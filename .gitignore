@@ -1,0 +1,24 @@
+# .gitignore
+
+# 环境变量与机密信息 (绝对不能传！)
+.env
+
+# 虚拟环境
+venv/
+env/
+conda/
+
+# 运行生成的产物与大文件
+output/
+tests/assets/*.mp4
+tests/assets/*.mp3
+tests/assets/*.wav
+
+# Python 缓存
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE 配置文件
+.vscode/
+.idea/
