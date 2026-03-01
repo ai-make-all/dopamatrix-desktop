@@ -2,7 +2,7 @@
 run_factory.py — ClipFlow 终极印钞机入口
 
 全自动视频生成流水线：
-  ScriptGenNode → TTSNode → TranslationBridgeNode → SubtitleNode
+  ScriptGenNode → TTSNode → AssetSelectNode → TranslationBridgeNode → SubtitleNode
   → AssemblyNode → FFmpegCompositorNode
 
 TranslationBridgeNode（内联桥接节点）：
@@ -18,6 +18,16 @@ TranslationBridgeNode（内联桥接节点）：
 import os
 import sys
 
+# ── Windows GBK 终端兼容修复 ──────────────────────────────────────────────────
+# 在 Windows 上将输出重定向到文件时，系统默认使用 GBK 编码，
+# 导致 emoji / 中文等 UTF-8 字符引发 UnicodeEncodeError。
+# 此处强制将 stdout/stderr 切换为 UTF-8，errors='replace' 确保即使遇到
+# 无法编码的字符也只输出 '?' 而不是崩溃整个进程。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ── 加载 .env 环境变量（必须在任何业务模块导入之前执行）────────────────────
 from dotenv import load_dotenv
 load_dotenv()
@@ -30,6 +40,7 @@ from src.core.engine import WorkflowEngine
 # ── 导入所有业务节点 ──────────────────────────────────────────────────────────
 from src.nodes.script_gen import ScriptGenNode
 from src.nodes.tts_node import TTSNode
+from src.nodes.asset_select import AssetSelectNode
 from src.nodes.subtitle import SubtitleNode
 from src.nodes.assembler import AssemblyNode
 from src.nodes.compositor import FFmpegCompositorNode
@@ -96,10 +107,11 @@ def build_pipeline() -> tuple[WorkflowEngine, WorkflowContext]:
     节点顺序与职责：
       1. ScriptGenNode         — 调用 LLM，生成结构化分镜脚本（script_data）
       2. TTSNode               — 将各语言旁白转为配音 MP3，写入 variants[lang]["voice_audio"]
-      3. TranslationBridgeNode — 将 script_data 旁白聚合，写入 config["translations"]
-      4. SubtitleNode          — 生成各语言 .ass 字幕文件，写入 variants[lang]["subtitle_ass"]
-      5. AssemblyNode          — 读取总时长 + 配音路径，组装 Timeline 写入 assets["timeline"]
-      6. FFmpegCompositorNode  — 编译 Timeline → FFmpeg → 渲染主视频 + 各语言字幕烧录变体
+      3. AssetSelectNode       — 逐场景检索下载视频素材，写入 assets["scene_clips"]
+      4. TranslationBridgeNode — 将 script_data 旁白聚合，写入 config["translations"]
+      5. SubtitleNode          — 生成各语言 .ass 字幕文件，写入 variants[lang]["subtitle_ass"]
+      6. AssemblyNode          — 读取 scene_clips + 配音路径，组装 Timeline 写入 assets["timeline"]
+      7. FFmpegCompositorNode  — 编译 Timeline → FFmpeg → 渲染主视频 + 各语言字幕烧录变体
 
     Returns:
         (engine, context) — 可进一步配置后调用 engine.run(context)
@@ -110,6 +122,7 @@ def build_pipeline() -> tuple[WorkflowEngine, WorkflowContext]:
     engine.nodes = [
         ScriptGenNode(),
         TTSNode(output_dir="output"),
+        AssetSelectNode(output_dir="output/clips"),
         TranslationBridgeNode(),
         SubtitleNode(),
         AssemblyNode(bg_video_path="tests/assets/bg1.mp4"),
@@ -129,6 +142,7 @@ def build_pipeline() -> tuple[WorkflowEngine, WorkflowContext]:
 
     # ── 输出目录初始化 ────────────────────────────────────────────────────────
     os.makedirs("output", exist_ok=True)
+    os.makedirs("output/clips", exist_ok=True)
 
     return engine, context
 

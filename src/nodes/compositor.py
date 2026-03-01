@@ -17,6 +17,12 @@ class FFmpegCompositorNode(BaseNode):
     def __init__(self, name: str = "FFmpeg_Slot_Compositor"):
         super().__init__(name)
 
+    # 视频输出目标分辨率：所有来源素材统一缩放到此尺寸后再 concat。
+    # 修改此处即可全局调整输出规格，无需改其他代码。
+    TARGET_W: int = 1280
+    TARGET_H: int = 720
+    TARGET_FPS: int = 30
+
     # ------------------------------------------------------------------
     # 核心编译器：Timeline → (input_args, video_filtergraph, audio_filtergraph)
     # ------------------------------------------------------------------
@@ -63,9 +69,24 @@ class FFmpegCompositorNode(BaseNode):
                 raw = f"[{clip_index}:v]"
 
                 if len(track.clips) > 1:
-                    # 多 Clip：归一化 PTS，稍后 concat（X轴拼接）
+                    # 多 Clip：完整归一化管道（解决花屏）：
+                    # setpts  — PTS 归零
+                    # scale   — 等比缩小到目标尺寸（保持宽高比）
+                    # pad     — 补黑边对齐到精确目标尺寸
+                    # setsar  — 强制 SAR=1（消除非方形像素 DAR 异常）
+                    # fps     — 统一帧率（消除帧率不一致导致的花屏）
+                    # format  — 强制 yuv420p（FFmpeg concat 要求像素格式一致）
+                    tw, th = self.TARGET_W, self.TARGET_H
                     norm_label = f"[norm{clip_index}]"
-                    video_parts.append(f"{raw}setpts=PTS-STARTPTS{norm_label}")
+                    video_parts.append(
+                        f"{raw}setpts=PTS-STARTPTS,"
+                        f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,"
+                        f"setsar=1,"
+                        f"fps={self.TARGET_FPS},"
+                        f"format=yuv420p"
+                        f"{norm_label}"
+                    )
                     per_clip_labels.append(norm_label)
                 else:
                     # 单 Clip：若有时间偏移则用 setpts 时移
@@ -173,23 +194,15 @@ class FFmpegCompositorNode(BaseNode):
             self.log("Warning: empty filtergraph — nothing to render.")
             return context
 
-        has_audio = bool(audio_fg)
+        # 3. 合并视频 filtergraph（无音频：Timeline 只含视频轨道）
+        full_filtergraph = video_fg
 
-        # 3. 合并视频+音频 filtergraph（用分号连接）
-        full_filtergraph = (
-            f"{video_fg};{audio_fg}" if has_audio else video_fg
-        )
-
-        # 4. 组装完整 FFmpeg 命令（列表形式）
+        # 4. 组装完整 FFmpeg 命令（无音频流：生成静音母带）
         output_path = "output/master_video.mp4"
         ffmpeg_bin = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
-        # 映射：视频流始终输出，音频流按需映射
-        map_args = ["-map", "[outv]"]
+        map_args = ["-map", "[outv]", "-an"]   # -an: 无音频轨道
         codec_args = ["-c:v", "libx264", "-preset", "fast"]
-        if has_audio:
-            map_args += ["-map", "[outa]"]
-            codec_args += ["-c:a", "aac", "-b:a", "192k"]
 
         cmd: List[str] = (
             [ffmpeg_bin]
@@ -197,8 +210,8 @@ class FFmpegCompositorNode(BaseNode):
             + ["-filter_complex", full_filtergraph]
             + map_args
             + codec_args
-            # ★ 防坑核心：视频结束时立即停止渲染，杜绝"视频定格等音频"Bug
-            + ["-shortest", "-y", output_path]
+            # master_video 是纯视频，无 -shortest 约束
+            + ["-y", output_path]
         )
 
         # 5. 打印命令，方便调试
@@ -244,80 +257,116 @@ class FFmpegCompositorNode(BaseNode):
         context.set_asset("video_master", output_path)
         self.log(f"Master video path '{output_path}' written to Context.")
 
-        # 8. 遍历多语言变体：将 .ass 字幕烧录到母带，生成最终多语言视频
-        self._burn_subtitles(context, output_path, ffmpeg_bin)
+        # 8. 逐语言生成最终变体视频（配音 + 字幕 + 画面合并）
+        self._render_variant(context, output_path, ffmpeg_bin)
 
         return context
 
     # ------------------------------------------------------------------
     # 字幕烧录：遍历 Context.variants，为每个语言生成最终变体视频
     # ------------------------------------------------------------------
-    def _burn_subtitles(
+    def _render_variant(
         self, context: WorkflowContext, master_path: str, ffmpeg_bin: str
     ) -> None:
         """
-        将 Context.variants 中注册的 .ass 字幕烧录到母带视频中。
+        逐语言生成最终变体视频：将 master_video（静音）+ 配音 + 字幕合并。
 
-        FFmpeg Windows 路径防坑处理：
-          1. 反斜杠 → 正斜杠（subtitles 滤镜不接受反斜杠）
-          2. 驱动器字母后的冒号需用反斜杠转义（C:/foo → C\\:/foo）
-          3. 整个滤镜参数值用单引号包裹（filter_complex 内部语法）
+        FFmpeg 命令策略：
+          - 输入 0：master_video.mp4（静音纯净画面）
+          - 输入 1：voice_{lang}.mp3（该语言配音，可选）
+          - 视频流：subtitles 滤镜烧录字幕（若无字幕则直接 copy）
+          - 音频流：apad 将配音延长至视频总时长，-shortest 以视频长度截断
+          - 若无配音：输出静音视频（-an）
 
         输出文件：output/final_{lang}.mp4
         """
         if not context.variants:
-            self.log("No language variants found in Context — skipping subtitle burn-in.")
+            self.log("No language variants found in Context — skipping variant rendering.")
             return
 
         for lang, assets in context.variants.items():
             ass_path: str = assets.get("subtitle_ass", "")
-            if not ass_path:
-                self.log(f"[{lang}] No 'subtitle_ass' registered — skipping.")
-                continue
-
-            if not os.path.exists(ass_path):
-                self.log(f"[{lang}] .ass file not found at '{ass_path}' — skipping.")
-                continue
-
+            voice_path: str = assets.get("voice_audio", "")
             final_path = f"output/final_{lang}.mp4"
 
-            # ★ 路径转义：Windows 路径 → FFmpeg subtitles 滤镜安全格式
-            #   Step 1: 反斜杠 → 正斜杠
-            #   Step 2: 盘符冒号转义 "C:/" → "C\\:/"（FFmpeg 滤镜解析规则）
-            safe_ass_path = ass_path.replace("\\", "/")
-            # 仅转义第一个冒号（驱动器字母后），避免破坏路径其余部分
-            if len(safe_ass_path) >= 2 and safe_ass_path[1] == ":":
-                safe_ass_path = safe_ass_path[0] + "\\:" + safe_ass_path[2:]
+            # ── 检查字幕文件 ──────────────────────────────────────────────
+            has_sub = bool(ass_path and os.path.exists(ass_path))
+            has_voice = bool(voice_path and os.path.exists(voice_path))
 
-            subtitle_filter = f"subtitles='{safe_ass_path}'"
+            if not has_sub:
+                self.log(f"[{lang}] No subtitle file found — video track will be raw copy.")
+            if not has_voice:
+                self.log(f"[{lang}] No voice_audio found — output will be silent.")
 
-            burn_cmd: List[str] = [
-                ffmpeg_bin,
-                "-i", master_path,
-                "-vf", subtitle_filter,
-                "-c:v", "libx264", "-preset", "fast",
-                "-c:a", "copy",
-                "-y", final_path,
-            ]
+            # ── 组装 FFmpeg 输入 ──────────────────────────────────────────
+            inputs: List[str] = [ffmpeg_bin, "-i", master_path]
+            if has_voice:
+                inputs += ["-i", voice_path]
 
-            self.log(f"[{lang}] Burning subtitle '{ass_path}' → '{final_path}'...")
-            self.log(f"[{lang}] CMD: {' '.join(burn_cmd)}")
+            # ── 视频滤镜：字幕烧录 ────────────────────────────────────────
+            if has_sub:
+                # Windows 路径转义：反斜杠 → 正斜杠，盘符冒号加反斜杠转义
+                safe_ass = ass_path.replace("\\", "/")
+                if len(safe_ass) >= 2 and safe_ass[1] == ":":
+                    safe_ass = safe_ass[0] + "\\:" + safe_ass[2:]
+                video_filter = f"subtitles='{safe_ass}'[outv]"
+                video_fg = f"[0:v]{video_filter}"
+                video_map = ["-map", "[outv]"]
+            else:
+                video_fg = ""
+                video_map = ["-map", "0:v"]
+
+            # ── 音频滤镜：apad 延长至视频长度 ────────────────────────────
+            if has_voice:
+                # [1:a]apad：将配音后面补静音到无限长，-shortest 以视频为准截断
+                audio_fg = "[1:a]apad[outa]"
+                audio_map = ["-map", "[outa]"]
+                audio_codec = ["-c:a", "aac", "-b:a", "192k"]
+                shortest = ["-shortest"]
+            else:
+                audio_fg = ""
+                audio_map = ["-an"]
+                audio_codec = []
+                shortest = []
+
+            # ── 合并 filter_complex ────────────────────────────────────────
+            filter_parts = [p for p in [video_fg, audio_fg] if p]
+            if filter_parts:
+                filter_args = ["-filter_complex", ";".join(filter_parts)]
+            else:
+                filter_args = []
+
+            # ── 组装完整命令 ──────────────────────────────────────────────
+            cmd: List[str] = (
+                inputs
+                + filter_args
+                + video_map
+                + audio_map
+                + ["-c:v", "libx264", "-preset", "fast"]
+                + audio_codec
+                + shortest
+                + ["-y", final_path]
+            )
+
+            self.log(f"[{lang}] Rendering variant → {final_path}")
+            self.log(f"[{lang}] CMD: {' '.join(cmd)}")
 
             try:
                 subprocess.run(
-                    burn_cmd,
+                    cmd,
                     check=True,
                     stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                 )
-                self.log(f"[{lang}] [OK] Subtitle video rendered: {final_path}")
+                self.log(f"[{lang}] [OK] Variant rendered: {final_path}")
                 context.set_variant_asset(lang, "final_video", final_path)
             except FileNotFoundError:
-                self.log(f"[{lang}] [ERROR] ffmpeg binary not found for subtitle burn-in.")
+                self.log(f"[{lang}] [ERROR] ffmpeg binary not found.")
             except subprocess.CalledProcessError as exc:
+                # 只打最后 800 字符，避免日志爆炸
                 self.log(
-                    f"[{lang}] [ERROR] FFmpeg subtitle burn failed "
-                    f"(exit {exc.returncode}):\n{exc.stderr}"
+                    f"[{lang}] [ERROR] Variant render failed "
+                    f"(exit {exc.returncode}):\n{exc.stderr[-800:]}"
                 )

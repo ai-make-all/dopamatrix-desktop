@@ -3,7 +3,7 @@
 > **多语言视频内容工厂 · Multilingual Video Content Factory**
 >
 > 本文档是 ClipFlow 项目的**宪法级纲领**，所有后续开发均以此为准。
-> 最后更新：2026-02-22
+> 最后更新：2026-03-01
 
 ---
 
@@ -47,6 +47,13 @@ ClipFlow 是一个面向**中东及全球市场**的多语言短视频批量生�
 - 所有核心视频渲染、节点流转在**本地**执行
 - UI 层通过标准 HTTP / WebSocket 与后端通信
 - 架构天然保留**云端化 / API 化**的迁移路径
+
+#### 场景说明 (Use-Case Scenarios)
+
+| 场景 | 终端 | 操作描述 |
+|------|------|----------|
+| **C 端 · 极速轻量** | 手机端 | 用户用手机拍摄库存或门店实录视频，上传后云端引擎自动融合 AI 素材，一键混剪出片，全程无需专业技能 |
+| **B 端 · 深度矩阵** | 桌面端 | 运营人员在桌面端拉满本地电脑算力，进行深度的 X/Y 轴多维编排，并行启动多进程矩阵，极速批量裂变变体 |
 
 ### 2.2 工作流引擎 — DAG Workflow
 
@@ -159,8 +166,8 @@ ClipFlow/
 │   │
 │   ├── localization/           ← 多语言 & RTL
 │   │   ├── __init__.py
-│   │   ├── ass_generator.py    ← .ass 字幕生成（含 RTL 排版）
-│   │   └── rtl_utils.py        ← 阿拉伯语 BiDi / Shaping 工具
+│   │   └── ass_generator.py    ← .ass 字幕生成（含 RTL 排版）
+│   │   # ⚠️ rtl_utils.py 已移除：实战证明 FFmpeg 原生 HarfBuzz 已完美支持 RTL 连写，采用极简透传方案
 │   │
 │   ├── api/                    ← FastAPI 接口层
 │   │   ├── __init__.py
@@ -265,14 +272,14 @@ workflow_def = {
 
 - [x] 定义 `WorkflowContext` 数据总线 (`src/core/context.py`)
 - [x] 定义 `BaseNode` 抽象基类 (`src/core/base_node.py`)
-- [ ] 实现 `WorkflowEngine` — DAG 拓扑排序与调度 (`src/core/engine.py`)
-  - [ ] 节点注册 & 边定义
-  - [ ] 拓扑排序 (Kahn's Algorithm)
-  - [ ] 顺序执行 & 错误处理
-  - [ ] 并行执行支持（无依赖节点并发调度）
-- [ ] 开发 `EchoNode` / `PassthroughNode` 用于单元测试验证引擎闭环
-- [ ] 编写 `tests/test_engine.py`，覆盖：线性流、分叉流、环检测
-- [ ] 补充 `WorkflowContext` 的节点级输出存储能力 (`node_outputs`)
+- [x] 实现 `WorkflowEngine` — DAG 拓扑排序与调度 (`src/core/engine.py`)
+  - [x] 节点注册 & 边定义
+  - [x] 拓扑排序 (Kahn's Algorithm)
+  - [x] 顺序执行 & 错误处理
+  - [x] 并行执行支持（无依赖节点并发调度）
+- [x] 开发 `EchoNode` / `PassthroughNode` 用于单元测试验证引擎闭环
+- [x] 编写 `tests/test_engine.py`，覆盖：线性流、分叉流、环检测
+- [x] 补充 `WorkflowContext` 的节点级输出存储能力 (`node_outputs`)
 
 ---
 
@@ -280,57 +287,87 @@ workflow_def = {
 
 **目标**：实现基于 X/Y 轴的二维混剪引擎，完成 Timeline → FFmpeg 编译。
 
-- [ ] 设计 & 实现 `Timeline` / `Track` / `ClipItem` 数据结构 (`src/core/timeline.py`)
-- [ ] 实现 FFmpeg 封装层 (`src/ffmpeg/`)
-  - [ ] `slot_manager.py` — 输入槽位分配 & 命名 (`[v0]`, `[v1]`, ...)
-  - [ ] `command_builder.py` — Complex Filtergraph 编译器
-    - [ ] X 轴拼接：`concat` 滤镜
-    - [ ] Y 轴叠加：`overlay` 滤镜 (含时间区间 `enable`)
-    - [ ] 音频轨混合：`amix` / `amerge`
-  - [ ] `runner.py` — 子进程执行 + 实时进度解析 (`-progress pipe:1`)
-- [ ] 实现 `CompositorNode` (`src/nodes/compositor_node.py`)
-  - [ ] 从 `WorkflowContext` 读取 `Timeline` 对象
-  - [ ] 调用 `command_builder` 编译为 FFmpeg 命令
-  - [ ] 调用 `runner` 执行并输出 master 视频路径
-- [ ] 编写 `tests/test_timeline.py` — 数据结构序列化 / 反序列化
-- [ ] 编写 `tests/test_compositor.py` — 用测试素材验证实际渲染输出
+- [x] 设计 & 实现 `Timeline` / `Track` / `ClipItem` 数据结构 (`src/core/timeline.py`)
+- [x] 实现 FFmpeg 封装层 (`src/ffmpeg/`)
+  - [x] `slot_manager.py` — 输入槽位分配 & 命名 (`[v0]`, `[v1]`, ...)
+  - [x] `command_builder.py` — Complex Filtergraph 编译器
+    - [x] X 轴拼接：`concat` 滤镜
+    - [x] Y 轴叠加：`overlay` 滤镜 (含时间区间 `enable`)
+    - [x] 音频轨混合：`amix` / `amerge`
+  - [x] `runner.py` — 子进程执行 + 实时进度解析 (`-progress pipe:1`)
+- [x] 实现 `CompositorNode` (`src/nodes/compositor_node.py`)
+  - [x] 从 `WorkflowContext` 读取 `Timeline` 对象
+  - [x] 调用 `command_builder` 编译为 FFmpeg 命令
+  - [x] 调用 `runner` 执行并输出 master 视频路径
+- [x] 编写 `tests/test_timeline.py` — 数据结构序列化 / 反序列化
+- [x] 编写 `tests/test_compositor.py` — 用测试素材验证实际渲染输出
 
 ---
 
-### Phase 3 — 内容生成与多语言适配 (Content & Localization)
+### Phase 3 — 内容生成、混合素材调度与多语言适配 (Content, Hybrid Asset Scheduling & Localization)
 
-**目标**：接入 LLM / TTS，重点攻克阿拉伯语 RTL 在 `.ass` 字幕中的排版。
+**目标**：接入 LLM / TTS，实现混合素材动态调度引擎，攻克阿拉伯语 RTL 在 `.ass` 字幕中的排版。
 
-- [ ] 实现 `ScriptGenNode` — LLM 文案生成 (`src/nodes/script_gen_node.py`)
-  - [ ] 支持多 LLM Provider（OpenAI / 通义 / 本地模型）
-  - [ ] Prompt 模板管理
-- [ ] 实现 `TTSNode` — 语音合成 (`src/nodes/tts_node.py`)
-  - [ ] 多引擎支持 (Edge TTS / Azure / ElevenLabs)
-  - [ ] 时间戳提取 → 用于字幕对齐
-- [ ] 实现 `AssetSelectNode` — 素材检索 (`src/nodes/asset_select_node.py`)
-  - [ ] 关键词匹配 / 语义检索
-  - [ ] 素材库索引
+- [x] 实现 `ScriptGenNode` — LLM 文案生成 (`src/nodes/script_gen_node.py`)
+  - [x] 支持多 LLM Provider（OpenAI / 通义 / 本地模型）
+  - [x] Prompt 模板管理
+- [x] 实现 `TTSNode` — 语音合成 (`src/nodes/tts_node.py`)
+  - [x] 多引擎支持 (Edge TTS / Azure / ElevenLabs)
+  - [x] 时间戳提取 → 用于字幕对齐
+- [ ] 实现 `AssetSelectNode` — **混合素材策略 (Hybrid Asset Strategy)** (`src/nodes/asset_select_node.py`)
+
+  > [!IMPORTANT]
+  > **核心商业逻辑**：架构必须支持在同一条 `Timeline` 中，按照可配置比例将「AI 生成片段」与「本地实拍片段」**穿插混剪**。这是对抗各大社交媒体平台（抖音/TikTok/Reels 等）对「纯 AI 视频」进行查重与限流算法的核心手段。
+
+  支持多 Provider 动态调度与穿插混剪：
+
+  | Provider | 类型 | 职责 |
+  |----------|------|------|
+  | **`LocalMatrixProvider`** | 本地实拍 | 从门店实况、库存录像等本地素材中提取片段，提供基础真实感，是对抗查重的核心锚点 |
+  | **`AIGenProvider`** | AI 生成（预留） | 未来调用大模型（可灵 / Runway 等）生成夸张、表现力强的补充画面，丰富视觉层次 |
+  | **`StockProvider`** | 免费素材库 | 对接 Pexels 等免费素材库兜底，在本地素材不足时自动填充 |
+
+  - [ ] `LocalMatrixProvider` — 本地素材扫描、建索引、关键词/语义检索
+  - [ ] `AIGenProvider` — 标准化接口定义（预留，待大模型 API 接入）
+  - [ ] `StockProvider` — Pexels API 对接与缓存
+  - [ ] 混剪调度器 — 按场景时长比例动态穿插三类素材，生成混合 `Timeline`
+
 - [ ] 实现多语言字幕系统 (`src/localization/`)
   - [ ] `ass_generator.py` — 从文案 + 时间戳生成 `.ass`
-  - [ ] `rtl_utils.py` — 阿拉伯语 BiDi 重排 & Font Shaping
+  - ~~`rtl_utils.py`~~ **已移除** — 实战证明 FFmpeg 原生 HarfBuzz 已完美支持 RTL 连写，已采用极简透传方案，无需 Python 侧预处理
   - [ ] RTL `.ass` 验证工具（自动检测排版异常）
-- [ ] 实现 `SubtitleMuxNode` (`src/nodes/subtitle_mux_node.py`)
-  - [ ] Master + .ass → Variant 流式输出
-  - [ ] 批量生成多语言变体
+- [x] 实现 `SubtitleMuxNode` (`src/nodes/subtitle_mux_node.py`)
+  - [x] Master + .ass → Variant 流式输出
+  - [x] 批量生成多语言变体
 - [ ] 编写 `tests/test_subtitle_mux.py`
 
 ---
 
-### Phase 4 — 深度去重与混淆管线 (Anti-Duplication)
+### Phase 4 — 高并发矩阵裂变与防封管线 (High-Concurrency Matrix & Anti-Dup)
 
-**目标**：对抗社交平台查重算法，确保每条变体视频具有唯一指纹。
+**目标**：抛弃单线程线性出片，引入 `ProcessPoolExecutor` 多进程池，彻底压榨本地 CPU 多核算力；结合底层防查重参数，实现批量变体的极速裂变，对抗平台限流。
+
+#### 4.1 多进程矩阵引擎 (ProcessPool Matrix Engine)
+
+> [!IMPORTANT]
+> **架构决策**：使用 Python `concurrent.futures.ProcessPoolExecutor` 而非 `ThreadPoolExecutor`。FFmpeg 渲染为 CPU 密集型任务，多线程受 GIL 限制无法有效并行；多进程可真正利用全部 CPU 核心，在 8 核机器上理论实现 8 倍渲染吞吐。
+
+- [ ] 实现 `MatrixEngine` — 多进程任务调度器 (`src/core/matrix_engine.py`)
+  - [ ] 基于 `ProcessPoolExecutor` 的任务池，核心数自动感知
+  - [ ] 任务队列管理：X 轴（文案/价格/卖点变体）× Y 轴（语言/画幅/风格变体）
+  - [ ] 进程间通信：`multiprocessing.Queue` 汇聚实时进度
+  - [ ] 优雅的错误隔离：单进程崩溃不影响整体批次
+- [ ] 实现批量任务提交接口 — 支持一次性提交 N×M 矩阵任务
+- [ ] 编写 `tests/test_matrix_engine.py` — 验证多进程并发与结果收集
+
+#### 4.2 底层防封参数 (Anti-Dup Parameters)
 
 - [ ] 实现 `AntiDupNode` (`src/nodes/anti_dup_node.py`)
   - [ ] 视觉扰动：微调亮度/对比度/色相 (FFmpeg `eq` / `hue` 滤镜)
-  - [ ] 时间扰动：首尾微量裁剪 / 变速 (`setpts`, `atempo`)
+  - [ ] 时间扰动：首尾微量裁剪 / 随机变速 (`setpts`, `atempo`)，配合 `LocalMatrixProvider` 实拍片段穿插双重防查重
   - [ ] 音频扰动：音调微调 (`asetrate` + `aresample`)
   - [ ] 元数据清洗：移除 EXIF / 修改容器元数据
-- [ ] 设计"指纹注册机制"
+- [ ] 设计「指纹注册机制」
   - [ ] 本地 Hash 计算（perceptual hash + file hash）
   - [ ] 轻量级云端 Hash 注册 API 规划（防跨设备重复）
 - [ ] 编写去重效果验证测试
