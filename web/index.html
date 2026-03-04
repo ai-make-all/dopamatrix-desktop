@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ClipFlow Matrix Console</title>
+  <meta name="description" content="ClipFlow 矩阵裂变控制台 — 极速批量视频渲染任务管理系统" />
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;600&display=swap');
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #020817;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(56, 189, 248, .04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(56, 189, 248, .04) 1px, transparent 1px);
+      background-size: 48px 48px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    #app {
+      position: relative;
+      z-index: 1;
+    }
+
+    .glass-card {
+      background: rgba(15, 23, 42, .85);
+      border: 1px solid rgba(56, 189, 248, .18);
+      border-radius: 16px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 0 32px rgba(56, 189, 248, .06), inset 0 1px 0 rgba(255, 255, 255, .04);
+    }
+
+    .btn-neon {
+      background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 50%, #8b5cf6 100%);
+      box-shadow: 0 0 24px rgba(99, 102, 241, .55), 0 4px 12px rgba(0, 0, 0, .5);
+      transition: all .25s ease;
+    }
+
+    .btn-neon:hover:not(:disabled) {
+      box-shadow: 0 0 40px rgba(99, 102, 241, .8), 0 6px 20px rgba(0, 0, 0, .6);
+      transform: translateY(-2px) scale(1.01);
+    }
+
+    .btn-neon:active:not(:disabled) {
+      transform: translateY(0) scale(.99);
+    }
+
+    .btn-neon:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+
+    .input-cyber {
+      background: rgba(2, 8, 23, .7);
+      border: 1px solid rgba(56, 189, 248, .22);
+      border-radius: 10px;
+      color: #e2e8f0;
+      transition: border-color .2s, box-shadow .2s;
+      font-family: 'Inter', sans-serif;
+    }
+
+    .input-cyber:focus {
+      outline: none;
+      border-color: rgba(56, 189, 248, .7);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, .12);
+    }
+
+    .input-cyber::placeholder {
+      color: rgba(100, 116, 139, .7);
+    }
+
+    .badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .7rem;
+      padding: 2px 10px;
+      border-radius: 99px;
+    }
+
+    .badge-pending {
+      background: rgba(234, 179, 8, .15);
+      color: #facc15;
+      border: 1px solid rgba(234, 179, 8, .35);
+    }
+
+    .badge-processing {
+      background: rgba(56, 189, 248, .15);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, .35);
+    }
+
+    .badge-completed {
+      background: rgba(34, 197, 94, .15);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, .35);
+    }
+
+    .badge-failed {
+      background: rgba(239, 68, 68, .15);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, .35);
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    .spin {
+      animation: spin .9s linear infinite;
+    }
+
+    @keyframes pulse-ring {
+      0% {
+        box-shadow: 0 0 0 0 rgba(56, 189, 248, .55);
+      }
+
+      70% {
+        box-shadow: 0 0 0 12px rgba(56, 189, 248, 0);
+      }
+
+      100% {
+        box-shadow: 0 0 0 0 rgba(56, 189, 248, 0);
+      }
+    }
+
+    .pulse-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #38bdf8;
+      animation: pulse-ring 1.5s ease-out infinite;
+      display: inline-block;
+    }
+
+    @keyframes scan {
+      0% {
+        top: -4px;
+      }
+
+      100% {
+        top: 100%;
+      }
+    }
+
+    .scan-line {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(56, 189, 248, .6), transparent);
+      animation: scan 2.8s linear infinite;
+      pointer-events: none;
+    }
+
+    .asset-card {
+      background: rgba(2, 8, 23, .8);
+      border: 1px solid rgba(56, 189, 248, .14);
+      border-radius: 12px;
+      overflow: hidden;
+      transition: transform .2s, box-shadow .2s;
+    }
+
+    .asset-card:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 8px 28px rgba(56, 189, 248, .12);
+    }
+
+    ::-webkit-scrollbar {
+      width: 5px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: rgba(56, 189, 248, .25);
+      border-radius: 4px;
+    }
+
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(16px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .fade-in {
+      animation: fadeInUp .4s ease both;
+    }
+  </style>
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            cyan: { 400: '#38bdf8', 500: '#0ea5e9' },
+            violet: { 400: '#a78bfa', 500: '#8b5cf6' },
+          }
+        }
+      }
+    }
+  </script>
+</head>
+
+<body>
+  <div id="app">
+
+    <!-- ── NAVBAR ── -->
+    <nav class="glass-card mx-4 mt-4 px-6 py-3 flex items-center justify-between sticky top-4 z-50">
+      <div class="flex items-center gap-3">
+        <div
+          class="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-violet-500 flex items-center justify-center text-sm font-black shadow-lg shadow-cyan-500/30">
+          ⚡</div>
+        <span
+          class="font-black text-lg tracking-tight bg-gradient-to-r from-cyan-400 to-violet-400 bg-clip-text text-transparent">
+          ClipFlow Matrix Console
+        </span>
+      </div>
+      <div class="flex items-center gap-2 text-xs text-slate-500">
+        <span class="pulse-dot"></span>
+        <span>Engine Online</span>
+        <span class="ml-3 badge badge-processing"
+          v-if="taskId && taskStatus !== 'completed' && taskStatus !== 'failed'">Task Active</span>
+      </div>
+    </nav>
+
+    <!-- ── MAIN LAYOUT ── -->
+    <main class="max-w-7xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-5 gap-6 min-h-[calc(100vh-90px)]">
+
+      <!-- LEFT PANEL -->
+      <aside class="lg:col-span-2 flex flex-col gap-4">
+        <div class="glass-card p-6 flex flex-col gap-5 flex-1">
+
+          <div class="flex items-center gap-2 text-xs font-semibold text-cyan-400 uppercase tracking-widest">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+            </svg>
+            控制面板
+          </div>
+
+          <!-- Prompt -->
+          <div class="flex flex-col gap-2">
+            <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">内容 Prompt</label>
+            <textarea id="promptInput" v-model="form.prompt" rows="7" :disabled="loading"
+              placeholder="描述你想要生成的视频内容…&#10;&#10;例：拍摄一款高端轿车的减震器安装教程，强调德国工艺与耐久性，适合 TikTok 矩阵投放。"
+              class="input-cyber w-full resize-none p-3 text-sm leading-relaxed">
+          </textarea>
+          </div>
+
+          <!-- Batch size -->
+          <div class="flex flex-col gap-2">
+            <label for="batchInput" class="text-xs font-medium text-slate-400 uppercase tracking-wider">批量数量 (Batch
+              Size)</label>
+            <input id="batchInput" v-model.number="form.batch_size" type="number" min="1" max="20" :disabled="loading"
+              class="input-cyber w-full p-3 text-sm font-mono" placeholder="3" />
+            <p class="text-xs text-slate-600">每次任务并行生成的视频变体数量（建议 1–10）</p>
+          </div>
+
+          <!-- Error -->
+          <div v-if="errorMsg"
+            class="text-xs text-red-400 bg-red-500/10 border border-red-500/25 rounded-lg px-3 py-2 break-words">
+            ⚠ {{ errorMsg }}
+          </div>
+
+          <!-- Submit -->
+          <button id="submitBtn" @click="submitTask" :disabled="loading || !form.prompt.trim()"
+            class="btn-neon w-full py-4 rounded-xl font-black text-lg text-white tracking-wide mt-auto">
+            <span v-if="!loading">⚡ 启动矩阵裂变</span>
+            <span v-else class="flex items-center justify-center gap-2">
+              <svg class="w-5 h-5 spin" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+              </svg>
+              渲染矩阵中…
+            </span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- RIGHT PANEL -->
+      <section class="lg:col-span-3 flex flex-col gap-4">
+
+        <!-- Empty state -->
+        <div v-if="!taskId && !assets.length"
+          class="glass-card flex-1 flex flex-col items-center justify-center gap-4 py-20 text-center">
+          <div class="text-6xl opacity-20">🎬</div>
+          <p class="text-slate-500 text-sm max-w-xs">
+            在左侧填写 Prompt 并点击按钮，任务状态与生成的视频矩阵将在此处呈现。
+          </p>
+        </div>
+
+        <!-- Task Status Panel -->
+        <div v-if="taskId && taskStatus !== 'completed' && taskStatus !== 'failed'"
+          class="glass-card p-6 relative overflow-hidden fade-in">
+          <div class="scan-line"></div>
+
+          <div class="flex items-center gap-3 mb-5">
+            <svg class="w-5 h-5 text-cyan-400 spin" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" />
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+            </svg>
+            <span class="font-semibold text-cyan-400 text-sm uppercase tracking-widest">任务状态面板</span>
+            <span :class="badgeClass" class="ml-auto">{{ taskStatus || 'pending' }}</span>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3 text-xs">
+            <div class="bg-slate-900/60 rounded-lg p-3 border border-slate-800">
+              <div class="text-slate-500 mb-1 uppercase tracking-wider">Task ID</div>
+              <div class="font-mono text-cyan-300 truncate">{{ taskId }}</div>
+            </div>
+            <div class="bg-slate-900/60 rounded-lg p-3 border border-slate-800">
+              <div class="text-slate-500 mb-1 uppercase tracking-wider">状态</div>
+              <div class="font-mono text-yellow-300">{{ taskStatus || 'initializing…' }}</div>
+            </div>
+            <div class="bg-slate-900/60 rounded-lg p-3 border border-slate-800 col-span-2">
+              <div class="text-slate-500 mb-1 uppercase tracking-wider">进度消息</div>
+              <div class="text-slate-300">{{ progressMsg || '正在拼命渲染中… 请稍候' }}</div>
+            </div>
+          </div>
+
+          <div class="mt-4 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div class="h-full bg-gradient-to-r from-cyan-500 to-violet-500 rounded-full animate-pulse"
+              style="width:65%"></div>
+          </div>
+          <p class="text-xs text-slate-600 mt-2 text-right">每 3 秒自动轮询…</p>
+        </div>
+
+        <!-- Failed state -->
+        <div v-if="taskStatus === 'failed'" class="glass-card p-6 border-red-500/30 fade-in">
+          <div class="flex items-center gap-2 text-red-400 font-semibold mb-2">✕ 任务执行失败</div>
+          <p class="text-xs text-slate-500">Task ID: <span class="font-mono text-slate-400">{{ taskId }}</span></p>
+          <p class="text-xs text-red-400 mt-2">{{ progressMsg }}</p>
+        </div>
+
+        <!-- Assets Delivery -->
+        <div v-if="assets.length" class="fade-in flex flex-col gap-4">
+
+          <div class="glass-card px-5 py-3 flex items-center gap-3">
+            <span class="text-green-400 text-lg">✓</span>
+            <div>
+              <div class="font-semibold text-green-400 text-sm">矩阵裂变完成！</div>
+              <div class="text-xs text-slate-500">共生成 {{ assets.length }} 个视频资产</div>
+            </div>
+            <span class="badge badge-completed ml-auto">completed</span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div v-for="(asset, idx) in assets" :key="asset.id || idx" class="asset-card fade-in">
+
+              <!-- Video player -->
+              <video controls class="w-full aspect-video bg-black" :src="buildVideoUrl(asset.file_path)"
+                preload="metadata">
+                您的浏览器不支持 HTML5 视频播放。
+              </video>
+
+              <!-- Metadata -->
+              <div class="p-4 flex flex-col gap-3">
+
+                <!-- Language + index -->
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-xs font-semibold text-slate-300 uppercase tracking-wider">语言</span>
+                  <span class="badge badge-processing">{{ asset.language || 'N/A' }}</span>
+                  <span class="text-xs text-slate-600 ml-auto font-mono">#{{ idx + 1 }}</span>
+                </div>
+
+                <!-- File path -->
+                <div class="text-xs text-slate-500 font-mono truncate" :title="asset.file_path">
+                  {{ asset.file_path || '—' }}
+                </div>
+
+                <!-- ★ Anti-dup fingerprint — bright green mono ★ -->
+                <div class="flex flex-col gap-1">
+                  <div
+                    class="flex items-center gap-1.5 text-xs font-semibold text-emerald-400 uppercase tracking-wider">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round"
+                        d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                    </svg>
+                    防重指纹 MD5
+                  </div>
+                  <!-- Bright green, extra-visible monospace hash -->
+                  <div
+                    class="font-mono text-xs font-semibold text-green-400 bg-green-950/40 border border-green-500/30 rounded-lg px-3 py-2 break-all leading-relaxed tracking-wide">
+                    {{ asset.file_hash || '—' }}
+                  </div>
+                </div>
+
+                <!-- Download -->
+                <a :href="buildVideoUrl(asset.file_path)"
+                  :download="asset.file_path ? asset.file_path.split(/[\\/]/).pop() : 'video.mp4'"
+                  class="mt-1 w-full text-center text-xs py-2 rounded-lg bg-slate-800/70 hover:bg-slate-700/70 border border-slate-700 hover:border-cyan-500/40 transition-all text-slate-300 hover:text-cyan-400">
+                  ↓ 下载视频
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </section>
+    </main>
+
+    <footer class="text-center text-xs text-slate-700 pb-6 mt-4">
+      ClipFlow Engine v0.5.0 &nbsp;·&nbsp; Matrix Console &nbsp;·&nbsp; Phase 5
+    </footer>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════
+     VUE 3  —  极度健壮版 setup()
+══════════════════════════════════════════════════ -->
+  <script>
+    const { createApp, ref, computed, onUnmounted } = Vue;
+
+    const API_BASE = 'http://127.0.0.1:8000';
+    const POLL_INTERVAL_MS = 3000;
+
+    createApp({
+      setup() {
+
+        // ── state ──────────────────────────────────────────────
+        const form = ref({ prompt: '', batch_size: 3 });
+        const loading = ref(false);
+        const taskId = ref('');
+        const taskStatus = ref('');
+        const progressMsg = ref('');
+        const assets = ref([]);
+        const errorMsg = ref('');
+
+        // Single timer ref — all paths go through this
+        let pollTimer = null;
+
+        // ── helpers ────────────────────────────────────────────
+
+        /** Always-safe timer teardown */
+        function clearPollTimer() {
+          if (pollTimer !== null) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        }
+
+        /** Normalise any file_path to a full URL */
+        function buildVideoUrl(filePath) {
+          if (!filePath) return '';
+          const normalized = filePath.replace(/\\/g, '/');          // Windows → forward slash
+          const withSlash = normalized.startsWith('/') ? normalized : '/' + normalized;
+          return API_BASE + withSlash;
+        }
+
+        /** Computed badge class for the status indicator */
+        const badgeClass = computed(() => {
+          const map = {
+            pending: 'badge badge-pending',
+            processing: 'badge badge-processing',
+            completed: 'badge badge-completed',
+            failed: 'badge badge-failed',
+          };
+          return map[taskStatus.value] ?? 'badge badge-pending';
+        });
+
+        // ── core logic ─────────────────────────────────────────
+
+        /** Submit a new render task */
+        async function submitTask() {
+          if (!form.value.prompt.trim()) return;
+
+          // ① Guard: kill any lingering poll from a previous run
+          clearPollTimer();
+
+          // ② Reset all reactive state
+          errorMsg.value = '';
+          assets.value = [];
+          taskId.value = '';
+          taskStatus.value = '';
+          progressMsg.value = '';
+          loading.value = true;
+
+          try {
+            const resp = await axios.post(
+              `${API_BASE}/api/v1/tasks/submit`,
+              {
+                prompt: form.value.prompt.trim(),
+                batch_size: form.value.batch_size || 1,
+              }
+            );
+
+            const data = resp.data;
+            // ⚠ 后端 VideoTaskResponse 主键字段名为 `id`，不是 `task_id`
+            taskId.value = String(data.id ?? '');
+            taskStatus.value = data.status ?? 'pending';
+            progressMsg.value = '任务已提交，正在初始化渲染管道…';
+
+            if (!taskId.value) {
+              throw new Error('后端未返回任务 id，原始响应：' + JSON.stringify(data));
+            }
+
+            // ③ Start polling immediately + every POLL_INTERVAL_MS
+            await pollTask();            // first check without waiting
+            pollTimer = setInterval(pollTask, POLL_INTERVAL_MS);
+
+          } catch (err) {
+            clearPollTimer();            // ④ safety: clear on submit error too
+            loading.value = false;
+            errorMsg.value = '提交失败：' + (err.response?.data?.detail ?? err.message ?? '未知错误');
+          }
+        }
+
+        /** Poll task status */
+        async function pollTask() {
+          if (!taskId.value) return;
+
+          try {
+            const resp = await axios.get(
+              `${API_BASE}/api/v1/tasks/${taskId.value}`
+            );
+            const data = resp.data;
+
+            taskStatus.value = data.status ?? taskStatus.value;
+            progressMsg.value = data.message ?? '';
+
+            if (data.status === 'completed') {
+              clearPollTimer();          // ⑤ stop polling on success
+              loading.value = false;
+              assets.value = Array.isArray(data.assets) ? data.assets : [];
+              if (assets.value.length === 0) {
+                progressMsg.value = '任务完成，但后端未返回任何资产，请检查 output 目录。';
+              }
+            } else if (data.status === 'failed') {
+              clearPollTimer();          // ⑥ stop polling on failure
+              loading.value = false;
+              progressMsg.value = data.message ?? '任务执行失败，请查看后端日志。';
+            }
+
+          } catch (err) {
+            // Network / server error during polling — show message but keep polling
+            progressMsg.value = '轮询异常（将继续重试）：' +
+              (err.response?.data?.detail ?? err.message ?? '网络错误');
+
+            // If it's a 404 (task not found), stop retrying
+            if (err.response?.status === 404) {
+              clearPollTimer();
+              loading.value = false;
+              taskStatus.value = 'failed';
+              progressMsg.value = `Task ${taskId.value} 不存在，已停止轮询。`;
+            }
+          }
+        }
+
+        // ⑦ Cleanup when component unmounts (page refresh / SPA teardown)
+        onUnmounted(clearPollTimer);
+
+        // ── expose to template ─────────────────────────────────
+        return {
+          form, loading, taskId, taskStatus, progressMsg,
+          assets, errorMsg, badgeClass,
+          submitTask, buildVideoUrl,
+        };
+      }
+    }).mount('#app');
+  </script>
+</body>
+
+</html>

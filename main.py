@@ -11,11 +11,13 @@ main.py  —  ClipFlow FastAPI 应用入口
   uvicorn main:app --reload --port 8000
 """
 
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from src.api.database import engine, Base
 from src.api.schemas import HealthResponse
@@ -62,6 +64,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---- 静态文件：挂载 output 目录，前端可直接通过 URL 播放视频 ---- #
+_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+app.mount("/output", StaticFiles(directory=_OUTPUT_DIR), name="output")
 
 
 # ================================================================== #
