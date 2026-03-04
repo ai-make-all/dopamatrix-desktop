@@ -3,7 +3,7 @@
 > **多语言视频内容工厂 · Multilingual Video Content Factory**
 >
 > 本文档是 ClipFlow 项目的**宪法级纲领**，所有后续开发均以此为准。
-> 最后更新：2026-03-01
+> 最后更新：2026-03-03
 
 ---
 
@@ -27,6 +27,12 @@ ClipFlow 是一个面向**中东及全球市场**的多语言短视频批量生�
 | **核心能力** | 多轨道混剪 → 母带生成 → 多语言字幕挂载 → 批量变体分发 |
 | **目标用户** | 跨境 MCN / 本地化团队 / AI Agent |
 | **差异壁垒** | FFmpeg 原生槽位渲染 + DAG 工作流编排 + Master-Variant 流式出片 |
+
+> [!IMPORTANT]
+> **战略定位 — 纯粹的高并发底层渲染引擎 (Headless Render Engine)**
+>
+> ClipFlow 致力于提供**纯粹的音视频渲染管线**。本系统**不包含**复杂的社交媒体抓取与自学习逻辑，而是通过标准化的 **Headless API** 向外暴露全部渲染能力，以便未来无缝接入上层的「**业务增长中枢系统 (GrowthOS)**」。
+> ClipFlow 的边界是：接收结构化任务指令 → 完成高质量渲染 → 返回带指纹与成本估算的结果报告。业务决策、数据学习、爆款分析等高阶逻辑，由 GrowthOS 负责。
 
 ---
 
@@ -343,7 +349,7 @@ workflow_def = {
 
 ---
 
-### Phase 4 — 高并发矩阵裂变与防封管线 (High-Concurrency Matrix & Anti-Dup)
+### Phase 4 — 高并发矩阵裂变与防封管线 (High-Concurrency Matrix & Anti-Dup) ✅
 
 **目标**：抛弃单线程线性出片，引入 `ProcessPoolExecutor` 多进程池，彻底压榨本地 CPU 多核算力；结合底层防查重参数，实现批量变体的极速裂变，对抗平台限流。
 
@@ -352,60 +358,92 @@ workflow_def = {
 > [!IMPORTANT]
 > **架构决策**：使用 Python `concurrent.futures.ProcessPoolExecutor` 而非 `ThreadPoolExecutor`。FFmpeg 渲染为 CPU 密集型任务，多线程受 GIL 限制无法有效并行；多进程可真正利用全部 CPU 核心，在 8 核机器上理论实现 8 倍渲染吞吐。
 
-- [ ] 实现 `MatrixEngine` — 多进程任务调度器 (`src/core/matrix_engine.py`)
-  - [ ] 基于 `ProcessPoolExecutor` 的任务池，核心数自动感知
-  - [ ] 任务队列管理：X 轴（文案/价格/卖点变体）× Y 轴（语言/画幅/风格变体）
-  - [ ] 进程间通信：`multiprocessing.Queue` 汇聚实时进度
-  - [ ] 优雅的错误隔离：单进程崩溃不影响整体批次
-- [ ] 实现批量任务提交接口 — 支持一次性提交 N×M 矩阵任务
-- [ ] 编写 `tests/test_matrix_engine.py` — 验证多进程并发与结果收集
+- [x] 实现 `MatrixEngine` — 多进程任务调度器 (`src/core/matrix_engine.py`)
+  - [x] 基于 `ProcessPoolExecutor` 的任务池，核心数自动感知
+  - [x] 任务队列管理：X 轴（文案/价格/卖点变体）× Y 轴（语言/画幅/风格变体）
+  - [x] 进程间通信：`multiprocessing.Queue` 汇聚实时进度
+  - [x] 优雅的错误隔离：单进程崩溃不影响整体批次
+- [x] 实现批量任务提交接口 — 支持一次性提交 N×M 矩阵任务
+- [x] 编写 `tests/test_matrix_engine.py` — 验证多进程并发与结果收集
 
 #### 4.2 底层防封参数 (Anti-Dup Parameters)
 
-- [ ] 实现 `AntiDupNode` (`src/nodes/anti_dup_node.py`)
-  - [ ] 视觉扰动：微调亮度/对比度/色相 (FFmpeg `eq` / `hue` 滤镜)
-  - [ ] 时间扰动：首尾微量裁剪 / 随机变速 (`setpts`, `atempo`)，配合 `LocalMatrixProvider` 实拍片段穿插双重防查重
-  - [ ] 音频扰动：音调微调 (`asetrate` + `aresample`)
-  - [ ] 元数据清洗：移除 EXIF / 修改容器元数据
-- [ ] 设计「指纹注册机制」
-  - [ ] 本地 Hash 计算（perceptual hash + file hash）
-  - [ ] 轻量级云端 Hash 注册 API 规划（防跨设备重复）
-- [ ] 编写去重效果验证测试
+- [x] 实现 `AntiDupNode` (`src/nodes/anti_dup_node.py`)
+  - [x] 视觉扰动：微调亮度/对比度/色相 (FFmpeg `eq` / `hue` 滤镜)
+  - [x] 时间扰动：首尾微量裁剪 / 随机变速 (`setpts`, `atempo`)，配合 `LocalMatrixProvider` 实拍片段穿插双重防查重
+  - [x] 音频扰动：音调微调 (`asetrate` + `aresample`)
+  - [x] 元数据清洗：移除 EXIF / 修改容器元数据
+- [x] 编写去重效果验证测试
+
+> [!NOTE]
+> 「**指纹注册机制 (Hash)**」已提升至 Phase 5，依赖 SQLite 数据库基建实现持久化存储，见 §5.3。
 
 ---
 
-### Phase 5 — Web UI 与可视化编排 (Visual Orchestration)
+### Phase 5 — FastAPI 接口层与数据基建 (Headless API & Data Infrastructure)
 
-**目标**：实现本地 FastAPI 接口层，对接前端实现拖拽式工作流配置。
+**目标**：构建标准化的 Headless API 接口层，引入轻量级数据库实现任务流与资产指纹的持久化管理，为 GrowthOS 等上层系统提供规范化的对接契约。
 
-- [ ] 实现 FastAPI 接口层 (`src/api/`)
-  - [ ] `schemas.py` — Pydantic 模型定义
-  - [ ] `routes.py` — 核心端点
-    - [ ] `POST /workflow/create` — 创建工作流
-    - [ ] `POST /workflow/run` — 执行工作流
-    - [ ] `GET /workflow/status/{id}` — 查询状态
-    - [ ] `GET /assets/list` — 素材库浏览
-  - [ ] WebSocket 端点 — 实时进度推送
+#### 5.1 数据库基建 (SQLite / SQLAlchemy)
+
+> [!IMPORTANT]
+> 引入 **SQLite + SQLAlchemy** 作为本地轻量级数据库，满足本地优先部署原则，同时保留迁移至 PostgreSQL 的路径。
+
+- [ ] 设计并实现 ORM 数据模型 (`src/db/models.py`)
+  - [ ] `VideoTask` — 任务流记录（任务 ID、状态、创建时间、耗时、成本估算）
+  - [ ] `VideoAsset` — 资产指纹记录（文件路径、`file_hash`、`perceptual_hash`、来源 Provider、注册时间）
+- [ ] 实现数据库初始化与迁移脚本 (`src/db/init_db.py`)
+- [ ] 实现 CRUD 操作层 (`src/db/crud.py`)
+
+#### 5.2 FastAPI 接口层 (`src/api/`)
+
+- [ ] `schemas.py` — Pydantic 请求/响应模型定义
+
+  > [!IMPORTANT]
+  > **Response 强制字段**：每次批量渲染完成后，API 返回体**必须**包含：
+  > - `file_hash` / `perceptual_hash` — 本批次各视频的指纹，供外部 GrowthOS 系统去重防重
+  > - `llm_tokens_used` / `tts_duration_seconds` — 大模型 Token 用量与 TTS 时长（用于成本预估估算，辅助上层系统核算 ROI）
+  > - `estimated_cost_usd` — 综合成本预估（Token 单价 × 用量 + TTS 费率 × 时长）
+
+- [ ] `routes.py` — 核心端点
+  - [ ] `POST /tasks/submit` — 提交渲染任务（写入 `VideoTask`）
+  - [ ] `POST /tasks/{id}/run` — 执行工作流，完成后更新任务状态与成本字段
+  - [ ] `GET /tasks/{id}/status` — 查询任务状态与完整结果（含 hash + 成本）
+  - [ ] `GET /assets/list` — 资产指纹库浏览
+  - [ ] WebSocket `/ws/tasks/{id}/progress` — 实时进度推送
 - [ ] 实现 `main.py` — FastAPI 启动入口
-- [ ] 开发 Web 前端 (`web/`)
-  - [ ] 工作流 DAG 可视化拖拽编排
-  - [ ] 时间线 Timeline 预览界面
-  - [ ] 任务队列 & 进度监控面板
-  - [ ] 素材库管理界面
+
+#### 5.3 指纹注册机制 (Hash Registry) ← *从 Phase 4 迁入*
+
+- [ ] 在 `AntiDupNode` 完成渲染后，调用 CRUD 层将 `file_hash` + `perceptual_hash` 持久化写入 `VideoAsset` 表
+- [ ] 任务提交时预检查 `perceptual_hash` 是否已存在，避免重复渲染
+- [ ] 编写 `tests/test_hash_registry.py` — 验证指纹注册与碰撞检测
 
 ---
 
-### Phase 6 — Agent Skills 封装 (Headless API)
+### Phase 6 — Agent & 增长大脑对接 (Headless API)
 
-**目标**：将管线封装为标准化 API/Tool，供外部 AI Agent 调用。
+**目标**：将渲染管线封装为标准化 Headless API，不仅供普通 AI Agent 单向调用，更要支持「**双向学习**」——允许外部增长大脑 (GrowthOS) 通过 API 动态向本系统注入最新的转化策略与 Prompt 模板，形成闭环迭代。
+
+#### 6.1 Agent 调用接口 (Outbound — ClipFlow 作为工具)
 
 - [ ] 定义 Agent Tool Schema（OpenAI Function Calling 兼容格式）
-  - [ ] `generate_video_tool` — 一键从文案到成品视频
+  - [ ] `generate_video_tool` — 一键从文案到成品视频（返回含 hash + 成本的完整报告）
   - [ ] `remix_video_tool` — 对已有素材重新混剪
   - [ ] `localize_video_tool` — 对 Master 生成指定语言变体
 - [ ] 实现 Headless CLI 入口 (`clipflow-cli`)
 - [ ] 编写集成测试 — 模拟 Agent 调用完整管线
-- [ ] 编写 API 文档 & 接入示例
+
+#### 6.2 双向学习注入接口 (Inbound — GrowthOS 向 ClipFlow 写入策略)
+
+> [!IMPORTANT]
+> **核心设计**：GrowthOS（或任何外部大脑）可通过以下接口，将其从数据分析中习得的最优策略**动态注入**到 ClipFlow 的渲染参数中，无需重新部署代码，实现策略的热更新。
+
+- [ ] `POST /strategies/overlay_clips` — 注入最新的 `overlay_clips` 配置（Y 轴转化策略：贴纸、Logo、CTA 动画等），覆盖本地默认配置
+- [ ] `POST /strategies/prompt_templates` — 注入最新的 LLM Prompt 模板（爆款文案结构、钩子句式等），写入数据库供后续任务使用
+- [ ] `GET /strategies/active` — 查询当前生效的策略版本与来源
+- [ ] 策略版本管理：每次注入记录版本号与时间戳，支持回滚至上一版本
+- [ ] 编写 API 文档 & GrowthOS 接入示例
 
 ---
 

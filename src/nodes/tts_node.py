@@ -100,11 +100,15 @@ class TTSNode(BaseNode):
 
         return {lang: "\n".join(lines) for lang, lines in narrations.items()}
 
-    def _run_tts(self, voice: str, text: str, output_path: Path) -> None:
+    def _run_tts(self, voice: str, text: str, output_path: Path, vtt_path: Path) -> None:
         """
-        调用 edge-tts CLI，将 text 转换为 MP3 文件。
+        调用 edge-tts CLI，将 text 转换为 MP3 文件，并同步生成 .vtt 时间轴文件。
 
-        使用 subprocess.run 同步阻塞执行，避免引入 asyncio 复杂性。
+        命令格式：
+          edge-tts --voice {voice} --rate {rate} --text "{text}"
+                   --write-media  {output_path}
+                   --write-subtitles {vtt_path}
+
         如果命令失败，抛出 RuntimeError（包含 stderr 信息方便诊断）。
         """
         cmd = [
@@ -113,9 +117,10 @@ class TTSNode(BaseNode):
             "--rate", self._rate,
             "--text", text,
             "--write-media", str(output_path),
+            "--write-subtitles", str(vtt_path),   # 生成精准分句时间轴
         ]
 
-        self.log(f"Running: {' '.join(cmd[:4])} ... --write-media {output_path.name}")
+        self.log(f"Running: {' '.join(cmd[:4])} ... --write-media {output_path.name} --write-subtitles {vtt_path.name}")
 
         result = subprocess.run(
             cmd,
@@ -177,16 +182,17 @@ class TTSNode(BaseNode):
                 continue
 
             output_path = self._output_dir / f"voice_{lang}.mp3"
+            vtt_path    = self._output_dir / f"voice_{lang}.vtt"
 
             self.log(
                 f"[{lang}] voice={voice} | "
                 f"text_length={len(text)} chars → {output_path}"
             )
 
-            # 调用 edge-tts CLI
-            self._run_tts(voice=voice, text=text, output_path=output_path)
+            # 调用 edge-tts CLI（同时写入 MP3 + VTT）
+            self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
 
-            # 验证文件真的生成了
+            # 验证 MP3 文件真的生成了
             if not output_path.exists() or output_path.stat().st_size == 0:
                 raise RuntimeError(
                     f"[TTSNode] Output file missing or empty after TTS: {output_path}"
@@ -200,6 +206,16 @@ class TTSNode(BaseNode):
 
             # 注册资产路径到 Context.variants
             context.set_variant_asset(lang, "voice_audio", str(output_path))
+
+            # 注册 .vtt 路径（如果文件存在）：供 SubtitleNode 第一时间读取
+            if vtt_path.exists() and vtt_path.stat().st_size > 0:
+                context.set_variant_asset(lang, "vtt_path", str(vtt_path))
+                self.log(f"[OK] [{lang}] VTT timeline → {vtt_path}")
+            else:
+                self.log(
+                    f"[Warning] [{lang}] VTT file not generated (edge-tts may not support "
+                    "--write-subtitles in this version). SubtitleNode will use fallback mode."
+                )
 
         self.log(
             f"TTS complete. Registered voice_audio for: "

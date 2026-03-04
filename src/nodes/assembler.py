@@ -9,6 +9,7 @@ AssemblyNode — Phase 4: 时间线拼装节点
 数据流：
   读取 → context.assets["script_data"]       (场景脚本 + 总时长计算)
   读取 → context.assets["scene_clips"]       (AssetSelectNode 下载的真实素材路径列表，可选)
+  读取 → context.assets["overlay_clips"]     (Y 轴叠加素材：{logo, sticker}，可选)
   读取 → context.variants[lang]["voice_audio"] (各语言配音 MP3，由 TTSNode 写入)
   写入 → context.assets["timeline"]           (组装完毕的 Timeline 对象)
 
@@ -17,6 +18,9 @@ AssemblyNode — Phase 4: 时间线拼装节点
     每个 clip 依次在 X 轴拼接；若素材总时长不足总时长，最后一个 clip 循环补齐。
   - 视频轨道降级路径（Fallback）：若 scene_clips 为空，退回到原 bg_video_path 逻辑
     （循环背景视频铺满总时长），保持向后兼容。
+  - Y 轴叠加轨道：若 overlay_clips 包含 Logo/Sticker 路径，分别创建 Layer 1 / Layer 2 的 Track。
+    Layer 1 (logo)    ：全程常騻，右上角定位。
+    Layer 2 (sticker) ：视频结束前 5 秒弹出，居中显示。
   - 背景视频素材通过构造器注入（bg_video_path），支持测试替换。
   - 每种语言的配音单独放入独立的 AudioTrack，最终由 amix 滤镜混合输出。
   - 本节点 **不** 处理字幕轨道；字幕烧录由 FFmpegCompositorNode._burn_subtitles 完成。
@@ -289,10 +293,59 @@ class AssemblyNode(BaseNode):
 
         timeline.add_track(bg_track)
 
-        # ── Step 3: 写回 Context（纯视频 Timeline，无音频轨道）────────────────
+        # ── Step 3: Y 轴叠加轨道：Logo (Layer 1) + Sticker (Layer 2) ────────
+        overlay_clips: dict = context.get_asset("overlay_clips") or {}
+        logo_path: Optional[str] = overlay_clips.get("logo")
+        sticker_path: Optional[str] = overlay_clips.get("sticker")
+
+        if logo_path and os.path.exists(logo_path):
+            logo_track = Track(name="logo_overlay", z_index=1, track_type="overlay")
+            logo_track.add_clip(Clip(
+                file_path=logo_path,
+                start_time=0.0,
+                duration=total_duration,
+                overlay_x="W-w-30",
+                overlay_y="30",
+            ))
+            timeline.add_track(logo_track)
+            self.log(
+                f"Layer 1 (logo_overlay): '{logo_path}' — "
+                f"full duration={total_duration:.1f}s, position=top-right (W-w-30:30)"
+            )
+        else:
+            self.log(
+                f"Layer 1 (logo_overlay): skipped "
+                f"({'not found' if logo_path else 'no logo path in overlay_clips'})"
+            )
+
+        if sticker_path and os.path.exists(sticker_path):
+            sticker_start = max(0.0, total_duration - 5.0)
+            sticker_dur = total_duration - sticker_start  # = min(5.0, total_duration)
+            sticker_track = Track(name="sticker_overlay", z_index=2, track_type="overlay")
+            sticker_track.add_clip(Clip(
+                file_path=sticker_path,
+                start_time=sticker_start,
+                duration=sticker_dur,
+                overlay_x="(W-w)/2",
+                overlay_y="(H-h)/2",
+            ))
+            timeline.add_track(sticker_track)
+            self.log(
+                f"Layer 2 (sticker_overlay): '{sticker_path}' — "
+                f"start={sticker_start:.1f}s, duration={sticker_dur:.1f}s, position=center"
+            )
+        else:
+            self.log(
+                f"Layer 2 (sticker_overlay): skipped "
+                f"({'not found' if sticker_path else 'no sticker path in overlay_clips'})"
+            )
+
+        # ── Step 4: 写回 Context（纯视频 Timeline，无音频轨道）────────────────
         context.set_asset("timeline", timeline)
+        overlay_count = len(timeline.tracks) - 1
         self.log(
-            f"Timeline assembled (video-only): {len(timeline.tracks)} video track(s). "
+            f"Timeline assembled: {len(timeline.tracks)} track(s) total "
+            f"(Layer 0={bg_track.name}, +{overlay_count} overlay). "
             "Audio will be added per-language by FFmpegCompositorNode."
         )
 

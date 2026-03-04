@@ -292,3 +292,214 @@ class PexelsProvider(BaseAssetProvider):
 
         print(f"[PexelsProvider] Downloaded: {local_path} ({local_path.stat().st_size / 1024:.1f} KB)")
         return str(local_path)
+
+
+# ---------------------------------------------------------------------------
+# LocalMatrixProvider — 本地素材矩阵抽卡器
+# ---------------------------------------------------------------------------
+
+class LocalMatrixProvider:
+    """
+    本地视频素材矩阵提供者。
+
+    从指定的本地目录中扫描 .mp4 文件，根据目标时长（target_duration）
+    随机有放回地抽取素材，直到累计时长满足要求，返回文件路径列表。
+
+    适用场景：
+      - 矩阵批量生产（无需联网 API）
+      - B/S Local First 架构下的本地素材优先策略
+
+    构造参数：
+        pool_dir:     本地素材目录，默认 "assets/matrix_pool/x_main"
+        ffprobe_bin:  ffprobe 可执行文件路径，默认从 FFPROBE_PATH 环境变量读取
+        fallback_dur: 当 ffprobe 探测失败时使用的保底时长（秒），默认 5.0
+
+    使用方法::
+
+        provider = LocalMatrixProvider()
+        clips = provider.get_clips_for_duration(target_duration=15.0)
+        # → ["assets/matrix_pool/x_main/clip_a.mp4", "assets/matrix_pool/x_main/clip_b.mp4", ...]
+
+        logo = provider.get_overlay_logo()
+        # → "assets/matrix_pool/y_overlay/logos/logo_1_blue.png"  (随机选取，可为 None)
+
+        sticker = provider.get_overlay_sticker()
+        # → "assets/matrix_pool/y_overlay/stickers/sticker_2_orange.png"
+    """
+
+    def __init__(
+        self,
+        pool_dir: str = "assets/matrix_pool/x_main",
+        ffprobe_bin: Optional[str] = None,
+        fallback_dur: float = 5.0,
+    ):
+        self._pool_dir = Path(pool_dir)
+        self._ffprobe_bin = ffprobe_bin or os.getenv("FFPROBE_PATH", "ffprobe")
+        self._fallback_dur = fallback_dur
+        # 文件时长缓存（避免对同一文件重复调用 ffprobe）
+        self._duration_cache: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # 公共接口
+    # ------------------------------------------------------------------
+
+    def get_clips_for_duration(self, target_duration: float) -> list[str]:
+        """
+        随机抽取本地素材，直到累计时长 >= target_duration。
+
+        抽取策略：
+          - 随机有放回（同一文件可被多次选中）
+          - 每次迭代从整个素材池随机选一个文件
+          - 累计时长超出目标后立即停止并返回
+
+        Args:
+            target_duration: 目标累计时长（秒）
+
+        Returns:
+            本地 .mp4 文件路径字符串列表（可包含重复路径）
+
+        Raises:
+            RuntimeError: 素材目录不存在或目录内无 .mp4 文件时抛出
+        """
+        import random
+
+        if not self._pool_dir.exists():
+            raise RuntimeError(
+                f"[LocalMatrixProvider] Pool directory not found: '{self._pool_dir}'. "
+                "Please create the directory and add .mp4 files."
+            )
+
+        mp4_files = sorted(self._pool_dir.glob("*.mp4"))
+        if not mp4_files:
+            raise RuntimeError(
+                f"[LocalMatrixProvider] No .mp4 files found in '{self._pool_dir}'. "
+                "Please add video files to the matrix pool."
+            )
+
+        print(
+            f"[LocalMatrixProvider] Pool: {len(mp4_files)} file(s) in '{self._pool_dir}'. "
+            f"Target duration: {target_duration:.1f}s"
+        )
+
+        selected: list[str] = []
+        accumulated = 0.0
+        max_iterations = 200  # 防止极端情况下的无限循环安全阀
+
+        for _ in range(max_iterations):
+            if accumulated >= target_duration:
+                break
+
+            chosen = random.choice(mp4_files)
+            clip_path = str(chosen)
+            dur = self._probe_duration(clip_path)
+            selected.append(clip_path)
+            accumulated += dur
+            print(
+                f"[LocalMatrixProvider]   + {chosen.name} ({dur:.1f}s) "
+                f"→ accumulated {accumulated:.1f}s / {target_duration:.1f}s"
+            )
+
+        print(
+            f"[LocalMatrixProvider] Done: {len(selected)} clip(s) selected, "
+            f"total ~{accumulated:.1f}s (target {target_duration:.1f}s)."
+        )
+        return selected
+
+    def get_overlay_logo(
+        self,
+        logos_subdir: str = "y_overlay/logos",
+    ) -> Optional[str]:
+        """
+        从 {pool_dir.parent}/y_overlay/logos/ 随机选取一张 PNG，作为品牌 Logo。
+
+        Args:
+            logos_subdir: 相对于 pool_dir 父目录的子路径，默认 "y_overlay/logos"
+
+        Returns:
+            PNG 文件的绝对路径字符串；目录不存在或为空时返回 None。
+        """
+        logos_dir = self._pool_dir.parent / logos_subdir
+        return self._pick_random_png(logos_dir)
+
+    def get_overlay_sticker(
+        self,
+        stickers_subdir: str = "y_overlay/stickers",
+    ) -> Optional[str]:
+        """
+        从 {pool_dir.parent}/y_overlay/stickers/ 随机选取一张 PNG，作为促销贴纸。
+
+        Args:
+            stickers_subdir: 相对于 pool_dir 父目录的子路径，默认 "y_overlay/stickers"
+
+        Returns:
+            PNG 文件的绝对路径字符串；目录不存在或为空时返回 None。
+        """
+        stickers_dir = self._pool_dir.parent / stickers_subdir
+        return self._pick_random_png(stickers_dir)
+
+    def _pick_random_png(self, subdir: Path) -> Optional[str]:
+        """
+        从指定目录随机选取一张 .png 文件。
+
+        优雅降级策略：
+          - 目录不存在 → 打印警告，返回 None
+          - 目录为空（无 .png）→ 打印警告，返回 None
+          - 否则：随机选取并返回绝对路径字符串
+        """
+        import random
+
+        if not subdir.exists():
+            print(
+                f"[LocalMatrixProvider] Warning: overlay directory not found: '{subdir}'. "
+                "Skipping overlay asset."
+            )
+            return None
+
+        png_files = sorted(subdir.glob("*.png"))
+        if not png_files:
+            print(
+                f"[LocalMatrixProvider] Warning: no .png files in '{subdir}'. "
+                "Skipping overlay asset."
+            )
+            return None
+
+        chosen = random.choice(png_files)
+        print(f"[LocalMatrixProvider] Y-overlay selected: {chosen.name} from '{subdir.name}/'")
+        return str(chosen)
+
+    # ------------------------------------------------------------------
+    # 内部方法
+    # ------------------------------------------------------------------
+
+    def _probe_duration(self, file_path: str) -> float:
+        """
+        用 ffprobe 探测视频文件时长；结果缓存以避免重复调用。
+        探测失败时返回 fallback_dur（保底时长）。
+        """
+        if file_path in self._duration_cache:
+            return self._duration_cache[file_path]
+
+        import subprocess
+        try:
+            result = subprocess.run(
+                [
+                    self._ffprobe_bin,
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            dur = float(result.stdout.strip())
+        except Exception as exc:
+            print(
+                f"[LocalMatrixProvider] Warning: ffprobe failed for '{file_path}' ({exc}). "
+                f"Using fallback duration {self._fallback_dur}s."
+            )
+            dur = self._fallback_dur
+
+        self._duration_cache[file_path] = dur
+        return dur

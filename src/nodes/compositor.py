@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
-from src.core.timeline import Timeline, Track
+from src.core.timeline import Clip, Timeline, Track
 
 
 class FFmpegCompositorNode(BaseNode):
@@ -33,10 +33,15 @@ class FFmpegCompositorNode(BaseNode):
         将 Timeline 的多轨数据编译为 FFmpeg 复杂滤镜图字符串。
 
         视频流处理（X轴 + Y轴）：
-          X轴（时间/concat）：单轨多 Clip → setpts 归一化 → concat
-          X轴（时间/offset）：单 Clip 且 start_time > 0 → setpts 时移
-          Y轴（图层/overlay）：从 z_index 最低层向上逐层 overlay
-            每层用 enable='between(t,{t_start},{t_end})' 限制合成时间窗口
+          X轴（时间/concat）：track_type="video" 的轨道 → setpts 归一化 → concat
+          Y轴（图层/overlay）：track_type="overlay" 的轨道 → PNG format=rgba 转换
+            → 级联 overlay 滤镜（由低 z_index 向高 z_index 逐层叠加）
+            → enable='between(t,{t_start},{t_end})' 精确控制每层时间窗口
+            → overlay_x / overlay_y 控制每层定位（来自 Clip 元数据）
+
+        PNG 透明通道保留：
+          overlay 轨道的 PNG 素材必须先经过 format=rgba 转换（保留 alpha），
+          底层视频需为 yuv420p；FFmpeg overlay 滤镜会正确混合两者。
 
         音频流处理：
           所有 AudioTrack 中的 Clip 统一收集为 FFmpeg 输入，
@@ -44,7 +49,7 @@ class FFmpegCompositorNode(BaseNode):
           若有多个则用 amix 混合为 [outa]。
 
         Returns:
-            input_args:       FFmpeg 的所有 -i 输入参数列表（视频+音频统一编号）
+            input_args:        FFmpeg 的所有 -i 输入参数列表（视频+音频统一编号）
             video_filtergraph: 视频部分的 filter_complex 子串（以 [outv] 结尾）
             audio_filtergraph: 音频部分的 filter_complex 子串（以 [outa] 结尾），
                                若无音频则为空字符串
@@ -55,13 +60,31 @@ class FFmpegCompositorNode(BaseNode):
         video_parts: List[str] = []   # 视频 filtergraph 语句
         audio_parts: List[str] = []   # 音频 filtergraph 语句
         clip_index = 0                # 全局输入槽位编号（视频 + 音频共用）
-        track_out_labels: List[str] = []
 
-        # ── Step 1: 遍历视频 Track，处理 X 轴 ──────────────────────────
+        # 基础视频轨（track_type="video"）的拼接输出标签
+        base_video_out_labels: List[str] = []
+        # Y 轴叠加轨（track_type="overlay"）的槽位 + clip 元数据
+        overlay_slots: List[Tuple[str, Clip]] = []   # [(rgba_label, clip_obj), ...]
+
+        # ── Step 1: 遍历 Track，区分 video / overlay ───────────────────
         for t_idx, track in enumerate(timeline.tracks):
             if not track.clips:
                 continue
 
+            # ── overlay 轨道（PNG 图层）：只注册输入槽位，不走 concat ──────
+            if getattr(track, "track_type", "video") == "overlay":
+                # overlay 轨道通常只有 1 个 Clip（logo 或 sticker）
+                clip = track.clips[0]
+                input_args.extend(["-i", clip.file_path])
+                raw_label = f"[{clip_index}:v]"
+                rgba_label = f"[rgba{clip_index}]"
+                # format=rgba：保留 PNG 透明通道，避免 alpha 被黑色填充
+                video_parts.append(f"{raw_label}format=rgba{rgba_label}")
+                overlay_slots.append((rgba_label, clip))
+                clip_index += 1
+                continue
+
+            # ── video 轨道：原有 X 轴 concat 管线 ─────────────────────────
             per_clip_labels: List[str] = []
 
             for clip in track.clips:
@@ -76,20 +99,24 @@ class FFmpegCompositorNode(BaseNode):
                     # setsar  — 强制 SAR=1（消除非方形像素 DAR 异常）
                     # fps     — 统一帧率（消除帧率不一致导致的花屏）
                     # format  — 强制 yuv420p（FFmpeg concat 要求像素格式一致）
+                    # effects — per-clip 防查重滤镜链（来自 AntiDupNode）
                     tw, th = self.TARGET_W, self.TARGET_H
                     norm_label = f"[norm{clip_index}]"
-                    video_parts.append(
+                    norm_chain = (
                         f"{raw}setpts=PTS-STARTPTS,"
                         f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
                         f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,"
                         f"setsar=1,"
                         f"fps={self.TARGET_FPS},"
                         f"format=yuv420p"
-                        f"{norm_label}"
                     )
+                    if clip.effects:
+                        effects_chain = ",".join(clip.effects)
+                        norm_chain += f",{effects_chain}"
+                    norm_chain += norm_label
+                    video_parts.append(norm_chain)
                     per_clip_labels.append(norm_label)
                 else:
-                    # 单 Clip：若有时间偏移则用 setpts 时移
                     if clip.start_time > 0:
                         shifted_label = f"[shifted{clip_index}]"
                         video_parts.append(
@@ -108,33 +135,52 @@ class FFmpegCompositorNode(BaseNode):
                 video_parts.append(
                     f"{concat_inputs}concat=n={len(track.clips)}:v=1:a=0{track_label}"
                 )
-                track_out_labels.append(track_label)
+                base_video_out_labels.append(track_label)
             else:
-                track_out_labels.append(per_clip_labels[0])
+                base_video_out_labels.append(per_clip_labels[0])
 
-        # ── Step 2: Y 轴叠加 ────────────────────────────────────────────
-        if not track_out_labels:
+        # ── Step 2: 级联 Y 轴 overlay（基础视频 + 叠加层）──────────────
+        if not base_video_out_labels:
             return [], "", ""
 
-        if len(track_out_labels) == 1:
-            video_parts.append(f"{track_out_labels[0]}copy[outv]")
+        # 基础视频（Layer 0）输出
+        if len(base_video_out_labels) == 1:
+            base = base_video_out_labels[0]
         else:
-            base = track_out_labels[0]
-            for i in range(1, len(track_out_labels)):
-                track = timeline.tracks[i]
-                t_start = min(c.start_time for c in track.clips)
-                t_end = max(
-                    c.start_time + (c.duration if c.duration is not None else 0.0)
-                    for c in track.clips
-                )
-                enable = f"'between(t,{t_start},{t_end})'"
-                out_label = (
-                    "[outv]" if i == len(track_out_labels) - 1 else f"[comp{i}]"
-                )
-                video_parts.append(
-                    f"{base}{track_out_labels[i]}overlay=0:0:enable={enable}{out_label}"
-                )
+            # 多个 video track（极少情况），先做基础叠加
+            base = base_video_out_labels[0]
+            for i, next_label in enumerate(base_video_out_labels[1:], start=1):
+                out_label = f"[base_comp{i}]"
+                video_parts.append(f"{base}{next_label}overlay=0:0{out_label}")
                 base = out_label
+
+        # Y 轴级联 PNG overlay（按 overlay_slots 顺序，z_index 由低到高）
+        total_overlay_count = len(overlay_slots)
+        for ov_idx, (rgba_label, clip) in enumerate(overlay_slots):
+            is_last = (ov_idx == total_overlay_count - 1)
+            out_label = "[outv]" if is_last else f"[comp_ov{ov_idx}]"
+
+            # 定位坐标：从 Clip.overlay_x / overlay_y 读取（默认左上角 0:0）
+            ov_x = getattr(clip, "overlay_x", None) or "0"
+            ov_y = getattr(clip, "overlay_y", None) or "0"
+
+            # 时间窗口：enable='between(t,start,end)' 精确控制显示区间
+            t_start = clip.start_time
+            t_end = t_start + (clip.duration if clip.duration is not None else 0.0)
+            enable = f"'between(t,{t_start},{t_end})'"
+
+            video_parts.append(
+                f"{base}{rgba_label}overlay={ov_x}:{ov_y}:enable={enable}{out_label}"
+            )
+            base = out_label
+            self.log(
+                f"[Overlay] slot {ov_idx}: {rgba_label} @ ({ov_x},{ov_y}) "
+                f"enable=between(t,{t_start},{t_end}) -> {out_label}"
+            )
+
+        # 无 overlay 轨道时：基础视频直接命名为 [outv]
+        if total_overlay_count == 0:
+            video_parts.append(f"{base}copy[outv]")
 
         video_filtergraph = ";".join(video_parts)
 
@@ -198,7 +244,10 @@ class FFmpegCompositorNode(BaseNode):
         full_filtergraph = video_fg
 
         # 4. 组装完整 FFmpeg 命令（无音频流：生成静音母带）
-        output_path = "output/master_video.mp4"
+        # 读取 session_id 实现多进程输出路径隔离（无 session_id 时使用默认名）
+        session_id: str = context.config.get("session_id", "")
+        sid_suffix = f"_{session_id}" if session_id else ""
+        output_path = f"output/master_video{sid_suffix}.mp4"
         ffmpeg_bin = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
         map_args = ["-map", "[outv]", "-an"]   # -an: 无音频轨道
@@ -287,7 +336,10 @@ class FFmpegCompositorNode(BaseNode):
         for lang, assets in context.variants.items():
             ass_path: str = assets.get("subtitle_ass", "")
             voice_path: str = assets.get("voice_audio", "")
-            final_path = f"output/final_{lang}.mp4"
+            # 多进程下用 session_id 区分不同批次的输出文件，避免覆盖
+            session_id: str = context.config.get("session_id", "")
+            sid_suffix = f"_{session_id}" if session_id else ""
+            final_path = f"output/final_{lang}{sid_suffix}.mp4"
 
             # ── 检查字幕文件 ──────────────────────────────────────────────
             has_sub = bool(ass_path and os.path.exists(ass_path))
