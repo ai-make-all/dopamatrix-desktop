@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field, ConfigDict
 class VideoTaskCreate(BaseModel):
     """
     POST /tasks/submit  请求体。
-    调用方（Agent / GrowthOS / CLI）提交一个新的矩阵生成任务。
+    调用方（Agent / GrowthOS / CLI / Tauri Desktop）提交一个新的矩阵生成任务。
     """
     session_id: Optional[str] = Field(
         default=None,
@@ -29,6 +29,23 @@ class VideoTaskCreate(BaseModel):
     )
     prompt:     str = Field(..., min_length=1, description="剧本要求或主题文案。")
     batch_size: int = Field(default=1, ge=1, le=256, description="矩阵变体数量。")
+    local_asset_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选：Tauri Desktop 通过 dialog 选取的本地素材目录绝对路径。"
+            "若提供，AssetSelectNode 将优先从该目录扫描 .mp4 / .mov 文件作为视频素材，"
+            "而非使用系统默认素材池。"
+        ),
+    )
+    local_overlay_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选：Y 轴本地贴图目录绝对路径（透明背景 .png 格式 Logo / 贴纸）。"
+            "若提供，AssetSelectNode 将优先从该目录扫描 .png 文件作为叠层素材；"
+            "文件无效或目录为空时，引擎将抛出 ValueError 拦截任务。"
+            "若不提供，则自动回退到系统默认 Y 轴素材池。"
+        ),
+    )
 
 
 class VideoTaskResponse(BaseModel):

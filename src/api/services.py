@@ -66,10 +66,12 @@ def _estimate_cost(tokens: int, tts_seconds: float) -> float:
 # ------------------------------------------------------------------ #
 
 def run_matrix_job(
-    task_id:    int,
-    session_id: str,
-    prompt:     str,
-    batch_size: int,
+    task_id:          int,
+    session_id:       str,
+    prompt:           str,
+    batch_size:       int,
+    local_asset_dir:  Optional[str] = None,
+    local_overlay_dir: Optional[str] = None,
 ) -> None:
     """
     矩阵批量生成后台任务。
@@ -78,10 +80,12 @@ def run_matrix_job(
     内部调用 run_matrix_factory，后者负责 ProcessPoolExecutor 调度。
 
     Args:
-        task_id:    video_tasks 表的主键（用于回写执行结果）
-        session_id: 父任务的 session_id（日志追踪用）
-        prompt:     剧本提示词
-        batch_size: 矩阵变体数量
+        task_id:           video_tasks 表的主键（用于回写执行结果）
+        session_id:        父任务的 session_id（日志追踪用）
+        prompt:            剧本提示词
+        batch_size:        矩阵变体数量
+        local_asset_dir:   （可选）X 轴：Tauri Dialog 选取的本地视频素材目录绝对路径
+        local_overlay_dir: （可选）Y 轴：透明背景 .png 贴图目录绝对路径
     """
     # ── 必须在函数内部导入，避免 FastAPI 启动时触发多进程相关副作用 ──
     from dotenv import load_dotenv
@@ -108,6 +112,8 @@ def run_matrix_job(
         results: list[dict] = run_matrix_factory(
             batch_size=batch_size,
             user_prompt=prompt,
+            local_asset_dir=local_asset_dir,    # ← X 轴视频素材目录
+            local_overlay_dir=local_overlay_dir, # ← Y 轴贴图目录
         )
 
         # 3. 统计成本 & 收集资产

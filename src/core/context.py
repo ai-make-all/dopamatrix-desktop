@@ -7,8 +7,14 @@ class WorkflowContext:
     类似 Coze/ComfyUI 中的 payload 传递。
     """
     # 修复处：将 str = None 改为 Optional[str] = None
-    def __init__(self, session_id: Optional[str] = None):
+    def __init__(self, session_id: Optional[str] = None,
+                 local_asset_dir: Optional[str] = None,
+                 local_overlay_dir: Optional[str] = None):
         self.session_id = session_id or str(uuid.uuid4())
+        # X 轴：本地视频素材目录（Tauri Dialog 传入）；None 表示使用系统默认素材池
+        self.local_asset_dir: Optional[str] = local_asset_dir
+        # Y 轴：本地贴图/Logo 目录（透明背景 .png）；None 表示使用系统默认叠层素材
+        self.local_overlay_dir: Optional[str] = local_overlay_dir
         
         # 存放全局配置 (如：目标语言、分辨率、API Keys)
         self.config: Dict[str, Any] = {}

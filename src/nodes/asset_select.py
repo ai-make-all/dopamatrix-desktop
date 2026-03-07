@@ -21,11 +21,17 @@ AssetSelectNode — Phase 4 升级版：本地矩阵素材选择节点
   - Pexels 降级逻辑保持不变，方便测试与回归。
 """
 
-from typing import Optional, Union
+import logging
+import os
+import random
+from pathlib import Path
+from typing import List, Optional, Union
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
 from src.services.asset_provider import BaseAssetProvider, LocalMatrixProvider, PexelsProvider
+
+logger = logging.getLogger(__name__)
 
 
 class AssetSelectNode(BaseNode):
@@ -71,6 +77,215 @@ class AssetSelectNode(BaseNode):
         scenes = script_data.get("scenes", [])
         return sum(float(s.get("duration", 0)) for s in scenes)
 
+    # -- 1.0 MVP validation constants ----------------------------------
+    # X-axis: video clip validation
+    _ALLOWED_SUFFIXES    = {".mp4", ".mov"}       # format whitelist (lowercase)
+    _MAX_FILE_SIZE_BYTES = 200 * 1024 * 1024      # hard cap: 200 MB
+    # Y-axis: overlay PNG validation
+    _ALLOWED_OVERLAY_SUFFIX  = ".png"             # only transparent PNGs
+    _MAX_OVERLAY_SIZE_BYTES  = 5 * 1024 * 1024    # hard cap: 5 MB
+
+    def _scan_user_asset_dir(
+        self, asset_dir: str, total_duration: float
+    ) -> Optional[List[str]]:
+        """
+        扫描用户通过 Tauri Dialog 选取的本地目录，收集符合条件的视频文件。
+
+        1.0 MVP 校验防线：
+          - 格式白名单：仅接受 .mp4 / .mov（忽略大小写）。
+          - 体积红线：单文件超过 200 MB 则警告并跳过。
+          - 零有效文件：扫描完毕后仍无合规文件，抛出 ValueError。
+
+        采样策略：
+          - 文件数量充足时，先随机打乱，再依序填满 total_duration；
+          - 文件较少时，有放回重复抽取（循环补足）；
+          - 目录不存在时，返回 None（触发 fallback 逻辑）。
+
+        Args:
+            asset_dir:      用户选取目录的绝对路径字符串。
+            total_duration: 视频总时长（秒），用于估算所需素材数量。
+
+        Returns:
+            List[str] — 选取的本地视频绝对路径列表（可含重复）。
+
+        Raises:
+            ValueError — 扫描后发现 0 个合规视频文件。
+        """
+        p = Path(asset_dir)
+        if not p.exists() or not p.is_dir():
+            self.log(f"[Scan] ✗ Directory does not exist or is not a folder: {asset_dir}")
+            return None
+
+        # ── Step 1：收集全部普通文件（不预设后缀，由校验层决定取舍）──────────
+        all_files: List[Path] = [f for f in p.iterdir() if f.is_file()]
+
+        # ── Step 2：逐文件执行格式 + 体积校验 ───────────────────────────────
+        valid_files: List[Path] = []
+        for f in all_files:
+            suffix = f.suffix.lower()
+
+            # 格式校验
+            if suffix not in self._ALLOWED_SUFFIXES:
+                logger.warning(
+                    "[Scan] ⚠️ 格式不符，已跳过：%s（仅支持 %s）",
+                    f.name,
+                    ", ".join(sorted(self._ALLOWED_SUFFIXES)),
+                )
+                continue
+
+            # 体积校验
+            try:
+                size_bytes = os.path.getsize(f)
+            except OSError as exc:
+                logger.warning("[Scan] ⚠️ 无法读取文件大小，已跳过：%s — %s", f.name, exc)
+                continue
+
+            if size_bytes > self._MAX_FILE_SIZE_BYTES:
+                size_mb = size_bytes / (1024 * 1024)
+                logger.warning(
+                    "[Scan] ⚠️ 文件超过 200MB 体积红线，已跳过：%s（%.1f MB）",
+                    f.name, size_mb,
+                )
+                continue
+
+            valid_files.append(f)
+
+        # ── Step 3：零有效文件 → 直接抛出异常，终止流程 ──────────────────────
+        if not valid_files:
+            raise ValueError(
+                "本地素材库中没有找到符合要求的有效视频"
+                "（仅支持 mp4/mov，且单文件需小于 200MB）。"
+            )
+
+        self.log(
+            f"[Scan] ✓ 校验通过 {len(valid_files)} 个视频文件（来自：'{asset_dir}'）。"
+        )
+
+        # ── Step 4：按总时长估算所需数量，随机有放回抽样 ──────────────────────
+        AVG_CLIP_DURATION = 5.0
+        needed = max(1, int(total_duration / AVG_CLIP_DURATION) + 1)
+
+        shuffled = valid_files.copy()
+        random.shuffle(shuffled)
+
+        result: List[str] = []
+        while len(result) < needed:
+            result.extend(str(f) for f in shuffled)
+        return result[:needed]
+
+    def _scan_user_overlay_dir(self, overlay_dir: str) -> List[str]:
+        """
+        Scan user-supplied Y-axis local directory for valid PNG overlay assets.
+
+        1.0 MVP guard-rails (Y-axis):
+          - Format whitelist : only .png accepted (case-insensitive).
+          - Size cap         : files > 5 MB are warned and skipped.
+          - Zero valid files : raise ValueError so the pipeline stops cleanly.
+          - Dir not found    : raise ValueError (user passed a bad path).
+
+        Args:
+            overlay_dir: Absolute path string of the user-chosen folder.
+
+        Returns:
+            List[str] of absolute paths to valid PNG files.
+
+        Raises:
+            ValueError when the directory is missing or zero qualifying PNGs exist.
+        """
+        p = Path(overlay_dir)
+        if not p.exists() or not p.is_dir():
+            raise ValueError(
+                f"Y\u8f74\u7d20\u6750\u5e93\u9519\u8bef\uff1a\u76ee\u5f55\u4e0d\u5b58\u5728\u6216\u65e0\u6cd5\u8bbf\u95ee: {overlay_dir}\uff0c"
+                "\u8bf7\u786e\u4fdd\u8def\u5f84\u6b63\u786e\u4e14\u6709\u8bfb\u53d6\u6743\u9650\u3002"
+            )
+
+        all_files: List[Path] = [f for f in p.iterdir() if f.is_file()]
+        valid_pngs: List[Path] = []
+
+        for f in all_files:
+            suffix = f.suffix.lower()
+
+            # Format check
+            if suffix != self._ALLOWED_OVERLAY_SUFFIX:
+                logger.warning(
+                    "[Y-Scan] Skipping non-PNG file: %s (only .png transparent overlays allowed).",
+                    f.name,
+                )
+                continue
+
+            # Size check
+            try:
+                size_bytes = os.path.getsize(f)
+            except OSError as exc:
+                logger.warning("[Y-Scan] Cannot read file size, skipping: %s — %s", f.name, exc)
+                continue
+
+            if size_bytes > self._MAX_OVERLAY_SIZE_BYTES:
+                size_mb = size_bytes / (1024 * 1024)
+                logger.warning(
+                    "[Y-Scan] PNG exceeds 5 MB cap, skipping: %s (%.1f MB).",
+                    f.name, size_mb,
+                )
+                continue
+
+            valid_pngs.append(f)
+
+        if not valid_pngs:
+            raise ValueError(
+                "Y\u8f74\u7d20\u6750\u5e93\u9519\u8bef\uff1a\u672a\u627e\u5230\u6709\u6548\u7684\u900f\u660e PNG \u56fe\u7247\uff0c"
+                "\u8bf7\u786e\u4fdd\u6587\u4ef6\u683c\u5f0f\u6b63\u786e\u4e14\u5c0f\u4e8e 5MB\u3002"
+            )
+
+        self.log(
+            f"[Y-Scan] Validated {len(valid_pngs)} PNG file(s) from '{overlay_dir}'."
+        )
+        return [str(f) for f in valid_pngs]
+
+    def _set_overlay_clips(
+        self, context: WorkflowContext, pool_dir: str
+    ) -> None:
+        """
+        Write Y-axis overlay assets (Logo + Sticker) into context.
+
+        Priority:
+          1. context.local_overlay_dir  -> user-supplied local PNG folder (strict validation)
+          2. default pool LocalMatrixProvider -> mock fallback (graceful degradation)
+        """
+        # -- Priority 1: user-supplied local Y-axis directory ----------------
+        if context.local_overlay_dir:
+            self.log(
+                f"[Y-Overlay] User local overlay dir detected: '{context.local_overlay_dir}'. "
+                "Scanning PNG files..."
+            )
+            # ValueError propagates up through execute() and surfaces as a task error
+            png_paths = self._scan_user_overlay_dir(context.local_overlay_dir)
+            # First file -> logo; second file (if any) -> sticker; else reuse logo
+            logo_path    = png_paths[0]
+            sticker_path = png_paths[1] if len(png_paths) >= 2 else png_paths[0]
+            context.set_asset("overlay_clips", {"logo": logo_path, "sticker": sticker_path})
+            self.log(
+                f"[Y-Overlay] User-dir mode: logo={logo_path}, "
+                f"sticker={sticker_path}. Written to context.assets['overlay_clips']."
+            )
+            return
+
+        # -- Priority 2: system default pool (graceful fallback) -------------
+        try:
+            local_provider = LocalMatrixProvider(pool_dir=pool_dir)
+            logo_path = local_provider.get_overlay_logo()
+            sticker_path = local_provider.get_overlay_sticker()
+        except Exception as exc:
+            self.log(f"[Y-Overlay] Failed to get overlay assets: {exc}. Setting to None.")
+            logo_path, sticker_path = None, None
+
+        context.set_asset("overlay_clips", {"logo": logo_path, "sticker": sticker_path})
+        self.log(
+            f"[Y-Overlay] Default-pool mode: logo={logo_path or 'None'}, "
+            f"sticker={sticker_path or 'None'}. Written to context.assets['overlay_clips']."
+        )
+
+
+
     # ------------------------------------------------------------------
     # 执行入口
     # ------------------------------------------------------------------
@@ -106,6 +321,10 @@ class AssetSelectNode(BaseNode):
         """
         【本地矩阵模式】：按脚本总时长，从本地素材池随机抽取一组视频。
 
+        优先级：
+          1. context.local_asset_dir  → 用户通过 Tauri Dialog 选取的本地目录
+          2. self._pool_dir           → 默认系统素材池（fallback）
+
         与 Pexels 模式的区别：
           - 不依赖网络
           - 一次性按总时长抽取，而非逐场景处理
@@ -117,6 +336,32 @@ class AssetSelectNode(BaseNode):
             context.set_asset("scene_clips", [])
             return context
 
+        # ── 优先：用户桌面端传入的本地素材目录 ──────────────────────────────
+        if context.local_asset_dir:
+            self.log(
+                f"[Local Mode] 📂 Tauri Asset Dir detected: '{context.local_asset_dir}'. "
+                "Scanning for .mp4 / .mov files..."
+            )
+            scene_clips = self._scan_user_asset_dir(
+                asset_dir=context.local_asset_dir,
+                total_duration=total_duration,
+            )
+            if scene_clips is not None:
+                context.set_asset("scene_clips", scene_clips)
+                self.log(
+                    f"[Local Mode] ✓ {len(scene_clips)} clip(s) from user dir selected "
+                    f"(total ~{total_duration:.1f}s). Written to context.assets['scene_clips']."
+                )
+                # Y-overlay 仍从默认池获取；用户目录通常只含主视频素材
+                self._set_overlay_clips(context, pool_dir=self._pool_dir)
+                return context
+            # 若用户目录扫描失败，发出警告并 fallback 到系统素材池
+            self.log(
+                f"[Local Mode] ⚠️ User asset dir invalid or empty. "
+                "Falling back to default pool."
+            )
+
+        # ── 降级：系统默认素材池（LocalMatrixProvider） ──────────────────────
         self.log(
             f"[Local Mode] {len(scenes)} scene(s), total duration: {total_duration:.1f}s. "
             f"Selecting clips from '{self._pool_dir}'..."
@@ -140,15 +385,7 @@ class AssetSelectNode(BaseNode):
             f"(total ~{total_duration:.1f}s). Written to context.assets['scene_clips']."
         )
 
-        # ── Y 轴素材抽取：Logo + Sticker ─────────────────────────────────
-        logo_path = local_provider.get_overlay_logo()
-        sticker_path = local_provider.get_overlay_sticker()
-        context.set_asset("overlay_clips", {"logo": logo_path, "sticker": sticker_path})
-        self.log(
-            f"[Local Mode] Y-overlay: logo={logo_path or 'None'}, "
-            f"sticker={sticker_path or 'None'}. Written to context.assets['overlay_clips']."
-        )
-
+        self._set_overlay_clips(context, pool_dir=self._pool_dir)
         return context
 
 

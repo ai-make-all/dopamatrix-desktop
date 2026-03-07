@@ -74,13 +74,19 @@ def submit_task(
     # 4. 投入后台执行（BackgroundTask 拿到 task.id 后，内部独立开 Session）
     background_tasks.add_task(
         run_matrix_job,
-        task_id    = task.id,
-        session_id = session_id,
-        prompt     = payload.prompt,
-        batch_size = payload.batch_size,
+        task_id          = task.id,
+        session_id       = session_id,
+        prompt           = payload.prompt,
+        batch_size       = payload.batch_size,
+        local_asset_dir  = payload.local_asset_dir,    # ← X 轴本地素材目录（可选）
+        local_overlay_dir= payload.local_overlay_dir,  # ← Y 轴本地贴图目录（可选）
     )
 
-    print(f"[routes] ✅ 任务已入队 task_id={task.id} session={session_id}")
+    print(
+        f"[routes] ✅ 任务已入队 task_id={task.id} session={session_id}"
+        + (f" local_asset_dir={payload.local_asset_dir}" if payload.local_asset_dir else "")
+        + (f" local_overlay_dir={payload.local_overlay_dir}" if payload.local_overlay_dir else "")
+    )
 
     # 5. 立即返回（assets 此时为空列表，后续通过 GET 轮询）
     return VideoTaskResponse.model_validate(task)

@@ -53,13 +53,17 @@ if hasattr(sys.stderr, "reconfigure"):
 # Worker 函数（运行在独立子进程中）
 # ===========================================================================
 
-def _run_single_matrix(session_id: str, user_prompt: str) -> dict:
+def _run_single_matrix(session_id: str, user_prompt: str,
+                       local_asset_dir: str | None = None,
+                       local_overlay_dir: str | None = None) -> dict:
     """
     单个矩阵视频生产 Worker，在独立子进程中执行完整 Pipeline。
 
     Args:
-        session_id:  当前任务的唯一标识符（8位短 UUID）
-        user_prompt: 视频生成提示词
+        session_id:        当前任务的唯一标识符（8位短 UUID）
+        user_prompt:       视频生成提示词
+        local_asset_dir:   （可选）X 轴：Tauri Desktop 选取的本地视频素材目录绝对路径
+        local_overlay_dir: （可选）Y 轴：透明背景 .png 贴图目录绝对路径
 
     Returns:
         结果字典，包含 session_id、success、assets、error 等字段
@@ -143,10 +147,18 @@ def _run_single_matrix(session_id: str, user_prompt: str) -> dict:
             FFmpegCompositorNode(),                                    # 8. FFmpeg 渲染
         ]
 
-        # ── 初始化 Context ────────────────────────────────────────────────────
-        context = WorkflowContext(session_id=session_id)
+        # ── 初始化 Context（将 X 轴 / Y 轴目录同时注入）────────────────────────────────────
+        context = WorkflowContext(
+            session_id=session_id,
+            local_asset_dir=local_asset_dir,
+            local_overlay_dir=local_overlay_dir,
+        )
         context.config["session_id"] = session_id   # compositor 用于拼接输出文件名
         context.set_asset("script", user_prompt)
+        if local_asset_dir:
+            print(f"[Worker {session_id}] 📂 X轴素材目录: {local_asset_dir}")
+        if local_overlay_dir:
+            print(f"[Worker {session_id}] 🖼️  Y轴贴图目录: {local_overlay_dir}")
 
         # ── 确保输出目录存在 ──────────────────────────────────────────────────
         os.makedirs("output", exist_ok=True)
@@ -192,13 +204,17 @@ def _run_single_matrix(session_id: str, user_prompt: str) -> dict:
 # 矩阵工厂主函数
 # ===========================================================================
 
-def run_matrix_factory(batch_size: int = 3, user_prompt: str = "") -> list[dict]:
+def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
+                       local_asset_dir: str | None = None,
+                       local_overlay_dir: str | None = None) -> list[dict]:
     """
     启动多进程矩阵批量生产。
 
     Args:
-        batch_size:   同时生产的矩阵视频数量（即子进程数）
-        user_prompt:  所有任务共享的提示词（每个任务独立调用 LLM，结果各不相同）
+        batch_size:        同时生产的矩阵视频数量（即子进程数）
+        user_prompt:       所有任务共享的提示词（每个任务独立调用 LLM，结果各不相同）
+        local_asset_dir:   （可选）X 轴：Tauri Desktop 选取的本地视频素材目录绝对路径
+        local_overlay_dir: （可选）Y 轴：透明背景 .png 贴图目录绝对路径
 
     Returns:
         所有任务的结果字典列表，按完成顺序排列
@@ -226,7 +242,8 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "") -> list[dict]
     with ProcessPoolExecutor(max_workers=batch_size) as executor:
         # 提交所有任务
         future_to_session: dict[Future, str] = {
-            executor.submit(_run_single_matrix, sid, user_prompt): sid
+            executor.submit(_run_single_matrix, sid, user_prompt,
+                            local_asset_dir, local_overlay_dir): sid
             for sid in sessions
         }
 

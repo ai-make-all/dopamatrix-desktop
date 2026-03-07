@@ -3,7 +3,7 @@
 > **多语言视频内容工厂 · Multilingual Video Content Factory**
 >
 > 本文档是 ClipFlow 项目的**宪法级纲领**，所有后续开发均以此为准。
-> 最后更新：2026-03-03
+> 最后更新：2026-03-06
 
 ---
 
@@ -15,6 +15,7 @@
 4. [核心数据模型 (Key Data Models)](#4-核心数据模型-key-data-models)
 5. [阶段实施规划 (Execution Phases)](#5-阶段实施规划-execution-phases)
 6. [技术红线 (Hard Constraints)](#6-技术红线-hard-constraints)
+7. [客户端生态与 PMF 内测版 (Client Ecosystem MVP v1.0)](#phase-7----客户端生态与-pmf-内测版-client-ecosystem-mvp-v10-)
 
 ---
 
@@ -444,6 +445,26 @@ workflow_def = {
 - [ ] `GET /strategies/active` — 查询当前生效的策略版本与来源
 - [ ] 策略版本管理：每次注入记录版本号与时间戳，支持回滚至上一版本
 - [ ] 编写 API 文档 & GrowthOS 接入示例
+
+---
+
+### Phase 7 — 客户端生态与 PMF 内测版 (Client Ecosystem MVP v1.0) 🚀
+
+**目标**：在不污染 ClipFlow 底层纯净引擎的前提下，构建面向 B端/C端 客户的交互外壳，完成 PMF (产品市场契合度) 的商业化验证。
+
+#### 7.1 B端重度客户：桌面端矩阵工作站 (Tauri + Vue 3) [当前分支: feature/tauri-desktop]
+
+> **定位**：部署在客户本地电脑，调用本地高配算力，直接读取本地素材库的「航空驾驶舱」。
+- [x] Tauri 机甲初始化与 Vue 3 UI 挂载
+- [ ] **本地素材挂载 (Local Asset Injection)**：引入 Tauri Dialog 插件，允许用户通过原生弹窗选择本地 `X轴` (实拍素材) 和 `Y轴` (贴纸/Logo) 的绝对路径，透传给底层 FFmpeg 引擎。
+- [ ] **ROI 与产出看板 (Dashboard)**：在本地 SQLite 中记录每次矩阵生成的 Token 成本估算，提供极简的数据统计大屏，向客户直观展示“印钞机”的效率。
+- [ ] 打包分发：构建 `.exe` / `.dmg` 独立安装包。
+
+#### 7.2 C端轻量客户：移动端极速投喂 (Telegram Bot) [独立仓库规划]
+
+> **定位**：面向汽修店老板/导购，无须安装 App，聊天式一键出片。
+- [ ] 独立微服务：Node.js + Telegraf 架构。
+- [ ] 交互闭环：接收用户手机拍摄的短视频 → 调用大模型生成 Prompt → 调用云端 ClipFlow `POST /tasks/submit` → 返回最终带指纹的成品视频。
 
 ---
 
