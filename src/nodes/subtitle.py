@@ -380,15 +380,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     def execute(self, context: WorkflowContext) -> WorkflowContext:
         """
-        执行字幕生成。
-
-        优先使用精准模式（VTT 驱动）：
-          从 context.variants[lang]["vtt_path"] 读取 .vtt 文件 →
-          解析分句时间 → 每句生成独立 Dialogue → 写入 .ass
-
-        若 vtt_path 不存在，降级到旧逻辑：
-          从 context.config["translations"] 读取文本 →
-          生成单个 Dialogue（含换行处理）
+        执行字幕生成 — 测试语言优先（Test-First）模式：
+        仅为 context.test_language 生成 1 个 .ass 文件。
         """
         font_name: str = str(context.config.get("font_name", "Tahoma"))
         font_size: int = int(context.config.get("font_size", 42))
@@ -397,88 +390,56 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         output_dir = Path("output")
         output_dir.mkdir(exist_ok=True)
 
-        # 收集所有需要生成字幕的语言
-        # 精准模式：从 variants 中有 vtt_path 的 lang 读取
-        # 降级模式：从 config["translations"] 读取
-        translations: Dict[str, str] = context.config.get("translations", {})
-        all_langs = set(context.variants.keys()) | set(translations.keys())
+        target_lang = getattr(context, "test_language", "en") or "en"
+        self.log(f"[Test-First] 字幕仅生成语言 '{target_lang}'")
 
-        if not all_langs:
-            self.log("Warning: no languages found in variants or translations, skipping.")
+        ass_path = str(output_dir / f"sub_{target_lang}.ass")
+        vtt_path: str = (context.variants.get(target_lang) or {}).get("vtt_path", "")
+
+        # ── 精准模式：VTT → 聚合短句 → 多行 Dialogue ─────────────────
+        if vtt_path and os.path.exists(vtt_path):
+            self.log(f"[{target_lang}] 精准模式: 解析 VTT '{vtt_path}'")
+            cues = self._parse_vtt(vtt_path)
+            if cues:
+                chunks = self._chunk_cues(cues, max_chars=25)
+                ass_content = self._build_ass_from_cues(
+                    cues=chunks, lang=target_lang,
+                    font_name=font_name, font_size=font_size, max_chars=max_chars,
+                )
+                with open(ass_path, "w", encoding="utf-8") as f:
+                    f.write(ass_content)
+                size = os.path.getsize(ass_path)
+                self.log(
+                    f"[OK] [{target_lang}] ASS ({len(chunks)} chunks) "
+                    f"→ {ass_path} ({size} bytes)"
+                )
+                context.set_variant_asset(target_lang, "subtitle_ass", ass_path)
+                return context
+            else:
+                self.log(f"[{target_lang}] VTT 无 cue，切换降级模式。")
+
+        # ── 降级模式：单行 Dialogue ────────────────────────────────────
+        translations: Dict[str, str] = context.config.get("translations", {})
+        text: str = translations.get(target_lang, "")
+        if not text:
+            text = (context.variants.get(target_lang) or {}).get("subtitle_text", "")
+
+        if not text:
+            self.log(f"[{target_lang}] 无可用文本，跳过字幕生成。")
             return context
 
-        self.log(
-            f"Generating subtitles for {len(all_langs)} language(s): {sorted(all_langs)}"
+        t_start = float(context.config.get("subtitle_start", 0.0))
+        t_end   = float(context.config.get("subtitle_end",   5.0))
+        self.log(f"[{target_lang}] 降级模式: 单 Dialogue ({t_start:.1f}s → {t_end:.1f}s)")
+        ass_content = self._build_ass_fallback(
+            text=text, t_start=t_start, t_end=t_end, lang=target_lang,
+            font_name=font_name, font_size=font_size, max_chars=max_chars,
         )
-
-        for lang in sorted(all_langs):
-            ass_path = str(output_dir / f"sub_{lang}.ass")
-            vtt_path: str = (context.variants.get(lang) or {}).get("vtt_path", "")
-
-            # ── 精准模式：VTT → 聚合短句 → 多行 Dialogue ────────────────
-            if vtt_path and os.path.exists(vtt_path):
-                self.log(f"[{lang}] Precise mode: parsing VTT '{vtt_path}'")
-                cues = self._parse_vtt(vtt_path)
-
-                if cues:
-                    # 逐词 cue 聚合为自然短句（TikTok 呼吸感字幕）
-                    # 已是分句格式时 _chunk_cues 自动跳过，不影响性能
-                    chunks = self._chunk_cues(cues, max_chars=25)
-                    ass_content = self._build_ass_from_cues(
-                        cues=chunks,
-                        lang=lang,
-                        font_name=font_name,
-                        font_size=font_size,
-                        max_chars=max_chars,
-                    )
-                    with open(ass_path, "w", encoding="utf-8") as f:
-                        f.write(ass_content)
-                    size = os.path.getsize(ass_path)
-                    self.log(
-                        f"[OK] [{lang}] ASS ({len(chunks)} chunks from {len(cues)} cues)"
-                        f" → {ass_path} ({size} bytes)"
-                    )
-                    context.set_variant_asset(lang, "subtitle_ass", ass_path)
-                    continue
-                else:
-                    self.log(
-                        f"[{lang}] VTT has no cues, falling back to single-dialogue mode."
-                    )
-
-            # ── 降级模式：单行 Dialogue（带换行算法）─────────────────────
-            text: str = translations.get(lang, "")
-            if not text:
-                # 尝试从 variants 中读取（TranslationBridgeNode 的旧格式）
-                text = (context.variants.get(lang) or {}).get("subtitle_text", "")
-
-            if not text:
-                self.log(f"[{lang}] No text available, skipping subtitle generation.")
-                continue
-
-            t_start = float(context.config.get("subtitle_start", 0.0))
-            t_end   = float(context.config.get("subtitle_end",   5.0))
-
-            self.log(
-                f"[{lang}] Fallback mode: single Dialogue "
-                f"({t_start:.1f}s → {t_end:.1f}s)"
-            )
-            ass_content = self._build_ass_fallback(
-                text=text,
-                t_start=t_start,
-                t_end=t_end,
-                lang=lang,
-                font_name=font_name,
-                font_size=font_size,
-                max_chars=max_chars,
-            )
-            with open(ass_path, "w", encoding="utf-8") as f:
-                f.write(ass_content)
-            size = os.path.getsize(ass_path)
-            self.log(f"[OK] [{lang}] ASS (fallback) → {ass_path} ({size} bytes)")
-            context.set_variant_asset(lang, "subtitle_ass", ass_path)
-
-        self.log(
-            f"All subtitle files registered: "
-            f"{list(context.variants.keys())}"
-        )
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_content)
+        size = os.path.getsize(ass_path)
+        self.log(f"[OK] [{target_lang}] ASS (降级) → {ass_path} ({size} bytes)")
+        context.set_variant_asset(target_lang, "subtitle_ass", ass_path)
+        self.log(f"字幕生成完成: [{target_lang}]")
         return context
+

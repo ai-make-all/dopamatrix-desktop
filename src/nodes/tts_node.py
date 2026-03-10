@@ -144,11 +144,11 @@ class TTSNode(BaseNode):
 
     def execute(self, context: WorkflowContext) -> WorkflowContext:
         """
-        执行 TTS 流程：
-          1. 从 Context 取出 script_data
-          2. 按语言聚合所有 scene 的旁白文本
-          3. 对每种语言调用 edge-tts CLI 生成 MP3
-          4. 将输出路径注册到 Context.variants
+        执行 TTS — 测试语言优先（Test-First）模式：
+
+        仅为 context.test_language 生成 1 个 MP3 + VTT。
+        砍掉多语言循环，消除无意义算力浪费；
+        正式上线时只需切换 test_language，无需改代码。
         """
         script_data: dict = context.get_asset("script_data") or {}
 
@@ -156,70 +156,67 @@ class TTSNode(BaseNode):
             self.log("Warning: context.assets['script_data'] is empty, skipping.")
             return context
 
-        # 确保输出目录存在
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 聚合各语言旁白
+        # ── 确定目标语言 ────────────────────────────────────────────
+        target_lang = getattr(context, "test_language", "en") or "en"
+        self.log(f"[Test-First] 目标语言 = '{target_lang}'（单语种模式，跳过其他语种）")
+
+        # 聚合所有语言旁白，但只取目标语言
         narrations = self._collect_narrations(script_data)
 
-        if not narrations:
-            self.log("Warning: No narrations found in script_data['scenes'], skipping.")
-            return context
-
-        self.log(
-            f"Detected languages: {list(narrations.keys())}. "
-            f"Starting TTS generation..."
-        )
-
-        for lang, text in narrations.items():
-            # 获取对应语音模型，找不到时使用 fallback 并警告
-            voice = self._voice_map.get(lang)
-            if not voice:
+        if target_lang not in narrations:
+            # 尝试 fallback：取 narrations 中第一个有 voice 映射的语言
+            fallback = next(
+                (lang for lang in narrations if lang in self._voice_map), None
+            )
+            if fallback:
                 self.log(
-                    f"Warning: No voice configured for lang='{lang}' in voice_map. "
-                    f"Skipping."
+                    f"[Test-First] '{target_lang}' 在 script_data 中无旁白，"
+                    f"回退到 '{fallback}'。"
                 )
-                continue
-
-            output_path = self._output_dir / f"voice_{lang}.mp3"
-            vtt_path    = self._output_dir / f"voice_{lang}.vtt"
-
-            self.log(
-                f"[{lang}] voice={voice} | "
-                f"text_length={len(text)} chars → {output_path}"
-            )
-
-            # 调用 edge-tts CLI（同时写入 MP3 + VTT）
-            self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
-
-            # 验证 MP3 文件真的生成了
-            if not output_path.exists() or output_path.stat().st_size == 0:
-                raise RuntimeError(
-                    f"[TTSNode] Output file missing or empty after TTS: {output_path}"
-                )
-
-            file_size_kb = output_path.stat().st_size / 1024
-            self.log(
-                f"[OK] [{lang}] MP3 generated → {output_path} "
-                f"({file_size_kb:.1f} KB)"
-            )
-
-            # 注册资产路径到 Context.variants
-            context.set_variant_asset(lang, "voice_audio", str(output_path))
-
-            # 注册 .vtt 路径（如果文件存在）：供 SubtitleNode 第一时间读取
-            if vtt_path.exists() and vtt_path.stat().st_size > 0:
-                context.set_variant_asset(lang, "vtt_path", str(vtt_path))
-                self.log(f"[OK] [{lang}] VTT timeline → {vtt_path}")
+                target_lang = fallback
             else:
                 self.log(
-                    f"[Warning] [{lang}] VTT file not generated (edge-tts may not support "
-                    "--write-subtitles in this version). SubtitleNode will use fallback mode."
+                    f"Warning: '{target_lang}' 无旁白且无可用 fallback，跳过 TTS。"
                 )
+                return context
+
+        text = narrations[target_lang]
+        voice = self._voice_map.get(target_lang)
+        if not voice:
+            self.log(
+                f"Warning: voice_map 中无 '{target_lang}' 的音色配置，跳过。"
+            )
+            return context
+
+        output_path = self._output_dir / f"voice_{target_lang}.mp3"
+        vtt_path    = self._output_dir / f"voice_{target_lang}.vtt"
 
         self.log(
-            f"TTS complete. Registered voice_audio for: "
-            f"{[lang for lang in narrations if self._voice_map.get(lang)]}"
+            f"[{target_lang}] voice={voice} | "
+            f"text_length={len(text)} chars → {output_path}"
         )
 
+        self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError(
+                f"[TTSNode] Output file missing or empty after TTS: {output_path}"
+            )
+
+        file_size_kb = output_path.stat().st_size / 1024
+        self.log(f"[OK] [{target_lang}] MP3 → {output_path} ({file_size_kb:.1f} KB)")
+        context.set_variant_asset(target_lang, "voice_audio", str(output_path))
+
+        if vtt_path.exists() and vtt_path.stat().st_size > 0:
+            context.set_variant_asset(target_lang, "vtt_path", str(vtt_path))
+            self.log(f"[OK] [{target_lang}] VTT → {vtt_path}")
+        else:
+            self.log(
+                f"[Warning] [{target_lang}] VTT not generated. SubtitleNode will use fallback."
+            )
+
+        self.log(f"TTS complete. Registered voice_audio for: [{target_lang}]")
         return context
+

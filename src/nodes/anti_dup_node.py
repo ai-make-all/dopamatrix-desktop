@@ -73,21 +73,25 @@ class AntiDupNode(BaseNode):
 
     def _gen_atempo_filter(self) -> str:
         """
-        生成随机 atempo 滤镜字符串（时间扰动）。
+        生成随机视频时间扰动滤镜字符串（合并版，减少 setpts 调用次数）。
 
-        注意：atempo 是音频滤镜，但在此处我们用它的视频等价物 setpts 实现速度扰动。
-        对于视频帧率微扰，直接使用 setpts 更精确。
-        返回格式：'setpts=1.005*PTS'（值 < 1 加速，> 1 减速）
+        【优化说明】——任务3 滤镜合并：
+          原先 compositor 归一化管道已含 setpts=PTS-STARTPTS（归零），
+          本节点再单独追加 setpts=factor*PTS 会造成两步 setpts 叠加。
+          现改为单步合并表达式：setpts=(PTS-STARTPTS)*factor
+            - 同时完成 PTS 归零 + 速度微扰，减少一个滤镜节点
+            - STARTPTS 为当前片段首帧 PTS，保证片段内时序连续
 
-        说明：tempo 范围 [0.99, 1.01] → setpts 范围 [0.99, 1.01]*PTS
-        加速时 setpts < 1（如 0.995*PTS），减速时 setpts > 1（如 1.005*PTS）。
+        返回格式：'setpts=(PTS-STARTPTS)*0.99128'（示例值）
+
+        说明：factor = 1/tempo
+          tempo=1.01（加速1%） → factor ≈ 0.99010  → setpts=(PTS-STARTPTS)*0.99010
+          tempo=0.99（减速1%） → factor ≈ 1.01010  → setpts=(PTS-STARTPTS)*1.01010
         """
-        # 注意：setpts 的倒数对应 atempo 速度
-        # tempo=1.01（加速1%） → setpts 乘数 = 1/1.01 ≈ 0.99
-        # tempo=0.99（减速1%） → setpts 乘数 = 1/0.99 ≈ 1.01
+        # setpts 乘数 = 1/tempo（tempo > 1 加速 → setpts < 1）
         tempo = random.uniform(*self._tempo_range)
         pts_factor = 1.0 / tempo
-        return f"setpts={pts_factor:.5f}*PTS"
+        return f"setpts=(PTS-STARTPTS)*{pts_factor:.5f}"
 
     # ------------------------------------------------------------------
     # 节点执行入口

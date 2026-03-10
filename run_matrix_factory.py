@@ -55,7 +55,10 @@ if hasattr(sys.stderr, "reconfigure"):
 
 def _run_single_matrix(session_id: str, user_prompt: str,
                        local_asset_dir: str | None = None,
-                       local_overlay_dir: str | None = None) -> dict:
+                       local_logo_dir: str | None = None,
+                       local_sticker_dir: str | None = None,
+                       aspect_ratio: str = "9:16",
+                       test_language: str = "en") -> dict:
     """
     单个矩阵视频生产 Worker，在独立子进程中执行完整 Pipeline。
 
@@ -147,18 +150,24 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             FFmpegCompositorNode(),                                    # 8. FFmpeg 渲染
         ]
 
-        # ── 初始化 Context（将 X 轴 / Y 轴目录同时注入）────────────────────────────────────
         context = WorkflowContext(
             session_id=session_id,
             local_asset_dir=local_asset_dir,
-            local_overlay_dir=local_overlay_dir,
+            local_logo_dir=local_logo_dir,
+            local_sticker_dir=local_sticker_dir,
+            aspect_ratio=aspect_ratio,
+            test_language=test_language,
         )
-        context.config["session_id"] = session_id   # compositor 用于拼接输出文件名
+        context.config["session_id"] = session_id
         context.set_asset("script", user_prompt)
         if local_asset_dir:
-            print(f"[Worker {session_id}] 📂 X轴素材目录: {local_asset_dir}")
-        if local_overlay_dir:
-            print(f"[Worker {session_id}] 🖼️  Y轴贴图目录: {local_overlay_dir}")
+            print(f"[Worker {session_id}] 📂 X轴素材: {local_asset_dir}")
+        if local_logo_dir:
+            print(f"[Worker {session_id}] 🎨 Logo: {local_logo_dir}")
+        if local_sticker_dir:
+            print(f"[Worker {session_id}] ✨ Sticker: {local_sticker_dir}")
+        print(f"[Worker {session_id}] 📐 画幅: {aspect_ratio} | 🌐 语言: {test_language}")
+
 
         # ── 确保输出目录存在 ──────────────────────────────────────────────────
         os.makedirs("output", exist_ok=True)
@@ -206,15 +215,21 @@ def _run_single_matrix(session_id: str, user_prompt: str,
 
 def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
                        local_asset_dir: str | None = None,
-                       local_overlay_dir: str | None = None) -> list[dict]:
+                       local_logo_dir: str | None = None,
+                       local_sticker_dir: str | None = None,
+                       aspect_ratio: str = "9:16",
+                       test_language: str = "en") -> list[dict]:
     """
     启动多进程矩阵批量生产。
 
     Args:
-        batch_size:        同时生产的矩阵视频数量（即子进程数）
-        user_prompt:       所有任务共享的提示词（每个任务独立调用 LLM，结果各不相同）
-        local_asset_dir:   （可选）X 轴：Tauri Desktop 选取的本地视频素材目录绝对路径
-        local_overlay_dir: （可选）Y 轴：透明背景 .png 贴图目录绝对路径
+        batch_size:        同时生产的矩阵视频数量
+        user_prompt:       所有任务共享的提示词
+        local_asset_dir:   X 轴本地视频素材目录
+        local_logo_dir:    Y 轴 Logo 水印目录
+        local_sticker_dir: Y 轴促销贴纸目录
+        aspect_ratio:      画幅比例
+        test_language:     测试语言
 
     Returns:
         所有任务的结果字典列表，按完成顺序排列
@@ -243,7 +258,8 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
         # 提交所有任务
         future_to_session: dict[Future, str] = {
             executor.submit(_run_single_matrix, sid, user_prompt,
-                            local_asset_dir, local_overlay_dir): sid
+                            local_asset_dir, local_logo_dir, local_sticker_dir,
+                            aspect_ratio, test_language): sid
             for sid in sessions
         }
 

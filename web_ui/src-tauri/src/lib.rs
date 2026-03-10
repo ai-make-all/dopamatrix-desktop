@@ -3,6 +3,8 @@ pub fn run() {
   tauri::Builder::default()
     // 注册对话框插件 2026-03-06  kevinjaja
     .plugin(tauri_plugin_dialog::init())
+    // 注册文件系统插件 2026-03-10  kevinjaja
+    .plugin(tauri_plugin_fs::init())
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(

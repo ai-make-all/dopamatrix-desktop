@@ -173,7 +173,48 @@ class AssetSelectNode(BaseNode):
             result.extend(str(f) for f in shuffled)
         return result[:needed]
 
-    def _scan_user_overlay_dir(self, overlay_dir: str) -> List[str]:
+    def _scan_user_logo_dir(self, logo_dir: str) -> List[str]:
+        """Logo 水印目录扫描：仅接受 .png，单文件 <5MB。"""
+        p = Path(logo_dir)
+        if not p.exists() or not p.is_dir():
+            raise ValueError(f"Logo 目录不存在或无法访问: {logo_dir}")
+        valid: List[str] = []
+        for f in p.iterdir():
+            if not f.is_file() or f.suffix.lower() != self._ALLOWED_OVERLAY_SUFFIX:
+                continue
+            try:
+                if os.path.getsize(f) > self._MAX_OVERLAY_SIZE_BYTES:
+                    logger.warning("[Logo-Scan] 超大跳过: %s", f.name)
+                    continue
+            except OSError:
+                continue
+            valid.append(str(f))
+        if not valid:
+            raise ValueError(f"Logo 目录无有效 PNG: {logo_dir}")
+        self.log(f"[Logo-Scan] {len(valid)} Logo PNG (‘{logo_dir}’)")
+        return valid
+
+    def _scan_user_sticker_dir(self, sticker_dir: str) -> List[str]:
+        """贴纸目录扫描：仅接受 .png，单文件 <5MB。"""
+        p = Path(sticker_dir)
+        if not p.exists() or not p.is_dir():
+            raise ValueError(f"贴纸目录不存在或无法访问: {sticker_dir}")
+        valid: List[str] = []
+        for f in p.iterdir():
+            if not f.is_file() or f.suffix.lower() != self._ALLOWED_OVERLAY_SUFFIX:
+                continue
+            try:
+                if os.path.getsize(f) > self._MAX_OVERLAY_SIZE_BYTES:
+                    logger.warning("[Sticker-Scan] 超大跳过: %s", f.name)
+                    continue
+            except OSError:
+                continue
+            valid.append(str(f))
+        if not valid:
+            raise ValueError(f"贴纸目录无有效 PNG: {sticker_dir}")
+        self.log(f"[Sticker-Scan] {len(valid)} 贴纸 PNG (‘{sticker_dir}’)")
+        return valid
+
         """
         Scan user-supplied Y-axis local directory for valid PNG overlay assets.
 
@@ -245,44 +286,51 @@ class AssetSelectNode(BaseNode):
         self, context: WorkflowContext, pool_dir: str
     ) -> None:
         """
-        Write Y-axis overlay assets (Logo + Sticker) into context.
+        Y 轴双轨拆分：分别扫描 Logo 目录和 Sticker 目录。
 
-        Priority:
-          1. context.local_overlay_dir  -> user-supplied local PNG folder (strict validation)
-          2. default pool LocalMatrixProvider -> mock fallback (graceful degradation)
+        优先级：
+          1. context.local_logo_dir    → 用户 Logo 目录（严格校验）
+          2. context.local_sticker_dir → 用户 Sticker 目录（严格校验）
+          3. 默认素材池（任一目录缺失时 fallback）
         """
-        # -- Priority 1: user-supplied local Y-axis directory ----------------
-        if context.local_overlay_dir:
-            self.log(
-                f"[Y-Overlay] User local overlay dir detected: '{context.local_overlay_dir}'. "
-                "Scanning PNG files..."
-            )
-            # ValueError propagates up through execute() and surfaces as a task error
-            png_paths = self._scan_user_overlay_dir(context.local_overlay_dir)
-            # First file -> logo; second file (if any) -> sticker; else reuse logo
-            logo_path    = png_paths[0]
-            sticker_path = png_paths[1] if len(png_paths) >= 2 else png_paths[0]
-            context.set_asset("overlay_clips", {"logo": logo_path, "sticker": sticker_path})
-            self.log(
-                f"[Y-Overlay] User-dir mode: logo={logo_path}, "
-                f"sticker={sticker_path}. Written to context.assets['overlay_clips']."
-            )
-            return
+        logo_path    = None
+        sticker_path = None
 
-        # -- Priority 2: system default pool (graceful fallback) -------------
-        try:
-            local_provider = LocalMatrixProvider(pool_dir=pool_dir)
-            logo_path = local_provider.get_overlay_logo()
-            sticker_path = local_provider.get_overlay_sticker()
-        except Exception as exc:
-            self.log(f"[Y-Overlay] Failed to get overlay assets: {exc}. Setting to None.")
-            logo_path, sticker_path = None, None
+        # ── 用户 Logo 目录 ────────────────────────────────────────────
+        if context.local_logo_dir:
+            try:
+                logo_pngs = self._scan_user_logo_dir(context.local_logo_dir)
+                logo_path = logo_pngs[0]   # 取第一个文件作为 Logo
+                self.log(f"[Y-Logo] 用户目录: logo={logo_path}")
+            except ValueError as exc:
+                self.log(f"[Y-Logo] 扫描失败: {exc}，回退默认池。")
+
+        # ── 用户 Sticker 目录 ──────────────────────────────────────────
+        if context.local_sticker_dir:
+            try:
+                sticker_pngs = self._scan_user_sticker_dir(context.local_sticker_dir)
+                sticker_path = sticker_pngs[0]   # 取第一个文件作为 Sticker
+                self.log(f"[Y-Sticker] 用户目录: sticker={sticker_path}")
+            except ValueError as exc:
+                self.log(f"[Y-Sticker] 扫描失败: {exc}，回退默认池。")
+
+        # ── 默认池 fallback（进入 None 的部分） ─────────────────────────
+        if logo_path is None or sticker_path is None:
+            try:
+                local_provider = LocalMatrixProvider(pool_dir=pool_dir)
+                if logo_path is None:
+                    logo_path = local_provider.get_overlay_logo()
+                if sticker_path is None:
+                    sticker_path = local_provider.get_overlay_sticker()
+            except Exception as exc:
+                self.log(f"[Y-Default] 默认池获取失败: {exc}")
 
         context.set_asset("overlay_clips", {"logo": logo_path, "sticker": sticker_path})
         self.log(
-            f"[Y-Overlay] Default-pool mode: logo={logo_path or 'None'}, "
-            f"sticker={sticker_path or 'None'}. Written to context.assets['overlay_clips']."
+            f"[Y-Overlay] logo={logo_path or 'None'}, sticker={sticker_path or 'None'} "
+            f"→ context.assets['overlay_clips']"
         )
+
 
 
 

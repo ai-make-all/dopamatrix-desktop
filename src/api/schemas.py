@@ -37,13 +37,34 @@ class VideoTaskCreate(BaseModel):
             "而非使用系统默认素材池。"
         ),
     )
-    local_overlay_dir: Optional[str] = Field(
+    local_logo_dir: Optional[str] = Field(
         default=None,
         description=(
-            "可选：Y 轴本地贴图目录绝对路径（透明背景 .png 格式 Logo / 贴纸）。"
-            "若提供，AssetSelectNode 将优先从该目录扫描 .png 文件作为叠层素材；"
-            "文件无效或目录为空时，引擎将抛出 ValueError 拦截任务。"
-            "若不提供，则自动回退到系统默认 Y 轴素材池。"
+            "可选：Y 轴 Logo 水印目录（透明背景 .png，常驻右上角）。"
+            "AssetSelectNode 将把其中的 .png 标注 type='logo'。"
+        ),
+    )
+    local_sticker_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选：Y 轴促销贴纸目录（透明背景 .png，居中弹出）。"
+            "AssetSelectNode 将把其中的 .png 标注 type='sticker'。"
+        ),
+    )
+    aspect_ratio: str = Field(
+        default="9:16",
+        description=(
+            "输出画幅比例。支持三种规格：\n"
+            "  '9:16' →  720×1280（竖屏，TikTok / Reels）\n"
+            "  '16:9' → 1280×720 （横屏，YouTube / 横版广告）\n"
+            "  '1:1'  →  720×720 （方形，Instagram Feed）"
+        ),
+    )
+    test_language: str = Field(
+        default="en",
+        description=(
+            "测试语言优先策略：仅生成该语种的 TTS 音频 + 字幕 + 最终变体。"
+            "支持：'en'（英语）| 'ar'（阿语）| 'zh'（中文）等。"
         ),
     )
 
@@ -117,3 +138,21 @@ class HealthResponse(BaseModel):
     status: str
     version: str = "0.1.0"
     db: str = "connected"
+
+
+# ================================================================== #
+# Task Submit Ack (202 Accepted)                                       #
+# ================================================================== #
+
+class TaskSubmitAck(BaseModel):
+    """
+    POST /tasks/submit 的即时响应体（202 Accepted）。
+
+    职责：让前端秒拿到 task_id 以便立即开始轮询，
+    同时给出人类可读的 message 说明任务在排队中。
+    不包含完整资产列表（那是 GET /tasks/{id} 的事）。
+    """
+    task_id:    int
+    session_id: str
+    status:     str = "queued"
+    message:    str = "任务已提交至后台矩阵工厂，请通过 GET /tasks/{task_id} 轮询进度。"
