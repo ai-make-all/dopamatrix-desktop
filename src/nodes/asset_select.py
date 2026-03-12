@@ -88,233 +88,54 @@ class AssetSelectNode(BaseNode):
     def _scan_user_asset_dir(
         self, asset_dir: str, total_duration: float
     ) -> Optional[List[str]]:
-        """
-        扫描用户通过 Tauri Dialog 选取的本地目录，收集符合条件的视频文件。
-
-        1.0 MVP 校验防线：
-          - 格式白名单：仅接受 .mp4 / .mov（忽略大小写）。
-          - 体积红线：单文件超过 200 MB 则警告并跳过。
-          - 零有效文件：扫描完毕后仍无合规文件，抛出 ValueError。
-
-        采样策略：
-          - 文件数量充足时，先随机打乱，再依序填满 total_duration；
-          - 文件较少时，有放回重复抽取（循环补足）；
-          - 目录不存在时，返回 None（触发 fallback 逻辑）。
-
-        Args:
-            asset_dir:      用户选取目录的绝对路径字符串。
-            total_duration: 视频总时长（秒），用于估算所需素材数量。
-
-        Returns:
-            List[str] — 选取的本地视频绝对路径列表（可含重复）。
-
-        Raises:
-            ValueError — 扫描后发现 0 个合规视频文件。
-        """
-        p = Path(asset_dir)
-        if not p.exists() or not p.is_dir():
-            self.log(f"[Scan] ✗ Directory does not exist or is not a folder: {asset_dir}")
-            return None
-
-        # ── Step 1：收集全部普通文件（不预设后缀，由校验层决定取舍）──────────
-        all_files: List[Path] = [f for f in p.iterdir() if f.is_file()]
-
-        # ── Step 2：逐文件执行格式 + 体积校验 ───────────────────────────────
-        valid_files: List[Path] = []
-        for f in all_files:
-            suffix = f.suffix.lower()
-
-            # 格式校验
-            if suffix not in self._ALLOWED_SUFFIXES:
-                logger.warning(
-                    "[Scan] ⚠️ 格式不符，已跳过：%s（仅支持 %s）",
-                    f.name,
-                    ", ".join(sorted(self._ALLOWED_SUFFIXES)),
-                )
-                continue
-
-            # 体积校验
-            try:
-                size_bytes = os.path.getsize(f)
-            except OSError as exc:
-                logger.warning("[Scan] ⚠️ 无法读取文件大小，已跳过：%s — %s", f.name, exc)
-                continue
-
-            if size_bytes > self._MAX_FILE_SIZE_BYTES:
-                size_mb = size_bytes / (1024 * 1024)
-                logger.warning(
-                    "[Scan] ⚠️ 文件超过 200MB 体积红线，已跳过：%s（%.1f MB）",
-                    f.name, size_mb,
-                )
-                continue
-
-            valid_files.append(f)
-
-        # ── Step 3：零有效文件 → 直接抛出异常，终止流程 ──────────────────────
-        if not valid_files:
-            raise ValueError(
-                "本地素材库中没有找到符合要求的有效视频"
-                "（仅支持 mp4/mov，且单文件需小于 200MB）。"
-            )
-
-        self.log(
-            f"[Scan] ✓ 校验通过 {len(valid_files)} 个视频文件（来自：'{asset_dir}'）。"
-        )
-
-        # ── Step 4：按总时长估算所需数量，随机有放回抽样 ──────────────────────
-        AVG_CLIP_DURATION = 5.0
-        needed = max(1, int(total_duration / AVG_CLIP_DURATION) + 1)
-
-        shuffled = valid_files.copy()
-        random.shuffle(shuffled)
-
-        result: List[str] = []
-        while len(result) < needed:
-            result.extend(str(f) for f in shuffled)
-        return result[:needed]
+        # Deprecated: No longer scanning directories
+        return None
 
     def _scan_user_logo_dir(self, logo_dir: str) -> List[str]:
-        """Logo 水印目录扫描：仅接受 .png，单文件 <5MB。"""
-        p = Path(logo_dir)
-        if not p.exists() or not p.is_dir():
-            raise ValueError(f"Logo 目录不存在或无法访问: {logo_dir}")
-        valid: List[str] = []
-        for f in p.iterdir():
-            if not f.is_file() or f.suffix.lower() != self._ALLOWED_OVERLAY_SUFFIX:
-                continue
-            try:
-                if os.path.getsize(f) > self._MAX_OVERLAY_SIZE_BYTES:
-                    logger.warning("[Logo-Scan] 超大跳过: %s", f.name)
-                    continue
-            except OSError:
-                continue
-            valid.append(str(f))
-        if not valid:
-            raise ValueError(f"Logo 目录无有效 PNG: {logo_dir}")
-        self.log(f"[Logo-Scan] {len(valid)} Logo PNG (‘{logo_dir}’)")
-        return valid
+        # Deprecated: No longer scanning directories
+        return []
 
     def _scan_user_sticker_dir(self, sticker_dir: str) -> List[str]:
-        """贴纸目录扫描：仅接受 .png，单文件 <5MB。"""
-        p = Path(sticker_dir)
-        if not p.exists() or not p.is_dir():
-            raise ValueError(f"贴纸目录不存在或无法访问: {sticker_dir}")
-        valid: List[str] = []
-        for f in p.iterdir():
-            if not f.is_file() or f.suffix.lower() != self._ALLOWED_OVERLAY_SUFFIX:
-                continue
-            try:
-                if os.path.getsize(f) > self._MAX_OVERLAY_SIZE_BYTES:
-                    logger.warning("[Sticker-Scan] 超大跳过: %s", f.name)
-                    continue
-            except OSError:
-                continue
-            valid.append(str(f))
-        if not valid:
-            raise ValueError(f"贴纸目录无有效 PNG: {sticker_dir}")
-        self.log(f"[Sticker-Scan] {len(valid)} 贴纸 PNG (‘{sticker_dir}’)")
-        return valid
-
-        """
-        Scan user-supplied Y-axis local directory for valid PNG overlay assets.
-
-        1.0 MVP guard-rails (Y-axis):
-          - Format whitelist : only .png accepted (case-insensitive).
-          - Size cap         : files > 5 MB are warned and skipped.
-          - Zero valid files : raise ValueError so the pipeline stops cleanly.
-          - Dir not found    : raise ValueError (user passed a bad path).
-
-        Args:
-            overlay_dir: Absolute path string of the user-chosen folder.
-
-        Returns:
-            List[str] of absolute paths to valid PNG files.
-
-        Raises:
-            ValueError when the directory is missing or zero qualifying PNGs exist.
-        """
-        p = Path(overlay_dir)
-        if not p.exists() or not p.is_dir():
-            raise ValueError(
-                f"Y\u8f74\u7d20\u6750\u5e93\u9519\u8bef\uff1a\u76ee\u5f55\u4e0d\u5b58\u5728\u6216\u65e0\u6cd5\u8bbf\u95ee: {overlay_dir}\uff0c"
-                "\u8bf7\u786e\u4fdd\u8def\u5f84\u6b63\u786e\u4e14\u6709\u8bfb\u53d6\u6743\u9650\u3002"
-            )
-
-        all_files: List[Path] = [f for f in p.iterdir() if f.is_file()]
-        valid_pngs: List[Path] = []
-
-        for f in all_files:
-            suffix = f.suffix.lower()
-
-            # Format check
-            if suffix != self._ALLOWED_OVERLAY_SUFFIX:
-                logger.warning(
-                    "[Y-Scan] Skipping non-PNG file: %s (only .png transparent overlays allowed).",
-                    f.name,
-                )
-                continue
-
-            # Size check
-            try:
-                size_bytes = os.path.getsize(f)
-            except OSError as exc:
-                logger.warning("[Y-Scan] Cannot read file size, skipping: %s — %s", f.name, exc)
-                continue
-
-            if size_bytes > self._MAX_OVERLAY_SIZE_BYTES:
-                size_mb = size_bytes / (1024 * 1024)
-                logger.warning(
-                    "[Y-Scan] PNG exceeds 5 MB cap, skipping: %s (%.1f MB).",
-                    f.name, size_mb,
-                )
-                continue
-
-            valid_pngs.append(f)
-
-        if not valid_pngs:
-            raise ValueError(
-                "Y\u8f74\u7d20\u6750\u5e93\u9519\u8bef\uff1a\u672a\u627e\u5230\u6709\u6548\u7684\u900f\u660e PNG \u56fe\u7247\uff0c"
-                "\u8bf7\u786e\u4fdd\u6587\u4ef6\u683c\u5f0f\u6b63\u786e\u4e14\u5c0f\u4e8e 5MB\u3002"
-            )
-
-        self.log(
-            f"[Y-Scan] Validated {len(valid_pngs)} PNG file(s) from '{overlay_dir}'."
-        )
-        return [str(f) for f in valid_pngs]
+        # Deprecated: No longer scanning directories
+        return []
 
     def _set_overlay_clips(
         self, context: WorkflowContext, pool_dir: str
     ) -> None:
         """
-        Y 轴双轨拆分：分别扫描 Logo 目录和 Sticker 目录。
-
-        优先级：
-          1. context.local_logo_dir    → 用户 Logo 目录（严格校验）
-          2. context.local_sticker_dir → 用户 Sticker 目录（严格校验）
-          3. 默认素材池（任一目录缺失时 fallback）
+        Y 轴双轨拆分：从数据库 `local_assets_inventory` 获取最少使用的 Logo 和 Sticker。
+        如果没有，则回退到 LocalMatrixProvider 默认素材池。
         """
-        logo_path    = None
+        logo_path = None
         sticker_path = None
+        used_ids = context.assets.get("used_asset_ids", [])
 
-        # ── 用户 Logo 目录 ────────────────────────────────────────────
-        if context.local_logo_dir:
-            try:
-                logo_pngs = self._scan_user_logo_dir(context.local_logo_dir)
-                logo_path = logo_pngs[0]   # 取第一个文件作为 Logo
-                self.log(f"[Y-Logo] 用户目录: logo={logo_path}")
-            except ValueError as exc:
-                self.log(f"[Y-Logo] 扫描失败: {exc}，回退默认池。")
+        # 1. 尝试从数据库获取
+        try:
+            from src.api.database import SessionLocal
+            from src.api.models import LocalAsset
+            with SessionLocal() as db:
+                logo_asset = db.query(LocalAsset).filter(
+                    LocalAsset.asset_type == 'logo',
+                    LocalAsset.is_exhausted == False
+                ).order_by(LocalAsset.usage_count.asc()).first()
+                if logo_asset:
+                    logo_path = logo_asset.file_path
+                    used_ids.append(logo_asset.id)
+                    self.log(f"[Y-Logo] 数据库提取 ID={logo_asset.id}: {logo_path}")
 
-        # ── 用户 Sticker 目录 ──────────────────────────────────────────
-        if context.local_sticker_dir:
-            try:
-                sticker_pngs = self._scan_user_sticker_dir(context.local_sticker_dir)
-                sticker_path = sticker_pngs[0]   # 取第一个文件作为 Sticker
-                self.log(f"[Y-Sticker] 用户目录: sticker={sticker_path}")
-            except ValueError as exc:
-                self.log(f"[Y-Sticker] 扫描失败: {exc}，回退默认池。")
+                sticker_asset = db.query(LocalAsset).filter(
+                    LocalAsset.asset_type == 'sticker',
+                    LocalAsset.is_exhausted == False
+                ).order_by(LocalAsset.usage_count.asc()).first()
+                if sticker_asset:
+                    sticker_path = sticker_asset.file_path
+                    used_ids.append(sticker_asset.id)
+                    self.log(f"[Y-Sticker] 数据库提取 ID={sticker_asset.id}: {sticker_path}")
+        except Exception as exc:
+            self.log(f"[Y-DB] 数据库查询 Y 轴素材失败，回退到默认池: {exc}")
 
-        # ── 默认池 fallback（进入 None 的部分） ─────────────────────────
+        # 2. 默认池 fallback
         if logo_path is None or sticker_path is None:
             try:
                 local_provider = LocalMatrixProvider(pool_dir=pool_dir)
@@ -325,6 +146,7 @@ class AssetSelectNode(BaseNode):
             except Exception as exc:
                 self.log(f"[Y-Default] 默认池获取失败: {exc}")
 
+        context.assets["used_asset_ids"] = used_ids
         context.set_asset("overlay_clips", {"logo": logo_path, "sticker": sticker_path})
         self.log(
             f"[Y-Overlay] logo={logo_path or 'None'}, sticker={sticker_path or 'None'} "
@@ -367,66 +189,115 @@ class AssetSelectNode(BaseNode):
         self, context: WorkflowContext, script_data: dict, scenes: list
     ) -> WorkflowContext:
         """
-        【本地矩阵模式】：按脚本总时长，从本地素材池随机抽取一组视频。
-
-        优先级：
-          1. context.local_asset_dir  → 用户通过 Tauri Dialog 选取的本地目录
-          2. self._pool_dir           → 默认系统素材池（fallback）
-
-        与 Pexels 模式的区别：
-          - 不依赖网络
-          - 一次性按总时长抽取，而非逐场景处理
-          - 返回的路径列表可包含重复文件（有放回抽样）
+        【本地矩阵模式】：按脚本总时长，从数据库 LocalAsset 表提取素材。
+        基于防疲劳 LRU 算法抽取（usage_count 升序），抽取文件供拼装节点使用，
+        并记录使用过的 ID 以便引擎终结时反写。
         """
-        total_duration = self._calc_total_duration(script_data)
+        # 🎯 音频霸权时长控制 (Audio Hegemony Duration Control)
+        target_lang = getattr(context, "test_language", "en") or "en"
+        voice_audio = context.variants.get(target_lang, {}).get("voice_audio")
+        
+        total_duration = 0.0
+        if voice_audio and os.path.exists(voice_audio):
+            import subprocess
+            try:
+                # 使用 ffprobe 读取真实物理时长
+                result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", voice_audio],
+                    capture_output=True, text=True, check=True
+                )
+                total_duration = float(result.stdout.strip())
+                self.log(f"[Audio Hegemony] 从音频 {voice_audio} 获取真实时长 T={total_duration:.2f}s")
+            except Exception as e:
+                self.log(f"[Warning] ffprobe 获取音频时长失败：{e}。回退到脚本预估时长。")
+                total_duration = self._calc_total_duration(script_data)
+        else:
+            self.log("[Warning] 未找到 voice_audio 或文件不存在。回退到脚本预估时长。")
+            total_duration = self._calc_total_duration(script_data)
+
         if total_duration <= 0:
             self.log("Warning: total_duration is 0. Skipping local asset selection.")
             context.set_asset("scene_clips", [])
             return context
 
-        # ── 优先：用户桌面端传入的本地素材目录 ──────────────────────────────
-        if context.local_asset_dir:
-            self.log(
-                f"[Local Mode] 📂 Tauri Asset Dir detected: '{context.local_asset_dir}'. "
-                "Scanning for .mp4 / .mov files..."
-            )
-            scene_clips = self._scan_user_asset_dir(
-                asset_dir=context.local_asset_dir,
-                total_duration=total_duration,
-            )
-            if scene_clips is not None:
-                context.set_asset("scene_clips", scene_clips)
-                self.log(
-                    f"[Local Mode] ✓ {len(scene_clips)} clip(s) from user dir selected "
-                    f"(total ~{total_duration:.1f}s). Written to context.assets['scene_clips']."
-                )
-                # Y-overlay 仍从默认池获取；用户目录通常只含主视频素材
-                self._set_overlay_clips(context, pool_dir=self._pool_dir)
-                return context
-            # 若用户目录扫描失败，发出警告并 fallback 到系统素材池
-            self.log(
-                f"[Local Mode] ⚠️ User asset dir invalid or empty. "
-                "Falling back to default pool."
-            )
+        target_duration = total_duration + 1.0
 
-        # ── 降级：系统默认素材池（LocalMatrixProvider） ──────────────────────
-        self.log(
-            f"[Local Mode] {len(scenes)} scene(s), total duration: {total_duration:.1f}s. "
-            f"Selecting clips from '{self._pool_dir}'..."
-        )
+        AVG_CLIP_DURATION = 5.0
+        original_needed = max(1, int(target_duration / AVG_CLIP_DURATION) + 1)
+        needed = original_needed
+        scene_clips = []
+        used_ids = context.assets.get("used_asset_ids", [])
 
+        # ── 1. 从 local_assets_inventory 数据库抽取 ──────────────────────────────
         try:
-            local_provider = LocalMatrixProvider(pool_dir=self._pool_dir)
-            scene_clips = local_provider.get_clips_for_duration(target_duration=total_duration)
-        except RuntimeError as exc:
-            self.log(
-                f"[Local Mode] ✗ LocalMatrixProvider failed: {exc}. "
-                "scene_clips will be empty; AssemblyNode will fall back to bg_video_path."
-            )
-            context.set_asset("scene_clips", [])
-            context.set_asset("overlay_clips", {"logo": None, "sticker": None})
-            return context
+            from src.api.database import SessionLocal
+            from src.api.models import LocalAsset
+            with SessionLocal() as db:
+                # 步骤 A: 优先抽取 1 个 Hook (如果有的话)
+                hook_asset = db.query(LocalAsset).filter(
+                    LocalAsset.asset_type == 'video',
+                    LocalAsset.video_role == 'hook',
+                    LocalAsset.is_exhausted == False
+                ).order_by(LocalAsset.usage_count.asc()).first()
+                
+                if hook_asset:
+                    scene_clips.append(hook_asset.file_path)
+                    used_ids.append(hook_asset.id)
+                    self.log(f"[Local Mode] 🎯 选取 Hook 片头 ID={hook_asset.id}: {hook_asset.file_path}")
+                    needed -= 1
+                else:
+                    self.log("[Local Mode] ⚠️ 警告: 库里完全没有设置 Hook 素材，退化为原来的全盘随机抽取逻辑。")
 
+                if needed > 0:
+                    # 步骤 B & C: 去查 video_role in ('body', 'general') 且未耗尽的视频
+                    # 绝对禁止跨界抽取 video_role == 'hook'
+                    fill_assets = db.query(LocalAsset).filter(
+                        LocalAsset.asset_type == 'video',
+                        LocalAsset.video_role.in_(['body', 'general']),
+                        LocalAsset.is_exhausted == False
+                    ).order_by(LocalAsset.usage_count.asc()).limit(needed).all()
+                    
+                    # 极端兜底：如果连符合条件的都没有，只回退到 general（依旧不能用 hook）
+                    if not fill_assets:
+                        self.log("[Local Mode] ⚠️ 警告: 库里完全没有未耗尽的 Body 素材，只能将就复用其他 general 素材 (严格排查 hook)。")
+                        fill_assets = db.query(LocalAsset).filter(
+                            LocalAsset.asset_type == 'video',
+                            LocalAsset.video_role == 'general',
+                            LocalAsset.is_exhausted == False
+                        ).order_by(LocalAsset.usage_count.asc()).limit(needed).all()
+
+                    if fill_assets:
+                        # 继续使用剩余素材，直到填满总时长
+                        while len(scene_clips) < original_needed:
+                            for asset in fill_assets:
+                                scene_clips.append(asset.file_path)
+                                used_ids.append(asset.id)
+                                if len(scene_clips) >= original_needed:
+                                    break
+                        self.log(f"[Local Mode] 📂 数据库选取 {len(fill_assets)} 种 Body (或兜底) 素材，循环平铺至完整时长。")
+        except Exception as exc:
+            self.log(f"[Local-DB] 数据库读取视频素材失败或未配置: {exc}")
+
+        # ── 2. 降级：系统默认素材池（如果 DB 没有查到有效结果）───────────────────
+        if not scene_clips:
+            self.log(
+                f"[Local Mode] {len(scenes)} scene(s), total duration: {total_duration:.1f}s. "
+                f"Selecting clips from default pool '{self._pool_dir}'..."
+            )
+
+            try:
+                local_provider = LocalMatrixProvider(pool_dir=self._pool_dir)
+                scene_clips = local_provider.get_clips_for_duration(target_duration=total_duration)
+            except RuntimeError as exc:
+                self.log(
+                    f"[Local Mode] ✗ LocalMatrixProvider failed: {exc}. "
+                    "scene_clips will be empty; AssemblyNode will fall back to bg_video_path."
+                )
+                context.set_asset("scene_clips", [])
+                context.set_asset("overlay_clips", {"logo": None, "sticker": None})
+                return context
+
+        context.assets["used_asset_ids"] = used_ids
         context.set_asset("scene_clips", scene_clips)
         self.log(
             f"[Local Mode] ✓ {len(scene_clips)} clip(s) selected "

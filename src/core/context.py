@@ -8,22 +8,16 @@ class WorkflowContext:
     """
     # 修复处：将 str = None 改为 Optional[str] = None
     def __init__(self, session_id: Optional[str] = None,
-                 local_asset_dir: Optional[str] = None,
-                 local_logo_dir: Optional[str] = None,
-                 local_sticker_dir: Optional[str] = None,
                  aspect_ratio: str = "9:16",
-                 test_language: str = "en"):
+                 test_language: str = "en",
+                 target_duration: int = 15):
         self.session_id = session_id or str(uuid.uuid4())
-        # X 轴：本地视频素材目录（Tauri Dialog 传入）
-        self.local_asset_dir: Optional[str] = local_asset_dir
-        # Y 轴双轨：Logo 水印目录（常驻右上角）
-        self.local_logo_dir: Optional[str] = local_logo_dir
-        # Y 轴双轨：促销贴纸目录（居中弹出）
-        self.local_sticker_dir: Optional[str] = local_sticker_dir
         # 画幅比例
         self.aspect_ratio: str = aspect_ratio
         # 测试语言优先：单次任务仅生成此语种的 TTS+字幕+变体
         self.test_language: str = test_language
+        # 目标视频时长（秒），固定枚举：15 | 30 | 60
+        self.target_duration: int = target_duration
         
         # 存放全局配置 (如：目标语言、分辨率、API Keys)
         self.config: Dict[str, Any] = {}

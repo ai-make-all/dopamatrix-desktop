@@ -54,19 +54,16 @@ if hasattr(sys.stderr, "reconfigure"):
 # ===========================================================================
 
 def _run_single_matrix(session_id: str, user_prompt: str,
-                       local_asset_dir: str | None = None,
-                       local_logo_dir: str | None = None,
-                       local_sticker_dir: str | None = None,
                        aspect_ratio: str = "9:16",
-                       test_language: str = "en") -> dict:
+                       test_language: str = "en",
+                       target_duration: int = 15,
+                       output_dir: str = None) -> dict:
     """
     单个矩阵视频生产 Worker，在独立子进程中执行完整 Pipeline。
 
     Args:
         session_id:        当前任务的唯一标识符（8位短 UUID）
         user_prompt:       视频生成提示词
-        local_asset_dir:   （可选）X 轴：Tauri Desktop 选取的本地视频素材目录绝对路径
-        local_overlay_dir: （可选）Y 轴：透明背景 .png 贴图目录绝对路径
 
     Returns:
         结果字典，包含 session_id、success、assets、error 等字段
@@ -152,21 +149,15 @@ def _run_single_matrix(session_id: str, user_prompt: str,
 
         context = WorkflowContext(
             session_id=session_id,
-            local_asset_dir=local_asset_dir,
-            local_logo_dir=local_logo_dir,
-            local_sticker_dir=local_sticker_dir,
             aspect_ratio=aspect_ratio,
             test_language=test_language,
+            target_duration=target_duration,
         )
         context.config["session_id"] = session_id
+        if output_dir:
+            context.config["output_dir"] = output_dir
         context.set_asset("script", user_prompt)
-        if local_asset_dir:
-            print(f"[Worker {session_id}] 📂 X轴素材: {local_asset_dir}")
-        if local_logo_dir:
-            print(f"[Worker {session_id}] 🎨 Logo: {local_logo_dir}")
-        if local_sticker_dir:
-            print(f"[Worker {session_id}] ✨ Sticker: {local_sticker_dir}")
-        print(f"[Worker {session_id}] 📐 画幅: {aspect_ratio} | 🌐 语言: {test_language}")
+        print(f"[Worker {session_id}] 📐 画幅: {aspect_ratio} | 🌐 语言: {test_language} | ⏱️ 时长: {target_duration}s")
 
 
         # ── 确保输出目录存在 ──────────────────────────────────────────────────
@@ -185,6 +176,7 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             "session_id": session_id,
             "success": True,
             "error": None,
+            "used_asset_ids": final_context.assets.get("used_asset_ids", []),
             "assets": {
                 "video_master": final_context.get_asset("video_master") or "",
                 "variants": {
@@ -205,6 +197,7 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             "success": False,
             "error": str(exc),
             "traceback": tb,
+            "used_asset_ids": [],
             "assets": {},
         }
 
@@ -214,20 +207,16 @@ def _run_single_matrix(session_id: str, user_prompt: str,
 # ===========================================================================
 
 def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
-                       local_asset_dir: str | None = None,
-                       local_logo_dir: str | None = None,
-                       local_sticker_dir: str | None = None,
                        aspect_ratio: str = "9:16",
-                       test_language: str = "en") -> list[dict]:
+                       test_language: str = "en",
+                       target_duration: int = 15,
+                       output_dir: str = None) -> list[dict]:
     """
     启动多进程矩阵批量生产。
 
     Args:
         batch_size:        同时生产的矩阵视频数量
         user_prompt:       所有任务共享的提示词
-        local_asset_dir:   X 轴本地视频素材目录
-        local_logo_dir:    Y 轴 Logo 水印目录
-        local_sticker_dir: Y 轴促销贴纸目录
         aspect_ratio:      画幅比例
         test_language:     测试语言
 
@@ -258,8 +247,7 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
         # 提交所有任务
         future_to_session: dict[Future, str] = {
             executor.submit(_run_single_matrix, sid, user_prompt,
-                            local_asset_dir, local_logo_dir, local_sticker_dir,
-                            aspect_ratio, test_language): sid
+                            aspect_ratio, test_language, target_duration, output_dir): sid
             for sid in sessions
         }
 

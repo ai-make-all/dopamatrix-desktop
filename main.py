@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from src.api.database import engine, Base
 from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
+from src.api import routes_assets
+from src.api import routes_history
 
 
 # ================================================================== #
@@ -93,9 +95,11 @@ async def health_check() -> HealthResponse:
 
 
 # ================================================================== #
-# Phase 5 路由挂载                                                      #
+# Phase 5 & DAM 路由挂载                                                #
 # ================================================================== #
 app.include_router(task_routes.router, prefix="/api/v1")
+app.include_router(routes_assets.router, prefix="/api/v1")
+app.include_router(routes_history.router, prefix="/api/v1")
 
 
 # ================================================================== #

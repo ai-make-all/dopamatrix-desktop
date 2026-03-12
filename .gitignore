@@ -14,6 +14,11 @@ tests/assets/*.mp4
 tests/assets/*.mp3
 tests/assets/*.wav
 
+*.log
+*.sqlite
+*.db
+assets/matrix_pool/
+
 # Python 缓存
 __pycache__/
 *.pyc

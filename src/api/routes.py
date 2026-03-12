@@ -79,19 +79,15 @@ def submit_task(
         session_id        = session_id,
         prompt            = payload.prompt,
         batch_size        = payload.batch_size,
-        local_asset_dir   = payload.local_asset_dir,
-        local_logo_dir    = payload.local_logo_dir,
-        local_sticker_dir = payload.local_sticker_dir,
         aspect_ratio      = payload.aspect_ratio,
         test_language     = payload.test_language,
+        target_duration   = payload.target_duration,
+        output_dir        = payload.output_dir,
     )
 
     print(
         f"[routes] ✅ 任务已入队 task_id={task.id} session={session_id}"
-        + (f" asset={payload.local_asset_dir}" if payload.local_asset_dir else "")
-        + (f" logo={payload.local_logo_dir}" if payload.local_logo_dir else "")
-        + (f" sticker={payload.local_sticker_dir}" if payload.local_sticker_dir else "")
-        + f" ratio={payload.aspect_ratio} lang={payload.test_language}"
+        + f" ratio={payload.aspect_ratio} lang={payload.test_language} duration={payload.target_duration}s"
     )
 
     # 5. 秒回 202（HTTP 请求绝不阻塞 2 分钟！）

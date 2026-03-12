@@ -15,7 +15,6 @@
 4. [核心数据模型 (Key Data Models)](#4-核心数据模型-key-data-models)
 5. [阶段实施规划 (Execution Phases)](#5-阶段实施规划-execution-phases)
 6. [技术红线 (Hard Constraints)](#6-技术红线-hard-constraints)
-7. [客户端生态与 PMF 内测版 (Client Ecosystem MVP v1.0)](#phase-7----客户端生态与-pmf-内测版-client-ecosystem-mvp-v10-)
 
 ---
 
@@ -311,160 +310,88 @@ workflow_def = {
 
 ---
 
-### Phase 3 — 内容生成、混合素材调度与多语言适配 (Content, Hybrid Asset Scheduling & Localization)
+### Phase 3 — 内容生成、混合素材调度与多语言适配 (Content, Hybrid Asset Scheduling & Localization) ✅
 
 **目标**：接入 LLM / TTS，实现混合素材动态调度引擎，攻克阿拉伯语 RTL 在 `.ass` 字幕中的排版。
 
 - [x] 实现 `ScriptGenNode` — LLM 文案生成 (`src/nodes/script_gen_node.py`)
-  - [x] 支持多 LLM Provider（OpenAI / 通义 / 本地模型）
-  - [x] Prompt 模板管理
 - [x] 实现 `TTSNode` — 语音合成 (`src/nodes/tts_node.py`)
-  - [x] 多引擎支持 (Edge TTS / Azure / ElevenLabs)
-  - [x] 时间戳提取 → 用于字幕对齐
-- [ ] 实现 `AssetSelectNode` — **混合素材策略 (Hybrid Asset Strategy)** (`src/nodes/asset_select_node.py`)
-
+- [x] 实现 `AssetSelectNode` — **智能弹药库与 Hook 隔离策略** (`src/nodes/asset_select_node.py`)
   > [!IMPORTANT]
-  > **核心商业逻辑**：架构必须支持在同一条 `Timeline` 中，按照可配置比例将「AI 生成片段」与「本地实拍片段」**穿插混剪**。这是对抗各大社交媒体平台（抖音/TikTok/Reels 等）对「纯 AI 视频」进行查重与限流算法的核心手段。
-
-  支持多 Provider 动态调度与穿插混剪：
-
-  | Provider | 类型 | 职责 |
-  |----------|------|------|
-  | **`LocalMatrixProvider`** | 本地实拍 | 从门店实况、库存录像等本地素材中提取片段，提供基础真实感，是对抗查重的核心锚点 |
-  | **`AIGenProvider`** | AI 生成（预留） | 未来调用大模型（可灵 / Runway 等）生成夸张、表现力强的补充画面，丰富视觉层次 |
-  | **`StockProvider`** | 免费素材库 | 对接 Pexels 等免费素材库兜底，在本地素材不足时自动填充 |
-
-  - [ ] `LocalMatrixProvider` — 本地素材扫描、建索引、关键词/语义检索
-  - [ ] `AIGenProvider` — 标准化接口定义（预留，待大模型 API 接入）
-  - [ ] `StockProvider` — Pexels API 对接与缓存
-  - [ ] 混剪调度器 — 按场景时长比例动态穿插三类素材，生成混合 `Timeline`
-
-- [ ] 实现多语言字幕系统 (`src/localization/`)
-  - [ ] `ass_generator.py` — 从文案 + 时间戳生成 `.ass`
-  - ~~`rtl_utils.py`~~ **已移除** — 实战证明 FFmpeg 原生 HarfBuzz 已完美支持 RTL 连写，已采用极简透传方案，无需 Python 侧预处理
-  - [ ] RTL `.ass` 验证工具（自动检测排版异常）
+  > **核心商业逻辑升级**：废弃单纯的本地文件夹扫描，改为直接读取本地 SQLite 数据库 (`local_assets_inventory`)。
+  > 1. **Hook 隔离**：强制首个镜头抽取 `video_role='hook'` 的黄金片头。
+  > 2. **LRU 防疲劳**：采用“最少使用优先”算法抽取混剪骨料 (`body`)，用完后 `usage_count` 自动 +1。
+- [x] 实现多语言字幕系统 (`src/localization/`)
+  - [x] `ass_generator.py` — 从文案 + 时间戳生成 `.ass`
+  - [x] FFmpeg 原生 HarfBuzz 完美支持 RTL，极简透传。
 - [x] 实现 `SubtitleMuxNode` (`src/nodes/subtitle_mux_node.py`)
-  - [x] Master + .ass → Variant 流式输出
-  - [x] 批量生成多语言变体
-- [ ] 编写 `tests/test_subtitle_mux.py`
+  - [x] Master + .ass → Variant 流式输出 (Test-First 单语种优先渲染)
 
 ---
 
 ### Phase 4 — 高并发矩阵裂变与防封管线 (High-Concurrency Matrix & Anti-Dup) ✅
 
-**目标**：抛弃单线程线性出片，引入 `ProcessPoolExecutor` 多进程池，彻底压榨本地 CPU 多核算力；结合底层防查重参数，实现批量变体的极速裂变，对抗平台限流。
-
-#### 4.1 多进程矩阵引擎 (ProcessPool Matrix Engine)
-
-> [!IMPORTANT]
-> **架构决策**：使用 Python `concurrent.futures.ProcessPoolExecutor` 而非 `ThreadPoolExecutor`。FFmpeg 渲染为 CPU 密集型任务，多线程受 GIL 限制无法有效并行；多进程可真正利用全部 CPU 核心，在 8 核机器上理论实现 8 倍渲染吞吐。
+**目标**：抛弃单线程线性出片，引入 `ProcessPoolExecutor` 多进程池，彻底压榨本地 CPU 多核算力；结合底层防查重参数，实现批量变体的极速裂变。
 
 - [x] 实现 `MatrixEngine` — 多进程任务调度器 (`src/core/matrix_engine.py`)
-  - [x] 基于 `ProcessPoolExecutor` 的任务池，核心数自动感知
-  - [x] 任务队列管理：X 轴（文案/价格/卖点变体）× Y 轴（语言/画幅/风格变体）
-  - [x] 进程间通信：`multiprocessing.Queue` 汇聚实时进度
-  - [x] 优雅的错误隔离：单进程崩溃不影响整体批次
-- [x] 实现批量任务提交接口 — 支持一次性提交 N×M 矩阵任务
-- [x] 编写 `tests/test_matrix_engine.py` — 验证多进程并发与结果收集
-
-#### 4.2 底层防封参数 (Anti-Dup Parameters)
-
+- [x] 实现批量任务提交接口 — 纯异步非阻塞 (返回 HTTP 202)
 - [x] 实现 `AntiDupNode` (`src/nodes/anti_dup_node.py`)
-  - [x] 视觉扰动：微调亮度/对比度/色相 (FFmpeg `eq` / `hue` 滤镜)
-  - [x] 时间扰动：首尾微量裁剪 / 随机变速 (`setpts`, `atempo`)，配合 `LocalMatrixProvider` 实拍片段穿插双重防查重
-  - [x] 音频扰动：音调微调 (`asetrate` + `aresample`)
-  - [x] 元数据清洗：移除 EXIF / 修改容器元数据
-- [x] 编写去重效果验证测试
-
-> [!NOTE]
-> 「**指纹注册机制 (Hash)**」已提升至 Phase 5，依赖 SQLite 数据库基建实现持久化存储，见 §5.3。
+  - [x] 视觉扰动：微调亮度/对比度/色相
+  - [x] 时间扰动：首尾微量裁剪 / 随机变速
 
 ---
 
-### Phase 5 — FastAPI 接口层与数据基建 (Headless API & Data Infrastructure)
+### Phase 5 — FastAPI 接口层与数据基建 (Headless API & Data Infrastructure) ✅
 
-**目标**：构建标准化的 Headless API 接口层，引入轻量级数据库实现任务流与资产指纹的持久化管理，为 GrowthOS 等上层系统提供规范化的对接契约。
+**目标**：构建标准化的 Headless API 接口层，引入轻量级数据库实现任务流与资产指纹的持久化管理。
 
-#### 5.1 数据库基建 (SQLite / SQLAlchemy)
+#### 5.1 数据库基建 (SQLite / SQLAlchemy) ✅
+- [x] 设计并实现 ORM 数据模型 (`src/db/models.py`)
+  - [x] `VideoTask` — 任务流记录。
+  - [x] `LocalAsset` (`local_assets_inventory`) — 本地 DAM 资产大盘，包含 `file_hash`, `usage_count`, `video_role`, `is_exhausted` 等疲劳度管理字段。
 
-> [!IMPORTANT]
-> 引入 **SQLite + SQLAlchemy** 作为本地轻量级数据库，满足本地优先部署原则，同时保留迁移至 PostgreSQL 的路径。
-
-- [ ] 设计并实现 ORM 数据模型 (`src/db/models.py`)
-  - [ ] `VideoTask` — 任务流记录（任务 ID、状态、创建时间、耗时、成本估算）
-  - [ ] `VideoAsset` — 资产指纹记录（文件路径、`file_hash`、`perceptual_hash`、来源 Provider、注册时间）
-- [ ] 实现数据库初始化与迁移脚本 (`src/db/init_db.py`)
-- [ ] 实现 CRUD 操作层 (`src/db/crud.py`)
-
-#### 5.2 FastAPI 接口层 (`src/api/`)
-
-- [ ] `schemas.py` — Pydantic 请求/响应模型定义
-
-  > [!IMPORTANT]
-  > **Response 强制字段**：每次批量渲染完成后，API 返回体**必须**包含：
-  > - `file_hash` / `perceptual_hash` — 本批次各视频的指纹，供外部 GrowthOS 系统去重防重
-  > - `llm_tokens_used` / `tts_duration_seconds` — 大模型 Token 用量与 TTS 时长（用于成本预估估算，辅助上层系统核算 ROI）
-  > - `estimated_cost_usd` — 综合成本预估（Token 单价 × 用量 + TTS 费率 × 时长）
-
-- [ ] `routes.py` — 核心端点
-  - [ ] `POST /tasks/submit` — 提交渲染任务（写入 `VideoTask`）
-  - [ ] `POST /tasks/{id}/run` — 执行工作流，完成后更新任务状态与成本字段
-  - [ ] `GET /tasks/{id}/status` — 查询任务状态与完整结果（含 hash + 成本）
-  - [ ] `GET /assets/list` — 资产指纹库浏览
-  - [ ] WebSocket `/ws/tasks/{id}/progress` — 实时进度推送
-- [ ] 实现 `main.py` — FastAPI 启动入口
-
-#### 5.3 指纹注册机制 (Hash Registry) ← *从 Phase 4 迁入*
-
-- [ ] 在 `AntiDupNode` 完成渲染后，调用 CRUD 层将 `file_hash` + `perceptual_hash` 持久化写入 `VideoAsset` 表
-- [ ] 任务提交时预检查 `perceptual_hash` 是否已存在，避免重复渲染
-- [ ] 编写 `tests/test_hash_registry.py` — 验证指纹注册与碰撞检测
+#### 5.2 FastAPI 接口层 (`src/api/`) ✅
+- [x] `POST /tasks/submit` — 异步提交渲染任务，立即返回 202。
+- [x] `POST /assets/import` — 物理 MD5 防重导入素材。
+- [x] `GET /assets/list` — 资产指纹库浏览与状态下发。
+- [x] **Webhook 异步回调**：任务完成后向 `WEBHOOK_URL` 推送包含最终视频路径与 Hash 的结案报告。
 
 ---
 
 ### Phase 6 — Agent & 增长大脑对接 (Headless API)
 
-**目标**：将渲染管线封装为标准化 Headless API，不仅供普通 AI Agent 单向调用，更要支持「**双向学习**」——允许外部增长大脑 (GrowthOS) 通过 API 动态向本系统注入最新的转化策略与 Prompt 模板，形成闭环迭代。
+**目标**：将渲染管线封装为标准化 API，支持「**双向学习**」——允许外部增长大脑 (GrowthOS) 动态向本系统注入最新的转化策略。
 
 #### 6.1 Agent 调用接口 (Outbound — ClipFlow 作为工具)
-
 - [ ] 定义 Agent Tool Schema（OpenAI Function Calling 兼容格式）
-  - [ ] `generate_video_tool` — 一键从文案到成品视频（返回含 hash + 成本的完整报告）
-  - [ ] `remix_video_tool` — 对已有素材重新混剪
-  - [ ] `localize_video_tool` — 对 Master 生成指定语言变体
-- [ ] 实现 Headless CLI 入口 (`clipflow-cli`)
-- [ ] 编写集成测试 — 模拟 Agent 调用完整管线
 
 #### 6.2 双向学习注入接口 (Inbound — GrowthOS 向 ClipFlow 写入策略)
-
 > [!IMPORTANT]
-> **核心设计**：GrowthOS（或任何外部大脑）可通过以下接口，将其从数据分析中习得的最优策略**动态注入**到 ClipFlow 的渲染参数中，无需重新部署代码，实现策略的热更新。
+> **核心设计**：GrowthOS 可通过以下接口，将其从数据分析中习得的最优策略**动态注入**到 ClipFlow，接管本地引擎的抽卡逻辑。
 
-- [ ] `POST /strategies/overlay_clips` — 注入最新的 `overlay_clips` 配置（Y 轴转化策略：贴纸、Logo、CTA 动画等），覆盖本地默认配置
-- [ ] `POST /strategies/prompt_templates` — 注入最新的 LLM Prompt 模板（爆款文案结构、钩子句式等），写入数据库供后续任务使用
-- [ ] `GET /strategies/active` — 查询当前生效的策略版本与来源
-- [ ] 策略版本管理：每次注入记录版本号与时间戳，支持回滚至上一版本
-- [ ] 编写 API 文档 & GrowthOS 接入示例
+- [ ] `POST /strategies/x_axis_hooks` — 注入 X 轴黄金片头策略（下发高 ROI 素材的 file_hash，强制本地引擎在下次渲染时绝对优先调用该 Hook，接管本地 LRU 算法）。
+- [ ] `POST /strategies/overlay_clips` — 注入最新的 Y 轴转化策略（贴纸、Logo 等）。
+- [ ] `POST /strategies/prompt_templates` — 注入最新的 LLM Prompt 模板。
+- [ ] `GET /strategies/active` — 查询当前生效的策略版本与来源。
 
 ---
 
 ### Phase 7 — 客户端生态与 PMF 内测版 (Client Ecosystem MVP v1.0) 🚀
 
-**目标**：在不污染 ClipFlow 底层纯净引擎的前提下，构建面向 B端/C端 客户的交互外壳，完成 PMF (产品市场契合度) 的商业化验证。
+**目标**：在不污染底层纯净引擎的前提下，构建面向 B端/C端 客户的交互外壳，完成商业化验证。
 
-#### 7.1 B端重度客户：桌面端矩阵工作站 (Tauri + Vue 3) [当前分支: feature/tauri-desktop]
-
-> **定位**：部署在客户本地电脑，调用本地高配算力，直接读取本地素材库的「航空驾驶舱」。
-- [x] Tauri 机甲初始化与 Vue 3 UI 挂载
-- [ ] **本地素材挂载 (Local Asset Injection)**：引入 Tauri Dialog 插件，允许用户通过原生弹窗选择本地 `X轴` (实拍素材) 和 `Y轴` (贴纸/Logo) 的绝对路径，透传给底层 FFmpeg 引擎。
-- [ ] **ROI 与产出看板 (Dashboard)**：在本地 SQLite 中记录每次矩阵生成的 Token 成本估算，提供极简的数据统计大屏，向客户直观展示“印钞机”的效率。
+#### 7.1 B端重度客户：桌面端矩阵工作站 (Tauri + Vue 3) [状态：v1.0 MVP 封板中]
+> **定位**：部署在客户本地电脑，双视图混合架构的「私有化印钞机」。
+- [x] **架构升级**：实现“首屏 ROI 看板” + “沉浸式 AI Feed 工作台”的双视图平滑切换。
+- [x] **数字资产管理 (DAM)**：独立的素材库面板，可视化展示 X轴/Y轴素材的“疲劳度血条”与“引用次数”，支持设置 Hook 身份。
+- [x] **异步无阻塞体验**：前端任务 Feed 流 + 轮询/Webhook 状态更新，告别干等。
 - [ ] 打包分发：构建 `.exe` / `.dmg` 独立安装包。
 
-#### 7.2 C端轻量客户：移动端极速投喂 (Telegram Bot) [独立仓库规划]
-
-> **定位**：面向汽修店老板/导购，无须安装 App，聊天式一键出片。
-- [ ] 独立微服务：Node.js + Telegraf 架构。
-- [ ] 交互闭环：接收用户手机拍摄的短视频 → 调用大模型生成 Prompt → 调用云端 ClipFlow `POST /tasks/submit` → 返回最终带指纹的成品视频。
+#### 7.2 C端轻量客户：移动端极速投喂 (Telegram/Discord Bot) [状态：新开战线]
+> **定位**：面向汽修店老板/买量投放手，移动办公的“极速触角”与 PLG 转化漏斗。
+- [ ] **独立微服务**：Node.js + Telegraf/Discord.js 架构。
+- [ ] **业务闭环**：接收移动端素材 -> 调用桌面端 API -> 接收 Webhook 拿视频 -> Bot 内原生转发分享。
+- [ ] **C 转 B 商业化漏斗**：设置免费产出配额墙，引导高频客户升级“企业版专属桌面主机”。
 
 ---
 

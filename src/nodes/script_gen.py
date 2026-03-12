@@ -112,10 +112,27 @@ class ScriptGenNode(BaseNode):
         self.log(f"Calling LLM provider [{type(self._provider).__name__}]...")
         self.log(f"User prompt: {user_prompt[:80]}{'...' if len(user_prompt) > 80 else ''}")
 
+        # --- 动态构建时长约束指令，驯服 LLM 严格控制字数 ---
+        target_duration: int = getattr(context, "target_duration", 15)
+        word_min = int(target_duration * 2.3)
+        word_max = int(target_duration * 2.8)
+        duration_constraint = (
+            f"\n\n\u3010\u6781\u5ea6\u91cd\u8981\u2014\u2014\u65f6\u957f\u63a7\u5236 (DO NOT IGNORE)\u3011\n"
+            f"\u4f60\u751f\u6210\u7684\u914d\u97f3\u6587\u6848\uff08Voiceover\uff09\u5728\u6b63\u5e38\u8bed\u901f\u4e0b\u671d\u8bfb\uff0c\u5fc5\u987b\u6781\u5176\u63a5\u8fd1 {target_duration} \u79d2\u3002\n"
+            f"\u8bf7\u4e25\u683c\u5c06\u6240\u6709 scene \u7684 narrations \u914d\u97f3\u6587\u5b57\u603b\u6570\uff08\u5355\u8bcd\u6570\uff09"
+            f"\u63a7\u5236\u5728 {word_min} \u5230 {word_max} \u4e2a\u5355\u8bcd\u4e4b\u95f4\uff01\n"
+            f"\u7edd\u5bf9\u4e0d\u5141\u8bb8\u8d85\u6807\uff0c\u5426\u5219\u7cfb\u7edf\u4f1a\u5d29\u6e83\uff01"
+        )
+        effective_system_prompt = _SYSTEM_PROMPT + duration_constraint
+
+        self.log(
+            f"目标时长: {target_duration}s | 字数生效区间: [{word_min}, {word_max}]"
+        )
+
         # --- 调用 LLM ---
         result: dict = self._provider.generate_script(
             prompt=user_prompt,
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=effective_system_prompt,
         )
 
         # --- 基础结构校验 ---

@@ -143,11 +143,10 @@ def run_matrix_job(
     session_id:        str,
     prompt:            str,
     batch_size:        int,
-    local_asset_dir:   Optional[str] = None,
-    local_logo_dir:    Optional[str] = None,
-    local_sticker_dir: Optional[str] = None,
     aspect_ratio:      str = "9:16",
     test_language:     str = "en",
+    target_duration:   int = 15,
+    output_dir:        Optional[str] = None,
 ) -> None:
     """
     矩阵批量生成后台任务。
@@ -160,11 +159,9 @@ def run_matrix_job(
         session_id:         日志追踪用
         prompt:             剧本提示词
         batch_size:         矩阵变体数量
-        local_asset_dir:    X 轴本地视频素材目录
-        local_logo_dir:     Y 轴 Logo 水印目录
-        local_sticker_dir:  Y 轴促销贴纸目录
         aspect_ratio:       画幅比例
         test_language:      测试语言（仅生成该语种的 TTS+字幕+变体）
+        target_duration:    目标视频时长（秒），固定枚举：15 | 30 | 60
     """
     # ── 必须在函数内部导入，避免 FastAPI 启动时触发多进程相关副作用 ──
     from dotenv import load_dotenv
@@ -172,9 +169,11 @@ def run_matrix_job(
 
     from run_matrix_factory import run_matrix_factory
     from src.api.database import SessionLocal
-    from src.api.models import VideoTask, VideoAsset
+    from src.api.models import VideoTask, VideoAsset, LocalAsset, TaskHistory
+    import time  # 引入 time 模块以计算精准耗时
 
     db = SessionLocal()
+    start_time = time.time() # 记录任务真实开始时间
 
     # 用于 Webhook 的终态变量（在 finally 块使用）
     _final_status:  str   = "failed"
@@ -199,21 +198,25 @@ def run_matrix_job(
         results: list[dict] = run_matrix_factory(
             batch_size=batch_size,
             user_prompt=prompt,
-            local_asset_dir=local_asset_dir,
-            local_logo_dir=local_logo_dir,
-            local_sticker_dir=local_sticker_dir,
             aspect_ratio=aspect_ratio,
             test_language=test_language,
+            target_duration=target_duration,
+            output_dir=output_dir,
         )
 
         # 3. 统计成本 & 收集资产
         total_tokens:   int   = 0
         total_tts_sec:  float = 0.0
         asset_rows: list[VideoAsset] = []
+        used_asset_ids: list[int] = []
+        history_assets: list[dict] = [] # 用于存入 TaskHistory.output_assets
 
         for result in results:
             if not result.get("success"):
                 continue
+
+            # Only append used assets for successful result variations to prevent false fatigue deductions
+            used_asset_ids.extend(result.get("used_asset_ids", []))
 
             variants: dict[str, str] = result.get("assets", {}).get("variants", {})
             for lang, file_path in variants.items():
@@ -230,6 +233,7 @@ def run_matrix_job(
                     created_at      = _now(),
                 )
                 asset_rows.append(asset)
+                history_assets.append({"path": file_path, "hash": fh})
                 print(f"[services]   📦 [{lang}] {file_path}  MD5={fh[:8]}…")
 
             total_tokens  += result.get("llm_tokens_used",      0) or 0
@@ -238,6 +242,37 @@ def run_matrix_job(
         # 4. 批量写入资产指纹
         if asset_rows:
             db.add_all(asset_rows)
+
+        # 4.5. 疲劳值反写闭环（事务一致性保护）
+        if used_asset_ids:
+            # 去重
+            unique_ids = list(set(used_asset_ids))
+            local_assets = db.query(LocalAsset).filter(LocalAsset.id.in_(unique_ids)).all()
+            for la in local_assets:
+                # 每个 ID 的实际使用次数（因为同一素材在多进程可能被使用多次）
+                usage_increment = used_asset_ids.count(la.id)
+                la.usage_count += usage_increment
+                la.last_used_at = _now()
+                # 满 10 次则疲劳耗竭
+                if la.usage_count >= 10:
+                    la.is_exhausted = True
+            
+            print(f"[services] 🔄 疲劳值闭环：更新了 {len(local_assets)} 个有效任务消耗素材。")
+
+        # 4.6 写入 TaskHistory 记录历史
+        if history_assets:
+            # 使用精准的系统时间差，保留 1 位小数
+            real_duration = round(time.time() - start_time, 1)
+            history_record = TaskHistory(
+                task_id=session_id, # 根据业务需求，通常用可以对外暴露的 session_id 或 UUID
+                prompt=prompt,
+                batch_size=batch_size,
+                duration=real_duration, 
+                output_assets=history_assets,
+                created_at=_now()
+            )
+            db.add(history_record)
+            print(f"[services] 🕒 往 task_history 表写入了 1 条历史归档记录")
 
         # 5. 更新任务状态 & 成本
         cost = _estimate_cost(total_tokens, total_tts_sec)

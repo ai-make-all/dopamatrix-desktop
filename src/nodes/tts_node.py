@@ -190,19 +190,44 @@ class TTSNode(BaseNode):
             )
             return context
 
-        output_path = self._output_dir / f"voice_{target_lang}.mp3"
-        vtt_path    = self._output_dir / f"voice_{target_lang}.vtt"
+        session_id = getattr(context, "session_id", context.config.get("session_id", "default"))
+        output_path = self._output_dir / f"voice_{session_id}_{target_lang}.mp3"
+        vtt_path    = self._output_dir / f"voice_{session_id}_{target_lang}.vtt"
 
         self.log(
             f"[{target_lang}] voice={voice} | "
             f"text_length={len(text)} chars → {output_path}"
         )
 
-        self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
+        max_retries = 3
+        success = False
+        last_error = None
 
-        if not output_path.exists() or output_path.stat().st_size == 0:
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
+                
+                if not output_path.exists():
+                    raise RuntimeError(f"Output file missing after TTS: {output_path}")
+                
+                # Check for minimum file size to prevent 0-byte or corrupted clips
+                file_size = output_path.stat().st_size
+                if file_size < 1024:
+                    raise RuntimeError(f"Output file too small ({file_size} bytes), likely corrupted: {output_path}")
+
+                success = True
+                break  # If successful, exit the retry loop
+                
+            except Exception as e:
+                last_error = e
+                self.log(f"[Warning] [{target_lang}] TTS generation failed on attempt {attempt}/{max_retries}: {e}")
+                import time
+                if attempt < max_retries:
+                    time.sleep(1) # Small backoff before retrying
+
+        if not success:
             raise RuntimeError(
-                f"[TTSNode] Output file missing or empty after TTS: {output_path}"
+                f"[TTSNode] TTS audio generation failed or file corrupted after {max_retries} attempts. Last error: {last_error}"
             )
 
         file_size_kb = output_path.stat().st_size / 1024

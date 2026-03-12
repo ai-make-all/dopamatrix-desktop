@@ -393,7 +393,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         target_lang = getattr(context, "test_language", "en") or "en"
         self.log(f"[Test-First] 字幕仅生成语言 '{target_lang}'")
 
-        ass_path = str(output_dir / f"sub_{target_lang}.ass")
+        session_id = getattr(context, "session_id", context.config.get("session_id", "default"))
+        ass_path = str(output_dir / f"sub_{session_id}_{target_lang}.ass")
         vtt_path: str = (context.variants.get(target_lang) or {}).get("vtt_path", "")
 
         # ── 精准模式：VTT → 聚合短句 → 多行 Dialogue ─────────────────

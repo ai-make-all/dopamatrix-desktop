@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from typing import List, Tuple
 
@@ -338,7 +339,7 @@ class FFmpegCompositorNode(BaseNode):
             self.log(
                 f"[ERROR] FFmpeg exited with code {exc.returncode}. stderr:\n{exc.stderr}"
             )
-            return context
+            raise RuntimeError(f"FFmpeg render failed: {exc.stderr}")
 
         # 7. 将母带路径写回 Context
         context.set_asset("video_master", output_path)
@@ -406,11 +407,11 @@ class FFmpegCompositorNode(BaseNode):
                 video_fg = ""
                 video_map = ["-map", "0:v"]
 
-            # ── 音频滤镜：apad 延长至视频长度 ────────────────────────────
+            # ── 音频映射：直接映射原始音频流，让 -shortest 以视频流截断 ───────
             if has_voice:
-                # [1:a]apad：将配音后面补静音到无限长，-shortest 以视频为准截断
-                audio_fg = "[1:a]apad[outa]"
-                audio_map = ["-map", "[outa]"]
+                # 直接映射 1:a，不使用 apad 以免无限填充导致 -shortest 失效
+                audio_fg = ""
+                audio_map = ["-map", "1:a"]
                 audio_codec = ["-c:a", "aac", "-b:a", "192k"]
                 shortest = ["-shortest"]
             else:
@@ -452,11 +453,21 @@ class FFmpegCompositorNode(BaseNode):
                 )
                 self.log(f"[{lang}] [OK] Variant rendered: {final_path}")
                 context.set_variant_asset(lang, "final_video", final_path)
+                
+                # Check for custom output_dir and copy final render
+                custom_output_dir = context.config.get("output_dir")
+                if custom_output_dir:
+                    os.makedirs(custom_output_dir, exist_ok=True)
+                    target_file_path = os.path.join(custom_output_dir, os.path.basename(final_path))
+                    shutil.copy(final_path, target_file_path)
+                    self.log(f"[{lang}] [OK] Copied final video to custom output dir: {target_file_path}")
             except FileNotFoundError:
                 self.log(f"[{lang}] [ERROR] ffmpeg binary not found.")
             except subprocess.CalledProcessError as exc:
                 # 只打最后 800 字符，避免日志爆炸
+                error_msg = exc.stderr[-800:] if exc.stderr else "Unknown error"
                 self.log(
                     f"[{lang}] [ERROR] Variant render failed "
-                    f"(exit {exc.returncode}):\n{exc.stderr[-800:]}"
+                    f"(exit {exc.returncode}):\n{error_msg}"
                 )
+                raise RuntimeError(f"FFmpeg render failed: {error_msg}")

@@ -22,6 +22,7 @@ class VideoTaskCreate(BaseModel):
     """
     POST /tasks/submit  请求体。
     调用方（Agent / GrowthOS / CLI / Tauri Desktop）提交一个新的矩阵生成任务。
+    弹药完全由内部按 LRU（最少使用）算法自动补给。
     """
     session_id: Optional[str] = Field(
         default=None,
@@ -29,28 +30,6 @@ class VideoTaskCreate(BaseModel):
     )
     prompt:     str = Field(..., min_length=1, description="剧本要求或主题文案。")
     batch_size: int = Field(default=1, ge=1, le=256, description="矩阵变体数量。")
-    local_asset_dir: Optional[str] = Field(
-        default=None,
-        description=(
-            "可选：Tauri Desktop 通过 dialog 选取的本地素材目录绝对路径。"
-            "若提供，AssetSelectNode 将优先从该目录扫描 .mp4 / .mov 文件作为视频素材，"
-            "而非使用系统默认素材池。"
-        ),
-    )
-    local_logo_dir: Optional[str] = Field(
-        default=None,
-        description=(
-            "可选：Y 轴 Logo 水印目录（透明背景 .png，常驻右上角）。"
-            "AssetSelectNode 将把其中的 .png 标注 type='logo'。"
-        ),
-    )
-    local_sticker_dir: Optional[str] = Field(
-        default=None,
-        description=(
-            "可选：Y 轴促销贴纸目录（透明背景 .png，居中弹出）。"
-            "AssetSelectNode 将把其中的 .png 标注 type='sticker'。"
-        ),
-    )
     aspect_ratio: str = Field(
         default="9:16",
         description=(
@@ -66,6 +45,17 @@ class VideoTaskCreate(BaseModel):
             "测试语言优先策略：仅生成该语种的 TTS 音频 + 字幕 + 最终变体。"
             "支持：'en'（英语）| 'ar'（阿语）| 'zh'（中文）等。"
         ),
+    )
+    target_duration: int = Field(
+        default=15,
+        description=(
+            "目标视频时长（秒），固定枚举值：15 | 30 | 60。"
+            "用于驯服 LLM 剧本生成节点，精准控制配音字数与视频总长。"
+        ),
+    )
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="可选：自定义最终成品视频输出目录绝对路径。"
     )
 
 
@@ -156,3 +146,39 @@ class TaskSubmitAck(BaseModel):
     session_id: str
     status:     str = "queued"
     message:    str = "任务已提交至后台矩阵工厂，请通过 GET /tasks/{task_id} 轮询进度。"
+
+# ================================================================== #
+# LocalAsset Schemas                                                 #
+# ================================================================== #
+
+class LocalAssetCreate(BaseModel):
+    file_paths: List[str] = Field(..., description="本地素材文件绝对路径列表")
+    asset_type: str = Field(..., description="枚举: 'video', 'logo', 'sticker'")
+    video_role: str = Field(default="general", description="枚举: 'hook', 'body', 'general'")
+    tags: Optional[List[str]] = Field(default=[], description="自定义标签内容，例如 ['高转化', 'Hook']")
+
+class AssetRoleUpdate(BaseModel):
+    video_role: str = Field(..., description="枚举: 'hook', 'body', 'general'")
+
+class LocalAssetImportResponse(BaseModel):
+    success_count: int
+    skipped_count: int
+    message: str
+
+
+class LocalAssetResponse(BaseModel):
+    """
+    前端查询素材库接口的响应模型
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    file_hash: str
+    file_path: str
+    asset_type: str
+    video_role: str
+    usage_count: int
+    tags: Optional[List[str]] = None
+    is_exhausted: bool
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
