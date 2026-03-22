@@ -2,26 +2,27 @@
 TTSNode — 多语言文字转语音节点
 
 设计原则：
-  使用 edge-tts CLI（subprocess.run）驱动 TTS，而非直接调用 async Python API。
-  这样可以在同步的 WorkflowEngine 中无缝运行，无需引入 asyncio 事件循环管理。
+  使用 edge_tts Python 原生异步 API 驱动 TTS，通过 asyncio.run() 在同步
+  WorkflowEngine 中执行，彻底消除对 edge-tts CLI 可执行文件的依赖，
+  从根本上解决生产环境 PATH 缺失导致的 [WinError 2] 崩溃。
 
 数据流：
   读取  → context.assets["script_data"]   (ScriptGenNode 输出的分镜 JSON)
   写入  → context.variants[lang]["voice_audio"]  (各语言 MP3 路径)
+          context.variants[lang]["vtt_path"]     (各语言 WebVTT 字幕路径)
 
 语音配置：
   en → en-US-AriaNeural   （美式英语，自然女声，适合品牌/广告内容）
   ar → ar-SA-HamedNeural  （沙特阿拉伯语，男声，覆盖中东市场）
-
-CLI 命令格式：
-  edge-tts --voice <voice> --text "<text>" --write-media <output.mp3>
 """
 
-import os
-import subprocess
+import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Dict
+
+import edge_tts
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
@@ -35,9 +36,6 @@ VOICE_MAP: Dict[str, str] = {
     "en": "en-US-AriaNeural",
     "ar": "ar-SA-HamedNeural",
 }
-
-# edge-tts 在不同环境下的可执行程序名（Windows 和 Unix 均可用）
-_EDGE_TTS_CMD = "edge-tts"
 
 
 class TTSNode(BaseNode):
@@ -61,10 +59,10 @@ class TTSNode(BaseNode):
     执行后写入 Context：
         context.variants["en"]["voice_audio"] → "output/voice_en.mp3"
         context.variants["ar"]["voice_audio"] → "output/voice_ar.mp3"
-        （每种 script_data 中出现的语言均会生成对应 MP3）
+        （每种 script_data 中出现的语言均会生成对应 MP3 + VTT）
 
     参数：
-        output_dir: MP3 文件输出目录，默认 "output"
+        output_dir: MP3/VTT 文件输出目录，默认 "output"
         voice_map:  语言代码 → edge-tts 音色名称的映射表，默认使用 VOICE_MAP
         rate:       语速调整，格式为 "+0%"（默认不调整）
     """
@@ -100,43 +98,57 @@ class TTSNode(BaseNode):
 
         return {lang: "\n".join(lines) for lang, lines in narrations.items()}
 
+    async def _run_tts_async(
+        self, voice: str, text: str, output_path: Path, vtt_path: Path
+    ) -> None:
+        """
+        使用 edge_tts Python 原生 API 流式生成音频并同步收集字幕事件。
+
+        通过 communicate.stream() 逐块写入 MP3 文件，同时将 WordBoundary
+        事件喂给 SubMaker。流结束后，将 SRT 内容转换为 WebVTT 格式写入文件。
+        整个过程无需 subprocess，不依赖任何外部可执行文件。
+        """
+        communicate = edge_tts.Communicate(text, voice, rate=self._rate)
+        submaker = edge_tts.SubMaker()
+
+        with open(str(output_path), "wb") as audio_file:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_file.write(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    submaker.feed(chunk)
+
+        # SRT → WebVTT：添加 WEBVTT 头，并将时间戳分隔符从逗号改为句点
+        srt_content = submaker.get_srt()
+        vtt_content = "WEBVTT\n\n" + srt_content.replace(",", ".")
+        with open(str(vtt_path), "w", encoding="utf-8") as vtt_file:
+            vtt_file.write(vtt_content)
+
     def _run_tts(self, voice: str, text: str, output_path: Path, vtt_path: Path) -> None:
         """
-        调用 edge-tts CLI，将 text 转换为 MP3 文件，并同步生成 .vtt 时间轴文件。
+        同步包装器：在当前线程中启动独立事件循环执行异步 TTS 任务。
 
-        命令格式：
-          edge-tts --voice {voice} --rate {rate} --text "{text}"
-                   --write-media  {output_path}
-                   --write-subtitles {vtt_path}
-
-        如果命令失败，抛出 RuntimeError（包含 stderr 信息方便诊断）。
+        asyncio.run() 每次都创建一个全新的事件循环并在结束后关闭，
+        可在 WorkflowEngine 的 ThreadPoolExecutor 环境中安全调用，
+        不会与主线程或其他工作线程的事件循环产生冲突。
         """
-        cmd = [
-            _EDGE_TTS_CMD,
-            "--voice", voice,
-            "--rate", self._rate,
-            "--text", text,
-            "--write-media", str(output_path),
-            "--write-subtitles", str(vtt_path),   # 生成精准分句时间轴
-        ]
-
-        self.log(f"Running: {' '.join(cmd[:4])} ... --write-media {output_path.name} --write-subtitles {vtt_path.name}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        self.log(
+            f"Running: edge_tts.Communicate(voice={voice!r}, rate={self._rate!r})"
+            f" → {output_path.name} + {vtt_path.name}"
         )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"[TTSNode] edge-tts failed for voice '{voice}'.\n"
-                f"Return code: {result.returncode}\n"
-                f"stderr: {result.stderr.strip()}\n"
-                f"stdout: {result.stdout.strip()}"
+        try:
+            asyncio.run(
+                self._run_tts_async(
+                    voice=voice,
+                    text=text,
+                    output_path=output_path,
+                    vtt_path=vtt_path,
+                )
             )
+        except Exception as e:
+            raise RuntimeError(
+                f"[TTSNode] edge_tts API failed for voice '{voice}': {e}"
+            ) from e
 
     # ------------------------------------------------------------------
     # 节点执行入口
@@ -206,28 +218,31 @@ class TTSNode(BaseNode):
         for attempt in range(1, max_retries + 1):
             try:
                 self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
-                
+
                 if not output_path.exists():
                     raise RuntimeError(f"Output file missing after TTS: {output_path}")
-                
-                # Check for minimum file size to prevent 0-byte or corrupted clips
+
                 file_size = output_path.stat().st_size
                 if file_size < 1024:
-                    raise RuntimeError(f"Output file too small ({file_size} bytes), likely corrupted: {output_path}")
+                    raise RuntimeError(
+                        f"Output file too small ({file_size} bytes), likely corrupted: {output_path}"
+                    )
 
                 success = True
-                break  # If successful, exit the retry loop
-                
+                break
+
             except Exception as e:
                 last_error = e
-                self.log(f"[Warning] [{target_lang}] TTS generation failed on attempt {attempt}/{max_retries}: {e}")
-                import time
+                self.log(
+                    f"[Warning] [{target_lang}] TTS attempt {attempt}/{max_retries} failed: {e}"
+                )
                 if attempt < max_retries:
-                    time.sleep(1) # Small backoff before retrying
+                    time.sleep(1)
 
         if not success:
             raise RuntimeError(
-                f"[TTSNode] TTS audio generation failed or file corrupted after {max_retries} attempts. Last error: {last_error}"
+                f"[TTSNode] TTS audio generation failed after {max_retries} attempts. "
+                f"Last error: {last_error}"
             )
 
         file_size_kb = output_path.stat().st_size / 1024
@@ -244,4 +259,3 @@ class TTSNode(BaseNode):
 
         self.log(f"TTS complete. Registered voice_audio for: [{target_lang}]")
         return context
-

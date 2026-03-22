@@ -29,8 +29,8 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ── 加载 .env 环境变量（必须在任何业务模块导入之前执行）────────────────────
-from dotenv import load_dotenv
-load_dotenv()
+from src.utils.env_utils import load_env
+load_env()
 
 # ── 导入核心组件 ─────────────────────────────────────────────────────────────
 from src.core.base_node import BaseNode
@@ -125,7 +125,7 @@ def build_pipeline() -> tuple[WorkflowEngine, WorkflowContext]:
         AssetSelectNode(output_dir="output/clips"),
         TranslationBridgeNode(),
         SubtitleNode(),
-        AssemblyNode(bg_video_path="tests/assets/bg1.mp4"),
+        AssemblyNode(),
         FFmpegCompositorNode(),
     ]
 

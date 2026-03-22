@@ -11,10 +11,12 @@ ClipFlow — 核心 API 路由。
 
 from __future__ import annotations
 
+import os
 import uuid
 from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload
 
 from .database import get_db
@@ -27,8 +29,34 @@ from .schemas import (
     TaskSubmitAck,
 )
 from .services import run_matrix_job
+from src.core.logger import LOG_DIR
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
+
+
+# ================================================================== #
+# GET /tasks/assets/{asset_id}/download — 下载视频资产文件流           #
+# ================================================================== #
+@router.get(
+    "/assets/{asset_id}/download",
+    summary="下载视频资产",
+    description="根据资产 ID 以文件流方式下载对应的 MP4 视频文件。",
+)
+def download_asset(
+    asset_id: int,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    asset = db.query(VideoAsset).filter(VideoAsset.id == asset_id).first()
+    if asset is None or not os.path.exists(asset.file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"asset_id={asset_id} 对应的资产不存在或文件已被移除。",
+        )
+    return FileResponse(
+        path=asset.file_path,
+        media_type="video/mp4",
+        filename=os.path.basename(asset.file_path),
+    )
 
 
 # ================================================================== #
@@ -83,11 +111,14 @@ def submit_task(
         test_language     = payload.test_language,
         target_duration   = payload.target_duration,
         output_dir        = payload.output_dir,
+        webhook_url       = payload.webhook_url,
+        client_payload    = payload.client_payload,
     )
 
-    print(
-        f"[routes] ✅ 任务已入队 task_id={task.id} session={session_id}"
-        + f" ratio={payload.aspect_ratio} lang={payload.test_language} duration={payload.target_duration}s"
+    from src.core.logger import logger
+    logger.info(
+        f"[routes] 任务已入队 task_id={task.id} session={session_id}"
+        f" ratio={payload.aspect_ratio} lang={payload.test_language} duration={payload.target_duration}s"
     )
 
     # 5. 秒回 202（HTTP 请求绝不阻塞 2 分钟！）
@@ -145,3 +176,16 @@ def list_tasks(
         .all()
     )
     return [VideoTaskStatusResponse.model_validate(t) for t in tasks]
+
+
+# ================================================================== #
+# GET /tasks/system/logs/path — 返回本地诊断日志目录路径               #
+# ================================================================== #
+@router.get(
+    "/system/logs/path",
+    summary="获取诊断日志目录路径",
+    description="返回本机诊断日志文件所在的绝对路径，供前端唤起资源管理器定位。",
+    tags=["System"],
+)
+def get_log_path() -> dict:
+    return {"path": str(LOG_DIR)}

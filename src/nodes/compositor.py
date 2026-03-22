@@ -1,11 +1,16 @@
 import os
 import shutil
 import subprocess
+import sys
 from typing import List, Tuple
+
+# 隐藏 Windows 下 FFmpeg 子进程的黑色控制台窗口
+_WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
 from src.core.timeline import Clip, Timeline, Track
+from src.utils.env_utils import get_ffmpeg_path
 
 
 class FFmpegCompositorNode(BaseNode):
@@ -285,7 +290,7 @@ class FFmpegCompositorNode(BaseNode):
         session_id: str = context.config.get("session_id", "")
         sid_suffix = f"_{session_id}" if session_id else ""
         output_path = f"output/master_video{sid_suffix}.mp4"
-        ffmpeg_bin = os.environ.get("FFMPEG_PATH", "ffmpeg")
+        ffmpeg_bin = get_ffmpeg_path("ffmpeg.exe")
 
         map_args = ["-map", "[outv]", "-an"]   # -an: 无音频轨道
         # superfast: 比 fast 快约 2x，码率略升但对 MVP 演示可接受
@@ -326,13 +331,14 @@ class FFmpegCompositorNode(BaseNode):
                 text=True,
                 encoding="utf-8",
                 errors="replace",      # 兼容 ffmpeg stderr 中的非 UTF-8 字符
+                creationflags=_WIN_NO_WINDOW,
             )
             self.log("[OK] FFmpeg completed successfully.")
         except FileNotFoundError:
             self.log(
-                "[ERROR] ffmpeg binary not found. "
-                "Set FFMPEG_PATH to the full path of ffmpeg.exe, "
-                "or add ffmpeg to your system PATH."
+                f"[ERROR] ffmpeg binary not found at '{ffmpeg_bin}'. "
+                "In production, ensure ffmpeg.exe is in the same directory as backend.exe. "
+                "In development, ensure ffmpeg is available on your system PATH."
             )
             return context
         except subprocess.CalledProcessError as exc:
@@ -450,6 +456,7 @@ class FFmpegCompositorNode(BaseNode):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    creationflags=_WIN_NO_WINDOW,
                 )
                 self.log(f"[{lang}] [OK] Variant rendered: {final_path}")
                 context.set_variant_asset(lang, "final_video", final_path)

@@ -1,29 +1,51 @@
-# .gitignore
+# ==========================================
+# ClipFlow V1.1 商业级 .gitignore 配置
+# ==========================================
 
-# 环境变量与机密信息 (绝对不能传！)
+# ── 1. 敏感数据与环境配置 (Zero Trust) ──
 .env
+.env.*
+clipflow.db
+clipflow.db-journal
 
-# 虚拟环境
-venv/
-env/
-conda/
-
-# 运行生成的产物与大文件
-output/
-tests/assets/*.mp4
-tests/assets/*.mp3
-tests/assets/*.wav
-
-*.log
-*.sqlite
-*.db
+# ── 2. 媒体资产与输出产物 ──
 assets/matrix_pool/
+output/
+tests/assets/
+*.mp4
+*.wav
+*.mp3
 
-# Python 缓存
+# ── 3. 运行日志 ──
+*.log
+logs/
+
+# ── 4. Python & 虚拟环境 ──
 __pycache__/
-*.pyc
-.pytest_cache/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env_build/
 
-# IDE 配置文件
+# ── 5. PyInstaller 打包缓存 ──
+build/
+dist/
+*.spec
+
+# ── 6. 前端 (Vue) 与 Tauri 依赖及产物 ──
+node_modules/
+web_ui/node_modules/
+web_ui/dist/
+# Tauri 编译的庞大缓存目录
+web_ui/src-tauri/target/
+# 忽略打包生成的边车文件，但【绝对不能】忽略 ffmpeg.exe 和 ffprobe.exe
+web_ui/src-tauri/bin/backend-*
+web_ui/src-tauri/bin/backend
+
+# ── 7. IDE 与系统文件 ──
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db

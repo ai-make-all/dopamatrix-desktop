@@ -27,12 +27,18 @@ AssemblyNode — Phase 4: 时间线拼装节点
 """
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
+
+# 隐藏 Windows 下 FFprobe 子进程的黑色控制台窗口
+_WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
 from src.core.timeline import Clip, Timeline, Track
+from src.utils.env_utils import get_ffmpeg_path
 
 
 class AssemblyNode(BaseNode):
@@ -52,7 +58,8 @@ class AssemblyNode(BaseNode):
             TTSNode 生成的各语言配音 MP3 路径。
 
     构造参数：
-        bg_video_path:  降级用背景视频文件路径（默认 "tests/assets/bg1.mp4"）
+        bg_video_path:  降级用背景视频文件路径（默认 None；不应在生产环境中依赖此路径，
+                        素材不足时应由 AssetSelectNode 提前抛出业务异常）
         output_dir:     输出目录（用于创建临时资产，默认 "output"）
 
     执行后写入 Context：
@@ -63,7 +70,7 @@ class AssemblyNode(BaseNode):
     def __init__(
         self,
         name: str = "AssemblyNode",
-        bg_video_path: str = "tests/assets/bg1.mp4",
+        bg_video_path: Optional[str] = None,
         output_dir: str = "output",
     ):
         super().__init__(name)
@@ -88,8 +95,7 @@ class AssemblyNode(BaseNode):
         用 ffprobe 探测视频文件的实际时长（秒）。
         如果 ffprobe 不可用或探测失败，返回保守估计值 10.0 秒。
         """
-        import subprocess
-        ffprobe_bin = os.environ.get("FFPROBE_PATH", "ffprobe")
+        ffprobe_bin = get_ffmpeg_path("ffprobe.exe")
         try:
             result = subprocess.run(
                 [
@@ -102,6 +108,7 @@ class AssemblyNode(BaseNode):
                 capture_output=True,
                 text=True,
                 timeout=10,
+                creationflags=_WIN_NO_WINDOW,
             )
             duration = float(result.stdout.strip())
             self.log(f"ffprobe detected bg video duration: {duration:.2f}s")
@@ -200,13 +207,17 @@ class AssemblyNode(BaseNode):
         track = Track(name="bg_video", z_index=0)
         bg_path = self._bg_video_path
 
-        if not os.path.exists(bg_path):
-            self.log(
-                f"Warning: bg_video_path '{bg_path}' not found. "
-                "Using as-is; FFmpeg will error if file is missing at render time."
+        if not bg_path:
+            raise ValueError(
+                "可用视频素材不足，请在素材库中添加新素材。"
+                "（scene_clips 为空且 bg_video_path 未配置，无法构建视频轨道）"
             )
-            track.add_clip(Clip(file_path=bg_path, start_time=0.0, duration=total_duration))
-            return track
+
+        if not os.path.exists(bg_path):
+            raise ValueError(
+                f"可用视频素材不足，请在素材库中添加新素材。"
+                f"（bg_video_path 指向的文件不存在: '{bg_path}'）"
+            )
 
         bg_duration = self._estimate_video_duration(bg_path)
         if bg_duration <= 0:
@@ -286,8 +297,7 @@ class AssemblyNode(BaseNode):
             )
         else:
             self.log(
-                "scene_clips is empty. Falling back to bg_video_path: "
-                f"'{self._bg_video_path}'"
+                f"[WARNING] scene_clips 为空，尝试降级到 bg_video_path='{self._bg_video_path}'"
             )
             bg_track = self._build_video_track_from_bg(total_duration)
 

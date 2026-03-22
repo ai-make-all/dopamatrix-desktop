@@ -2,3 +2,6 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# API Key 配置文件（由 build_backend.py 自动从项目根目录复制过来，不应进入版本库）
+.env

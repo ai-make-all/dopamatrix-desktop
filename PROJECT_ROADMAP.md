@@ -3,7 +3,7 @@
 > **多语言视频内容工厂 · Multilingual Video Content Factory**
 >
 > 本文档是 ClipFlow 项目的**宪法级纲领**，所有后续开发均以此为准。
-> 最后更新：2026-03-06
+> 最后更新：2026-03-19
 
 ---
 
@@ -155,20 +155,19 @@ ClipFlow/
 │   │   ├── engine.py           ← WorkflowEngine (DAG 调度)
 │   │   └── timeline.py         ← Timeline 二维数据结构
 │   │
-│   ├── nodes/                  ← 业务节点
+│   ├── nodes/                  ← 业务节点（FFmpeg 编译与执行逻辑高内聚于此层）
 │   │   ├── __init__.py
-│   │   ├── script_gen_node.py  ← LLM 文案生成
+│   │   ├── script_gen.py       ← LLM 文案生成
 │   │   ├── tts_node.py         ← TTS 语音合成
-│   │   ├── asset_select_node.py← 素材检索/匹配
-│   │   ├── compositor_node.py  ← Timeline → FFmpeg 编译器 [核心]
-│   │   ├── subtitle_mux_node.py← .ass 字幕挂载 (Master→Variant)
+│   │   ├── asset_select.py     ← 素材检索/匹配（SQLite LRU + Hook 隔离）
+│   │   ├── assembler.py        ← AssemblyNode：X 轴素材拼接 + Y 轴叠加轨道构建 → Timeline
+│   │   ├── compositor.py       ← FFmpegCompositorNode：Timeline → Complex Filtergraph 编译
+│   │   │                          内含槽位分配、滤镜链构建、子进程执行与进度解析 [核心渲染]
+│   │   ├── subtitle.py         ← .ass 字幕挂载 (Master → Variant)
 │   │   └── anti_dup_node.py    ← 去重 / 混淆
 │   │
-│   ├── ffmpeg/                 ← FFmpeg 封装层
-│   │   ├── __init__.py
-│   │   ├── command_builder.py  ← Filtergraph 命令构建器
-│   │   ├── slot_manager.py     ← 输入槽位管理
-│   │   └── runner.py           ← 子进程执行 & 进度回调
+│   │   # ⚠️ src/ffmpeg/ 独立封装层已移除：实战证明将槽位分配、Filtergraph 编译、
+│   │   #    子进程执行等逻辑直接内聚于 FFmpegCompositorNode 内部，可读性与维护性更佳。
 │   │
 │   ├── localization/           ← 多语言 & RTL
 │   │   ├── __init__.py
@@ -294,17 +293,16 @@ workflow_def = {
 **目标**：实现基于 X/Y 轴的二维混剪引擎，完成 Timeline → FFmpeg 编译。
 
 - [x] 设计 & 实现 `Timeline` / `Track` / `ClipItem` 数据结构 (`src/core/timeline.py`)
-- [x] 实现 FFmpeg 封装层 (`src/ffmpeg/`)
-  - [x] `slot_manager.py` — 输入槽位分配 & 命名 (`[v0]`, `[v1]`, ...)
-  - [x] `command_builder.py` — Complex Filtergraph 编译器
-    - [x] X 轴拼接：`concat` 滤镜
-    - [x] Y 轴叠加：`overlay` 滤镜 (含时间区间 `enable`)
-    - [x] 音频轨混合：`amix` / `amerge`
-  - [x] `runner.py` — 子进程执行 + 实时进度解析 (`-progress pipe:1`)
-- [x] 实现 `CompositorNode` (`src/nodes/compositor_node.py`)
-  - [x] 从 `WorkflowContext` 读取 `Timeline` 对象
-  - [x] 调用 `command_builder` 编译为 FFmpeg 命令
-  - [x] 调用 `runner` 执行并输出 master 视频路径
+- [x] 实现 `AssemblyNode` (`src/nodes/assembler.py`) — Timeline 拼装节点
+  - [x] 从 `context.assets["scene_clips"]` 读取按场景排列的素材，X 轴顺序拼接
+  - [x] 支持 Y 轴叠加轨道（Logo / Sticker），层号与 `enable` 时间区间动态计算
+  - [x] Fallback：若无 `scene_clips` 则退回背景视频循环铺满总时长
+  - [x] 写入 `context.assets["timeline"]` 供 `FFmpegCompositorNode` 消费
+- [x] 实现 `FFmpegCompositorNode` (`src/nodes/compositor.py`) — 高内聚渲染核心
+  - [x] 输入槽位分配 & 命名（`[v0]`, `[v1]`, ...），内联于节点内部（无独立 `src/ffmpeg/` 层）
+  - [x] Complex Filtergraph 编译：`concat`（X 轴）+ `overlay`（Y 轴，含 `enable` 时间区间）+ `amix`（音频混合）
+  - [x] 子进程执行 + 实时进度解析（`-progress pipe:1`），内联于节点内部
+  - [x] 动态分辨率解析（`9:16` / `16:9` / `1:1`），输出 master 视频路径至 `WorkflowContext`
 - [x] 编写 `tests/test_timeline.py` — 数据结构序列化 / 反序列化
 - [x] 编写 `tests/test_compositor.py` — 用测试素材验证实际渲染输出
 
@@ -356,23 +354,51 @@ workflow_def = {
 - [x] `GET /assets/list` — 资产指纹库浏览与状态下发。
 - [x] **Webhook 异步回调**：任务完成后向 `WEBHOOK_URL` 推送包含最终视频路径与 Hash 的结案报告。
 
+#### 5.3 硬件加速与性能基建 (Hardware Acceleration & Performance) 🚀 [Next]
+- [ ] **GPU 硬件加速自适应 (Auto-Fallback)**：渲染引擎动态检测系统是否具备兼容的独立显卡（如 Nvidia GPU）。若有，自动将视频编码器从 `-c:v libx264` 切换为 `-c:v h264_nvenc`榨干硬件算力；若无，静默降级为 CPU 稳态渲染，实现 100% 客户机兼容。
+- [ ] **数据库并发锁消除**：通过在 SQLAlchemy 引擎层开启 SQLite 的 WAL (Write-Ahead Logging) 模式，实现读写分离，彻底解决 UI 高频轮询带来的 `database is locked`性能瓶颈。
+
 ---
 
-### Phase 6 — Agent & 增长大脑对接 (Headless API)
+### Phase 6 — V1.5 云端中枢与 Agent 协同编排 (GrowthOS & Agent Orchestration)
 
-**目标**：将渲染管线封装为标准化 API，支持「**双向学习**」——允许外部增长大脑 (GrowthOS) 动态向本系统注入最新的转化策略。
+**目标**：打破本地信息孤岛，引入 WebSocket 长连接与开源多智能体框架，实现从“单机渲染工具”到“云端控制节点”的跨越，建立视频基因溯源体系。
 
-#### 6.1 Agent 调用接口 (Outbound — ClipFlow 作为工具)
-- [ ] 定义 Agent Tool Schema（OpenAI Function Calling 兼容格式）
+#### 6.1 WebSocket 长连接与双向策略下发 (The Nervous System)
+- [ ] **建立持久化通道**：在 FastAPI 引入 WebSocket，使本地 ClipFlow 保持对云端 GrowthOS 的长连接监听。
+- [ ] **本地实时进度推送 (无中间件架构)**：坚决摒弃 Redis 等重型中间件，捍卫桌面端“单体免安装”的极致体验。通过 Python 内存事件总线 (Event Bus) 捕获 FFmpeg 子进程进度，并经由 WebSocket 管道像心跳一样平滑推送给前端 UI。
+- [ ] **Copilot 模式 (半托管)**：云端下发策略卡片（如：“检测到近期中东市场 #Tire 标签爆火，是否应用该策略生成 10 个视频？”），UI 弹出确认框，用户一键执行。
+- [ ] **Autopilot 模式 (全托管)**：云端直接下发 JSON 渲染指令，本地引擎在后台静默排队、静默渲染、自动回传，彻底实现“无人值守印钞”。
 
-#### 6.2 双向学习注入接口 (Inbound — GrowthOS 向 ClipFlow 写入策略)
-> [!IMPORTANT]
-> **核心设计**：GrowthOS 可通过以下接口，将其从数据分析中习得的最优策略**动态注入**到 ClipFlow，接管本地引擎的抽卡逻辑。
+#### 6.2 多智能体框架集成 (DeerFlow & CrewAI Integration)
+> **设计原则**：ClipFlow 保持纯粹的渲染工具属性（Tool），由外部 Agent 框架负责逻辑推理。
+- [ ] **ClipFlow Tool 封装**：将 `POST /tasks/submit` 封装为标准的 LangChain/CrewAI 可调用工具 (`ClipFlow_Render_Tool`)。
+- [ ] **轻量级编排 (CrewAI)**：构建创意工作组（数据分析师 Agent -> 文案编剧 Agent -> 执行导演 Agent -> 调用 ClipFlow 出片）。
+- [ ] **深度数据挖掘 (DeerFlow)**：利用字节 DeerFlow 的强大沙盒与爬虫能力，自动抓取 TikTok/Meta 的行业竞品爆款数据，喂给 CrewAI 进行二次创作。
+- [ ] **动态技能路由 (Dynamic Skills Routing)**：打造“对话即服务”体验。隐藏复杂的节点连线，Agent 根据运营人员自然语言意图，动态加载 `DataRetrieval_Skill`, `Localization_Skill` 等独立技能模块，整理参数后统一抛给底层固定 Workflow 执行。
 
-- [ ] `POST /strategies/x_axis_hooks` — 注入 X 轴黄金片头策略（下发高 ROI 素材的 file_hash，强制本地引擎在下次渲染时绝对优先调用该 Hook，接管本地 LRU 算法）。
-- [ ] `POST /strategies/overlay_clips` — 注入最新的 Y 轴转化策略（贴纸、Logo 等）。
-- [ ] `POST /strategies/prompt_templates` — 注入最新的 LLM Prompt 模板。
-- [ ] `GET /strategies/active` — 查询当前生效的策略版本与来源。
+#### 6.3 视频基因溯源机制 (Gene Traceability)
+- [ ] **指纹埋点**：在 Webhook 回调的结案报告中，强绑定 `hook_asset_hash`, `bg_assets_hash`, `script_id` 和 `tts_voice`。
+- [ ] **血统追踪**：让云端 GrowthOS 清晰知道每一个导出的变体视频，是由哪几个具体的“骨相（画面）”和“皮相（文案）”拼装而成的，为未来的 ROI 归因提供绝对精准的数据源。
+
+#### 6.4 混合视觉生成管线 (AIGC Generative Hooks)
+> **设计原则**：用 AI 做“矛”(引流)，用实拍做“盾”(转化)，解决传统商家素材枯竭痛点。
+- [ ] **生成类节点引入**：在 DAG 中新增 `GenerativeHookNode`，对接 Kling / Runway / Midjourney API。
+- [ ] **视觉张力重构**：允许用户上传枯燥的传统商品实拍，系统自动调用图生视频 API，生成前 3 秒极具“空间错位感”或“荒诞感”的 Hook（如：长城上贴瓷砖），再与真实素材无缝拼接。
+- [ ] **低门槛 PPT 魔法流**：沉淀基于 FFmpeg 滤镜（抠图 Overlay + Zoom 极速缩放）的固定“时空穿越模板”，单图即可裂变鬼畜吸睛短视频。
+
+#### 6.5 自动化 Hook 工厂 (The Hook Engine)
+> **设计原则**：买量引擎的核心是“心理触发实验”，前 3 秒决定 80% 转化，需建立独立的高能片头流水线。
+- [ ] **Hook 骨架库**：内置挑战型（Competence）、反差型（Transformation）、挫败型（Frustration）、猎奇型（Curiosity）等心理触发 DSL 模板。
+- [ ] **全自动缝合线**：系统自动调用 AIGC 视觉张力素材 + TTS 猎奇配音 + 大字报夸张字幕，日均静默生成上百个独立 Hook 切片，注入本地 SQLite 素材大盘。
+- [ ] **A/B 测试变量池**：为同一个实拍 Body（盾），自动排列组合 50 种不同的 Hook（矛），生成用于跑量测试的矩阵变体。
+
+#### 6.6 Story DSL 解析与双引擎智能调度 (Story DSL & Dual Engines)
+> **设计原则**：彻底摒弃基于物理图层的“盲拼”，升级为基于语义标签和逻辑节拍的“智能调度”。
+- [ ] **Story DSL 解析器引入**：开发 `DSLParserNode`，能够读取基于意图的视频脚本语言（如 `HOOK: shot_type=customer_reaction`）。
+- [ ] **Content Engine (实体商家引擎)**：内置生活叙事结构 DSL（X轴：Hook → Context → Build → Reveal → CTA；Y轴：产品特写、门店环境等）。
+- [ ] **UA Engine (游戏买量引擎)**：内置心理触发结构 DSL（X轴：Problem → Failure → Near Win → Reward；Y轴：挫败感、好奇心、能力证明等）。
+- [ ] **语义调度路由**：系统根据用户身份，下发不同的 Story DSL，引擎自动根据标签和权重从 SQLite 资产库中抽取契合语义的素材，交由 FFmpeg 渲染。
 
 ---
 
@@ -381,17 +407,39 @@ workflow_def = {
 **目标**：在不污染底层纯净引擎的前提下，构建面向 B端/C端 客户的交互外壳，完成商业化验证。
 
 #### 7.1 B端重度客户：桌面端矩阵工作站 (Tauri + Vue 3) [状态：v1.0 MVP 封板中]
-> **定位**：部署在客户本地电脑，双视图混合架构的「私有化印钞机」。
+> **定位**：部署在客户本地电脑，基于“意图驱动”的私有化印钞机。
 - [x] **架构升级**：实现“首屏 ROI 看板” + “沉浸式 AI Feed 工作台”的双视图平滑切换。
+- [ ] **UI 范式颠覆 (Block Matrix)**：抛弃传统的树状文件管理。引入“看板式积木块”，X轴（叙事节拍）为看板列，Y轴（情绪标签）为筛选器，拖拽标签即可生成 Story DSL 可视化链条。
 - [x] **数字资产管理 (DAM)**：独立的素材库面板，可视化展示 X轴/Y轴素材的“疲劳度血条”与“引用次数”，支持设置 Hook 身份。
 - [x] **异步无阻塞体验**：前端任务 Feed 流 + 轮询/Webhook 状态更新，告别干等。
-- [ ] 打包分发：构建 `.exe` / `.dmg` 独立安装包。
+- [ ] **动态耗时预估 (Dynamic Time Estimation)**：基于当前物理机的 CPU 核心数与引擎自学习的渲染消耗系数 ($k$)，在任务提交前提供精准的“预计耗时”测算，用可控的进度预期消除矩阵渲染等待期的用户焦虑。
+- [x] 打包分发：采用 Tauri Sidecar (边车模式) 构建单体 `.exe`安装包，实现 Python 核心引擎的无感自启。
 
-#### 7.2 C端轻量客户：移动端极速投喂 (Telegram/Discord Bot) [状态：新开战线]
+#### 7.2 C端轻量客户：移动端极速投喂 (Telegram Bot) [状态：新开战线]
 > **定位**：面向汽修店老板/买量投放手，移动办公的“极速触角”与 PLG 转化漏斗。
+- [ ] **Zero-UI 交互理念 (Conversational Asset Management)**：用户只需在对话框发送视频和语音（如“修了个底盘，很解压”），后台 VLM 自动打上隐藏的 Y 轴标签 (`shot_type: repair`, `emotion: satisfying`)，彻底免除手动建文件夹的门槛。
 - [ ] **独立微服务**：Node.js + Telegraf/Discord.js 架构。
-- [ ] **业务闭环**：接收移动端素材 -> 调用桌面端 API -> 接收 Webhook 拿视频 -> Bot 内原生转发分享。
+- [ ] **业务闭环**：极速上传素材 -> 发送自然语言渲染指令 -> 调用桌面端 API -> 接收 Webhook 获取成品 -> Bot 内原生转发分享。
 - [ ] **C 转 B 商业化漏斗**：设置免费产出配额墙，引导高频客户升级“企业版专属桌面主机”。
+
+---
+
+### Phase 8 — V2.0 视觉引擎与全自动闭环 (AI Vision & Full Autopilot)
+
+**目标**：引入多模态视觉能力（VLM），让系统真正“看懂”本地素材库；打通公域播放量数据，实现以 ROI 为导向的自动优胜劣汰与无限爆款裂变。
+
+#### 8.1 视觉引擎与素材自动打标 (Auto-Tagging & VLM)
+- [ ] **AI 视觉审片**：用户批量导入 100 个车间视频时，系统自动截取关键帧，调用多模态大模型（如 GPT-4o / Gemini 1.5 Pro Vision）。
+- [ ] **语义 Y 轴自动补全 (Semantic Auto-Tagging)**：彻底废弃人工建文件夹。调用多模态大模型扫描入库视频，自动按全新 Y 轴规范写入 SQLite：提取镜头类型 (`shot_type: closeup / env`)、情绪属性 (`emotion: satisfying / frustration`) 与场景实体，为 Story DSL 提供极其精准的弹药库。
+- [ ] **智能 Hook 判定**：基于视觉张力算法，AI 自动从长视频中截取出前 3 秒最吸引眼球的片段，并自动在数据库中标记为 `video_role='hook'`。
+
+#### 8.2 基因可视化大屏 (Gene Visualization)
+- [ ] **Hook 热力图**：在桌面端/云端 UI 呈现素材库的热力看板，哪些 Hook 组合带来的曝光量最高，以“基因树”的形式可视化展示。
+- [ ] **素材疲劳度熔断机制**：当某个素材在全网播放量超过阈值（如被标记为烂大街），系统 UI 自动将其标红并进入“冷冻期”，防止账号被平台判罚重复搬运。
+
+#### 8.3 商业数据闭环 (The Holy Grail)
+- [ ] **生态回流 API**：接入 Meta Ads / TikTok 开发者 API，将变体视频的真实播放量、完播率、转化率拉取回 GrowthOS。
+- [ ] **达尔文进化算法**：GrowthOS 自动分析高 ROI 视频的基因溯源数据。发现某个特定 Hook 爆了，自动调用 ClipFlow 以该 Hook 为核心，再自动裂变 50 个新的混剪变体，实现真正的商业永动机。
 
 ---
 
@@ -408,6 +456,7 @@ workflow_def = {
 | 🔴 4 | **所有业务逻辑必须封装为 `BaseNode` 子类** | 保证可编排、可测试、可复用 |
 | 🔴 5 | **节点间数据传递必须通过 `WorkflowContext`** | 保证数据流的可追溯性和序列化能力 |
 | 🔴 6 | **前后端通过 HTTP/WebSocket 解耦** | 保留云端化迁移路径 |
+| 🔴 7 | **矩阵输出分辨率基准线必须锁定为 720P 级别（竖屏 720x1280，横屏 1280x720）** | 兼顾 TikTok/Reels 竖屏与 YouTube/游戏买量横屏需求。720P 是在移动端肉眼画质与单机多核矩阵并发渲染速度之间的“黄金甜点位”。如非特殊客户定制，严禁在全局代码中默认提权至 1080P 或 4K，防止引发算力雪崩。 |
 
 ---
 

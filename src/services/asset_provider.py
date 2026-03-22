@@ -15,15 +15,22 @@
 
 import hashlib
 import os
+import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+# 隐藏 Windows 下 FFprobe 子进程的黑色控制台窗口
+_WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from src.utils.env_utils import get_ffmpeg_path
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +318,7 @@ class LocalMatrixProvider:
 
     构造参数：
         pool_dir:     本地素材目录，默认 "assets/matrix_pool/x_main"
-        ffprobe_bin:  ffprobe 可执行文件路径，默认从 FFPROBE_PATH 环境变量读取
+        ffprobe_bin:  ffprobe 可执行文件路径，默认由 get_ffmpeg_path() 自动嗅探（生产/开发环境自适应）
         fallback_dur: 当 ffprobe 探测失败时使用的保底时长（秒），默认 5.0
 
     使用方法::
@@ -334,7 +341,7 @@ class LocalMatrixProvider:
         fallback_dur: float = 5.0,
     ):
         self._pool_dir = Path(pool_dir)
-        self._ffprobe_bin = ffprobe_bin or os.getenv("FFPROBE_PATH", "ffprobe")
+        self._ffprobe_bin = ffprobe_bin or get_ffmpeg_path("ffprobe.exe")
         self._fallback_dur = fallback_dur
         # 文件时长缓存（避免对同一文件重复调用 ffprobe）
         self._duration_cache: dict[str, float] = {}
@@ -479,7 +486,6 @@ class LocalMatrixProvider:
         if file_path in self._duration_cache:
             return self._duration_cache[file_path]
 
-        import subprocess
         try:
             result = subprocess.run(
                 [
@@ -492,6 +498,7 @@ class LocalMatrixProvider:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                creationflags=_WIN_NO_WINDOW,
             )
             dur = float(result.stdout.strip())
         except Exception as exc:

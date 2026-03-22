@@ -57,6 +57,14 @@ class VideoTaskCreate(BaseModel):
         default=None,
         description="可选：自定义最终成品视频输出目录绝对路径。"
     )
+    webhook_url: Optional[str] = Field(
+        default=None,
+        description="渲染完成后，本地引擎主动推送结案报告的云端接收地址。"
+    )
+    client_payload: Optional[dict] = Field(
+        default=None,
+        description="无结构透传字典，用于外部 Agent/Bot 存放上下文（如 TG 的 chat_id），在 Webhook 中原样奉还。"
+    )
 
 
 class VideoTaskResponse(BaseModel):

@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onUnmounted, nextTick, watch } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
+import { open as openPath } from '@tauri-apps/plugin-shell'
 import { readDir } from '@tauri-apps/plugin-fs'
 import axios from 'axios'
 import Dashboard from './components/Dashboard.vue'
@@ -33,6 +34,18 @@ async function pickGlobalOutputFolder() {
     }
   } catch (err) {
     console.error('[Tauri Dialog] 设置目录打开失败：', err)
+  }
+}
+
+async function openDiagnosticLogs() {
+  try {
+    const res = await axios.get(`${API_BASE}/api/v1/tasks/system/logs/path`)
+    const logPath = res.data.path
+    await openPath(logPath)
+  } catch (err) {
+    const msg = err?.message || String(err)
+    console.error('[DiagnosticLogs] 打开日志目录失败：', err)
+    showToast(`❌ 打开日志目录失败：${msg}`)
   }
 }
 
@@ -754,9 +767,14 @@ onUnmounted(clearPollTimer)
               <span style="color:#38bdf8; margin-right: 0.5rem; flex-shrink:0;">当前路径：</span>
               <span style="color:#f8fafc; word-break: break-all; font-family: monospace;">{{ globalOutputDir || '未设置 (默认跟随引擎输出)' }}</span>
             </div>
-            <button @click="pickGlobalOutputFolder" class="cta-glow-btn" style="padding: 0.75rem 1.5rem; width: auto; font-size: 0.95rem;">
-              📁 更改成品视频输出目录
-            </button>
+            <div style="display:flex; gap: 1rem; flex-wrap: wrap;">
+              <button @click="pickGlobalOutputFolder" class="cta-glow-btn" style="padding: 0.75rem 1.5rem; width: auto; font-size: 0.95rem;">
+                📁 更改成品视频输出目录
+              </button>
+              <button @click="openDiagnosticLogs" class="cta-glow-btn" style="padding: 0.75rem 1.5rem; width: auto; font-size: 0.95rem; background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15)); border-color: rgba(139,92,246,0.4);">
+                📁 导出/查看诊断日志
+              </button>
+            </div>
           </div>
         </div>
       </template>

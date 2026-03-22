@@ -24,11 +24,17 @@ AssetSelectNode — Phase 4 升级版：本地矩阵素材选择节点
 import logging
 import os
 import random
+import subprocess
+import sys
 from pathlib import Path
 from typing import List, Optional, Union
 
+# 隐藏 Windows 下 FFprobe 子进程的黑色控制台窗口
+_WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.utils.env_utils import get_ffmpeg_path
 from src.services.asset_provider import BaseAssetProvider, LocalMatrixProvider, PexelsProvider
 
 logger = logging.getLogger(__name__)
@@ -199,12 +205,12 @@ class AssetSelectNode(BaseNode):
         
         total_duration = 0.0
         if voice_audio and os.path.exists(voice_audio):
-            import subprocess
             try:
                 # 使用 ffprobe 读取真实物理时长
                 result = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", voice_audio],
-                    capture_output=True, text=True, check=True
+                    [get_ffmpeg_path("ffprobe.exe"), "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", voice_audio],
+                    capture_output=True, text=True, check=True,
+                    creationflags=_WIN_NO_WINDOW,
                 )
                 total_duration = float(result.stdout.strip())
                 self.log(f"[Audio Hegemony] 从音频 {voice_audio} 获取真实时长 T={total_duration:.2f}s")
@@ -289,13 +295,11 @@ class AssetSelectNode(BaseNode):
                 local_provider = LocalMatrixProvider(pool_dir=self._pool_dir)
                 scene_clips = local_provider.get_clips_for_duration(target_duration=total_duration)
             except RuntimeError as exc:
-                self.log(
-                    f"[Local Mode] ✗ LocalMatrixProvider failed: {exc}. "
-                    "scene_clips will be empty; AssemblyNode will fall back to bg_video_path."
-                )
-                context.set_asset("scene_clips", [])
-                context.set_asset("overlay_clips", {"logo": None, "sticker": None})
-                return context
+                self.log(f"[Local Mode] ✗ 默认素材池读取失败: {exc}")
+                raise ValueError(
+                    f"可用视频素材不足，请在素材库中添加新素材。"
+                    f"（数据库无可用记录，默认素材池 '{self._pool_dir}' 也无法提供素材：{exc}）"
+                ) from exc
 
         context.assets["used_asset_ids"] = used_ids
         context.set_asset("scene_clips", scene_clips)

@@ -20,12 +20,18 @@ src/api/services.py
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import sys
-import traceback
+import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from src.core.logger import logger
 
 # ── 确保子进程输出兼容 Windows GBK 终端 ──────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -65,73 +71,65 @@ def _estimate_cost(tokens: int, tts_seconds: float) -> float:
 
 
 # ------------------------------------------------------------------ #
-# Webhook 发射器（防爆型，永不崩溃主流程）                              #
+# Webhook 发射器 V2（tenacity 指数退避重试，防爆型）                    #
 # ------------------------------------------------------------------ #
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
+async def _send_webhook_async(webhook_url: str, payload: dict) -> None:
+    """
+    异步 POST 结案报告，带 tenacity 指数退避重试。
+
+    重试策略：最多 3 次，首次等待 2s，指数增长，最长 10s。
+    任何 HTTP 4xx/5xx 均会触发 raise_for_status → 触发重试。
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        logger.info(f"[webhook] 正在向 {webhook_url} 发送结案报告…")
+        response = await client.post(webhook_url, json=payload)
+        response.raise_for_status()
+        logger.info(f"[webhook] Webhook 发送成功！HTTP {response.status_code}")
+
+
 def _fire_webhook(
-    task_id:      int,
-    session_id:   str,
-    final_status: str,           # "completed" | "failed"
-    test_language: str = "en",
-    assets_count:  int = 0,
-    cost_usd:      float = 0.0,
+    task_id:        int,
+    session_id:     str,
+    final_status:   str,            # "completed" | "failed"
+    assets:         list[dict],     # [{"path": ..., "hash": ...}, ...]
+    cost_usd:       float = 0.0,
+    webhook_url:    Optional[str] = None,
+    client_payload: Optional[dict] = None,
 ) -> None:
     """
-    向 WEBHOOK_URL 发送任务终态通知。
+    同步包装器：组装结案报告并调用异步发送函数。
 
-    设计原则：
-      - WEBHOOK_URL 未配置 → 直接跳过，不打日志（减少噪音）
-      - 任何网络/超时错误 → 仅打印警告，绝不 raise，绝不影响调用方
-      - 超时 3 秒（优先用 httpx；若未安装则 fallback 到 urllib）
-      - Payload 紧凑：task_id / session_id / status / test_language /
-                       assets_count / estimated_cost_usd
+    URL 优先级：per-task webhook_url > 环境变量 WEBHOOK_URL。
+    任何网络/重试耗尽异常均被捕获，绝不影响调用方。
     """
-    webhook_url: str = os.getenv("WEBHOOK_URL", "").strip()
-    if not webhook_url:
+    url: str = (webhook_url or "").strip() or os.getenv("WEBHOOK_URL", "").strip()
+    if not url:
         return  # 未配置，静默跳过
 
-    payload = {
+    report: dict[str, Any] = {
         "task_id":            task_id,
         "session_id":         session_id,
         "status":             final_status,
-        "test_language":      test_language,
-        "assets_count":       assets_count,
+        "assets":             assets,
         "estimated_cost_usd": round(cost_usd, 6),
+        "client_payload":     client_payload,
     }
 
     try:
-        # ── 优先使用 httpx（项目已有依赖）──────────────────────────────
-        import httpx
-        with httpx.Client(timeout=3.0) as client:
-            resp = client.post(webhook_url, json=payload)
-        print(
-            f"[webhook] 📡 task_id={task_id} → {webhook_url} "
-            f"status={resp.status_code}"
-        )
-
-    except ImportError:
-        # ── Fallback: 标准库 urllib（httpx 未安装时）──────────────────
-        import json
-        import urllib.request
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            webhook_url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                print(
-                    f"[webhook] 📡 task_id={task_id} → {webhook_url} "
-                    f"status={resp.status}"
-                )
-        except Exception as exc:
-            print(f"[webhook] ⚠️  urllib 发送失败（已忽略）: {exc}")
-
+        # run_matrix_job 是同步函数，运行于 FastAPI 的线程池 worker 中，
+        # 不存在已运行的事件循环，可以安全使用 asyncio.run()。
+        asyncio.run(_send_webhook_async(url, report))
     except Exception as exc:
-        # ── 任意其他异常（网络超时、DNS 失败等）→ 仅打印，不崩溃 ─────
-        print(f"[webhook] ⚠️  task_id={task_id} Webhook 发送失败（已忽略）: {exc}")
+        # 重试 3 次后仍失败 → 记录警告，绝不崩溃主流程
+        logger.warning(
+            f"[webhook] task_id={task_id} Webhook 最终发送失败（已忽略）: {exc}"
+        )
 
 
 # ------------------------------------------------------------------ #
@@ -147,12 +145,14 @@ def run_matrix_job(
     test_language:     str = "en",
     target_duration:   int = 15,
     output_dir:        Optional[str] = None,
+    webhook_url:       Optional[str] = None,
+    client_payload:    Optional[dict] = None,
 ) -> None:
     """
     矩阵批量生成后台任务。
 
     生命周期：queued → processing → completed | failed
-    任务终态后自动触发 Webhook（若已配置 WEBHOOK_URL）。
+    任务终态后自动触发 Webhook（per-task webhook_url 优先，回退 WEBHOOK_URL 环境变量）。
 
     Args:
         task_id:            video_tasks 表的主键
@@ -162,35 +162,39 @@ def run_matrix_job(
         aspect_ratio:       画幅比例
         test_language:      测试语言（仅生成该语种的 TTS+字幕+变体）
         target_duration:    目标视频时长（秒），固定枚举：15 | 30 | 60
+        webhook_url:        渲染完成后的结案报告推送地址（可选）
+        client_payload:     调用方透传上下文，在 Webhook 中原样返回（可选）
     """
-    # ── 必须在函数内部导入，避免 FastAPI 启动时触发多进程相关副作用 ──
-    from dotenv import load_dotenv
-    load_dotenv()
+    # load_env() 在 main.py 启动时已全局加载一次；此处补充调用确保
+    # 直接调用本函数（如测试场景）时也能正确获取环境变量。
+    from src.utils.env_utils import load_env
+    load_env()
 
     from run_matrix_factory import run_matrix_factory
     from src.api.database import SessionLocal
     from src.api.models import VideoTask, VideoAsset, LocalAsset, TaskHistory
-    import time  # 引入 time 模块以计算精准耗时
+
+    base_url = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
     db = SessionLocal()
-    start_time = time.time() # 记录任务真实开始时间
+    start_time = time.time()
 
     # 用于 Webhook 的终态变量（在 finally 块使用）
-    _final_status:  str   = "failed"
-    _assets_count:  int   = 0
-    _cost_usd:      float = 0.0
+    _final_status:   str        = "failed"
+    _webhook_assets: list[dict] = []
+    _cost_usd:       float      = 0.0
 
     try:
         # 1. 标记任务为 processing
         task: Optional[VideoTask] = db.get(VideoTask, task_id)
         if task is None:
-            print(f"[services] ⚠️  task_id={task_id} 在数据库中不存在，终止。")
+            logger.warning(f"[services] task_id={task_id} 在数据库中不存在，终止。")
             return
 
         task.status = "processing"
         db.commit()
-        print(
-            f"[services] 🚀 task_id={task_id} | session={session_id} "
+        logger.info(
+            f"[services] task_id={task_id} | session={session_id} "
             f"| lang={test_language} | 开始运行矩阵工厂…"
         )
 
@@ -213,6 +217,12 @@ def run_matrix_job(
 
         for result in results:
             if not result.get("success"):
+                # 将 worker 的失败原因写入日志文件，便于打包后排查（print 在 --windowed 模式下无效）
+                logger.error(
+                    f"[services] task_id={task_id} worker session={result.get('session_id', '?')} "
+                    f"失败: {result.get('error', 'unknown')} | "
+                    f"traceback: {result.get('traceback', '')[:500]}"
+                )
                 continue
 
             # Only append used assets for successful result variations to prevent false fatigue deductions
@@ -233,15 +243,21 @@ def run_matrix_job(
                     created_at      = _now(),
                 )
                 asset_rows.append(asset)
-                history_assets.append({"path": file_path, "hash": fh})
-                print(f"[services]   📦 [{lang}] {file_path}  MD5={fh[:8]}…")
+                logger.info(f"[services] [{lang}] {file_path}  MD5={fh[:8]}…")
 
             total_tokens  += result.get("llm_tokens_used",      0) or 0
             total_tts_sec += result.get("tts_duration_seconds", 0.0) or 0.0
 
-        # 4. 批量写入资产指纹
+        # 4. 批量写入资产指纹，flush 后取得自增主键以拼装绝对下载链接
         if asset_rows:
             db.add_all(asset_rows)
+            db.flush()  # 推入 DB 生成 asset.id，暂不提交事务
+            for asset in asset_rows:
+                history_assets.append({
+                    "path": asset.file_path,
+                    "hash": asset.file_hash,
+                    "download_url": f"{base_url}/tasks/assets/{asset.id}/download",
+                })
 
         # 4.5. 疲劳值反写闭环（事务一致性保护）
         if used_asset_ids:
@@ -257,7 +273,7 @@ def run_matrix_job(
                 if la.usage_count >= 10:
                     la.is_exhausted = True
             
-            print(f"[services] 🔄 疲劳值闭环：更新了 {len(local_assets)} 个有效任务消耗素材。")
+            logger.info(f"[services] 疲劳值闭环：更新了 {len(local_assets)} 个有效任务消耗素材。")
 
         # 4.6 写入 TaskHistory 记录历史
         if history_assets:
@@ -272,7 +288,7 @@ def run_matrix_job(
                 created_at=_now()
             )
             db.add(history_record)
-            print(f"[services] 🕒 往 task_history 表写入了 1 条历史归档记录")
+            logger.info("[services] 往 task_history 表写入了 1 条历史归档记录")
 
         # 5. 更新任务状态 & 成本
         cost = _estimate_cost(total_tokens, total_tts_sec)
@@ -283,19 +299,17 @@ def run_matrix_job(
         task.estimated_cost_usd   = cost
         db.commit()
 
-        _final_status = "completed"
-        _assets_count = len(asset_rows)
-        _cost_usd     = cost
+        _final_status   = "completed"
+        _webhook_assets = history_assets   # [{"path": ..., "hash": ...}, ...]
+        _cost_usd       = cost
 
-        print(
-            f"[services] ✅ task_id={task_id} 完成。"
-            f"  资产数={_assets_count}  "
-            f"  预估成本=${_cost_usd:.4f} USD"
+        logger.info(
+            f"任务 {task_id} 执行成功，总耗时: {time.time() - start_time:.2f} 秒  "
+            f"资产数={len(_webhook_assets)}  预估成本=${_cost_usd:.4f} USD"
         )
 
-    except Exception:
-        tb = traceback.format_exc()
-        print(f"[services] ❌ task_id={task_id} 执行异常:\n{tb}")
+    except Exception as e:
+        logger.exception(f"任务 {task_id} 发生未知崩溃！耗时: {time.time() - start_time:.2f} 秒")
         try:
             task = db.get(VideoTask, task_id)
             if task:
@@ -308,12 +322,13 @@ def run_matrix_job(
     finally:
         db.close()
 
-        # 6. 发射 Webhook（任务终态后，防爆，不阻塞，不崩溃）
+        # 6. 发射 Webhook（任务终态后，tenacity 重试，防爆，不崩溃）
         _fire_webhook(
             task_id=task_id,
             session_id=session_id,
             final_status=_final_status,
-            test_language=test_language,
-            assets_count=_assets_count,
+            assets=_webhook_assets,
             cost_usd=_cost_usd,
+            webhook_url=webhook_url,
+            client_payload=client_payload,
         )

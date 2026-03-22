@@ -1,20 +1,130 @@
+/// ClipFlow Tauri 应用核心入口
+///
+/// 生命周期策略：
+///   1. 生产模式下通过 tauri-plugin-shell 启动 Python Sidecar（backend.exe）
+///   2. 拦截 RunEvent::ExitRequested，在 Tauri 进程退出前执行两阶段后端清理：
+///      Phase-1  HTTP POST /api/v1/system/shutdown  让 Python 自行优雅退出（纯 std TCP，无外部依赖）
+///      Phase-2  taskkill /F /T /IM backend.exe     兜底斩杀整个进程树（Windows 专属）
+///   这样无论 ProcessPoolExecutor 派生了多少子进程，都能被连根拔起。
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
-    // 注册对话框插件 2026-03-06  kevinjaja
-    .plugin(tauri_plugin_dialog::init())
-    // 注册文件系统插件 2026-03-10  kevinjaja
-    .plugin(tauri_plugin_fs::init())
-    .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
-      Ok(())
-    })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(
+                    tauri_plugin_log::Builder::default()
+                        .level(log::LevelFilter::Info)
+                        .build(),
+                )?;
+            }
+
+            // 生产环境下启动 Python FastAPI 后端 Sidecar
+            #[cfg(not(debug_assertions))]
+            {
+                use tauri_plugin_shell::ShellExt;
+                let sidecar_command = app
+                    .shell()
+                    .sidecar("backend")
+                    .expect("failed to create `backend` binary command");
+                let (mut rx, child) = sidecar_command
+                    .spawn()
+                    .expect("Failed to spawn sidecar");
+                tauri::async_runtime::spawn(async move {
+                    let _keep_alive = child; // 持有句柄，防止 Drop 导致进程被提前回收
+                    while let Some(_event) = rx.recv().await {
+                        // 持续监听直到 sidecar 退出
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        // 使用 build + run(closure) 模式以便挂载自定义事件处理器
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // 仅在生产模式（Sidecar 实际运行）下执行后端清理
+                #[cfg(not(debug_assertions))]
+                shutdown_backend();
+            }
+        });
+}
+
+/// 两阶段后端关机：
+///   Phase-1  向 Python 发送 HTTP 关机请求（纯 std::net::TcpStream，无 tokio/reqwest 依赖）
+///   Phase-2  Windows taskkill 兜底，连根斩杀整个 backend.exe 进程树
+#[cfg(not(debug_assertions))]
+fn shutdown_backend() {
+    const BACKEND_ADDR: &str = "127.0.0.1:8000";
+    const SHUTDOWN_PATH: &str = "/api/v1/system/shutdown";
+    const BACKEND_EXE: &str = "backend.exe";
+
+    // ── Phase-1: 用原始 TCP 发送 HTTP POST，无需任何异步运行时 ──────
+    let graceful_sent = send_http_shutdown(BACKEND_ADDR, SHUTDOWN_PATH);
+
+    if graceful_sent {
+        // 给 Python 留足时间执行 taskkill 自杀（Python 侧 0.5s 延迟 + 系统执行时间）
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+
+    // ── Phase-2: Windows 进程树兜底斩杀 ────────────────────────────
+    // /F 强制  /T 包含全部子进程树  /IM 按名称匹配所有 backend.exe 实例
+    // 即使 Phase-1 已成功，此处仍执行（taskkill 对不存在的进程静默返回 ERROR: 没有找到进程）
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/IM", BACKEND_EXE])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+}
+
+/// 用纯 std::net::TcpStream 发送 HTTP POST 关机请求。
+///
+/// 之所以不使用 reqwest::blocking：reqwest::blocking 内部会新建 tokio Runtime，
+/// 若调用时已处于某个 tokio 上下文（Tauri 内部使用 tokio），会触发 panic。
+/// 纯 TCP 方案完全规避该风险，同时无需添加任何额外依赖。
+///
+/// 返回 true 表示请求已成功发出并收到响应，false 表示后端不可达（已崩溃或未启动）。
+#[cfg(not(debug_assertions))]
+fn send_http_shutdown(addr: &str, path: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &addr.parse().expect("invalid backend address"),
+        Duration::from_secs(2),
+    ) else {
+        return false; // 后端不可达，直接跳到 Phase-2
+    };
+
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    // 读取响应首行，验证是否为 2xx
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let resp = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            resp.starts_with("HTTP/1.1 2") || resp.starts_with("HTTP/1.0 2")
+        }
+        _ => false,
+    }
 }

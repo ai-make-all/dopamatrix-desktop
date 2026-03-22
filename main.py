@@ -11,19 +11,38 @@ main.py  —  ClipFlow FastAPI 应用入口
   uvicorn main:app --reload --port 8000
 """
 
+import asyncio
 import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+# ── 生产环境（PyInstaller 打包）：将工作目录切换到可执行文件所在目录 ──────────
+# 必须在所有其他代码之前执行，确保 clipflow.db / .env / output/ 等相对路径
+# 全部解析到安装目录（如 C:\ClipFlow\），而非系统默认工作目录。
+if getattr(sys, "frozen", False):
+    os.chdir(os.path.dirname(sys.executable))
+
+# ── 最早加载 .env ─────────────────────────────────────────────────────────────
+# 必须在任何读取 os.environ 的模块（OpenAI SDK、数据库 URL 等）导入之前完成。
+# ThreadPoolExecutor 线程共享同一 os.environ，加载一次即对全部线程生效。
+from src.utils.env_utils import load_env
+load_env()
+
+from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from src.core.logger import setup_logger, logger
 from src.api.database import engine, Base
 from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
 from src.api import routes_assets
 from src.api import routes_history
+
+setup_logger()
 
 
 # ================================================================== #
@@ -33,14 +52,14 @@ from src.api import routes_history
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期管理：启动时建表，关闭时可做清理。"""
     # ---- 启动阶段 ---- #
-    print("[ClipFlow] 正在初始化数据库表结构…")
+    logger.info("[ClipFlow] 正在初始化数据库表结构…")
     Base.metadata.create_all(bind=engine)
-    print("[ClipFlow] 数据库就绪 ✓")
+    logger.info("[ClipFlow] 数据库就绪 ✓")
 
     yield  # 应用运行中
 
     # ---- 关闭阶段（预留） ---- #
-    print("[ClipFlow] 应用已关闭。")
+    logger.info("[ClipFlow] 应用已关闭。")
 
 
 # ================================================================== #
@@ -103,8 +122,53 @@ app.include_router(routes_history.router, prefix="/api/v1")
 
 
 # ================================================================== #
+# 系统管理路由（私有，不对外文档暴露）                                   #
+# ================================================================== #
+_system_router = APIRouter(prefix="/api/v1/system", include_in_schema=False)
+
+
+@_system_router.post("/shutdown")
+async def system_shutdown() -> JSONResponse:
+    """
+    私有关机端点 — 仅供 Tauri 前端在窗口关闭时调用。
+
+    执行策略（两阶段）：
+      1. 立即返回 200，确保 HTTP 响应能被 Rust 端收到。
+      2. 异步延迟 0.5 秒后，使用 taskkill /F /T /PID 斩杀自身进程树
+         （/T 参数会连同 ProcessPoolExecutor 派生的全部子进程一起终止）。
+      3. 非 Windows 平台回退到 os._exit(0)。
+    """
+    async def _deferred_exit() -> None:
+        await asyncio.sleep(0.5)
+        pid = os.getpid()
+        logger.info(f"[shutdown] 收到优雅关机指令，PID={pid}，正在终止进程树…")
+        if sys.platform == "win32":
+            # /F 强制  /T 包含全部子进程  /PID 精准锁定自身
+            subprocess.Popen(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            os._exit(0)
+
+    asyncio.create_task(_deferred_exit())
+    return JSONResponse(content={"status": "shutting_down"})
+
+
+app.include_router(_system_router)
+
+
+# ================================================================== #
 # 开发入口（直接 python main.py 时使用）                                 #
 # ================================================================== #
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    is_prod = getattr(sys, "frozen", False)
+
+    if is_prod:
+        # 生产环境（PyInstaller 打包）：直接传 FastAPI 实例，不能传字符串
+        uvicorn.run(app, host="127.0.0.1", port=8000, log_config=None)
+    else:
+        # 开发环境
+        uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
