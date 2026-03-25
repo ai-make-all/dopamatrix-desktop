@@ -46,8 +46,13 @@ class AudioTrack:
     与视频 Track 平级，独立存放于 Timeline.audio_tracks。
     多条 AudioTrack 最终会被 amix 滤镜混合为单一音频输出流 [outa]。
     """
-    def __init__(self, name: str):
+    def __init__(self, name: str, audio_type: str = "general"):
         self.name = name
+        # audio_type: 'bgm'     — 背景音乐轨
+        #             'sfx'     — 音效轨
+        #             'tts'     — TTS 旁白轨
+        #             'general' — 通用音频轨（默认）
+        self.audio_type: str = audio_type
         self.clips: List[Clip] = []
 
     def add_clip(self, clip: Clip):

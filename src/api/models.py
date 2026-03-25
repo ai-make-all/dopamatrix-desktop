@@ -102,10 +102,12 @@ class LocalAsset(Base):
     id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
     file_hash    = Column(String(64), unique=True, nullable=False, index=True)
     file_path    = Column(String(512), nullable=False)        # 本地绝对路径
-    asset_type   = Column(String(20), nullable=False)         # 'video', 'logo', 'sticker'
+    asset_type   = Column(String(20), nullable=False)         # 'video', 'logo', 'sticker',
+                                                              # 'audio_bgm', 'audio_sfx', 'audio_tts'
     video_role   = Column(String(20), nullable=False, default="general") # 'hook', 'body', 'general'
     usage_count  = Column(Integer, nullable=False, default=0)
     tags         = Column(JSON, nullable=True)                # 自定义标签列表
+    emotion_tag  = Column(String(50), index=True, nullable=True)         # BGM 情绪抽卡标签（如 asmr, cyberpunk）
     is_exhausted = Column(Boolean, nullable=False, default=False)
     created_at   = Column(DateTime(timezone=True), nullable=False, default=_now)
     last_used_at = Column(DateTime(timezone=True), nullable=True)

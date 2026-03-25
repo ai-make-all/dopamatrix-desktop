@@ -37,8 +37,10 @@ _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" els
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
-from src.core.timeline import Clip, Timeline, Track
+from src.core.timeline import AudioTrack, Clip, Timeline, Track
 from src.utils.env_utils import get_ffmpeg_path
+from src.api.database import SessionLocal
+from src.api.models import LocalAsset
 
 
 class AssemblyNode(BaseNode):
@@ -350,13 +352,66 @@ class AssemblyNode(BaseNode):
                 f"({'not found' if sticker_path else 'no sticker path in overlay_clips'})"
             )
 
-        # ── Step 4: 写回 Context（纯视频 Timeline，无音频轨道）────────────────
+        # ── Step 4: BGM 情绪抽卡 — LRU 机制从本地素材库注入背景音乐轨道 ──────
+        bgm_emotion: Optional[str] = (
+            context.config.get("audio_scape", {})
+            .get("bgm", {})
+            .get("emotion")
+        )
+
+        if bgm_emotion:
+            self.log(f"BGM emotion tag detected: '{bgm_emotion}' — querying DAM...")
+            db = SessionLocal()
+            try:
+                bgm_asset: Optional[LocalAsset] = (
+                    db.query(LocalAsset)
+                    .filter(
+                        LocalAsset.asset_type == "audio_bgm",
+                        LocalAsset.emotion_tag == bgm_emotion,
+                        LocalAsset.is_exhausted == False,  # noqa: E712
+                    )
+                    .order_by(LocalAsset.usage_count.asc())   # LRU：优先抽用量最少的
+                    .first()
+                )
+
+                if bgm_asset:
+                    bgm_track = AudioTrack(name="BGM_Track", audio_type="bgm")
+                    bgm_track.add_clip(Clip(file_path=bgm_asset.file_path, start_time=0.0))
+                    timeline.add_audio_track(bgm_track)
+
+                    bgm_asset.usage_count += 1
+                    db.commit()
+
+                    self.log(
+                        f"BGM injected: id={bgm_asset.id} "
+                        f"emotion='{bgm_emotion}' "
+                        f"path='{bgm_asset.file_path}' "
+                        f"usage_count={bgm_asset.usage_count}"
+                    )
+                else:
+                    self.log(
+                        f"[WARN] No available BGM found for emotion='{bgm_emotion}' "
+                        "(asset_type='audio_bgm', is_exhausted=False). "
+                        "Continuing without BGM."
+                    )
+            except Exception as exc:
+                db.rollback()
+                self.log(f"[ERROR] BGM DB query failed: {exc}. Continuing without BGM.")
+            finally:
+                db.close()
+        else:
+            self.log("No 'audio_scape.bgm.emotion' in config — BGM track skipped.")
+
+        # ── Step 5: 写回 Context ──────────────────────────────────────────────
         context.set_asset("timeline", timeline)
         overlay_count = len(timeline.tracks) - 1
+        audio_track_count = len(timeline.audio_tracks)
         self.log(
-            f"Timeline assembled: {len(timeline.tracks)} track(s) total "
-            f"(Layer 0={bg_track.name}, +{overlay_count} overlay). "
-            "Audio will be added per-language by FFmpegCompositorNode."
+            f"Timeline assembled: {len(timeline.tracks)} video track(s) "
+            f"(Layer 0={bg_track.name}, +{overlay_count} overlay), "
+            f"{audio_track_count} audio track(s) "
+            f"({'BGM injected' if audio_track_count else 'no BGM'}). "
+            "TTS audio will be added per-language by FFmpegCompositorNode."
         )
 
         return context

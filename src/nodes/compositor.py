@@ -357,20 +357,28 @@ class FFmpegCompositorNode(BaseNode):
         return context
 
     # ------------------------------------------------------------------
-    # 字幕烧录：遍历 Context.variants，为每个语言生成最终变体视频
+    # 字幕烧录 + BGM/SFX 混音：遍历 Context.variants，为每个语言生成最终变体视频
     # ------------------------------------------------------------------
     def _render_variant(
         self, context: WorkflowContext, master_path: str, ffmpeg_bin: str
     ) -> None:
         """
-        逐语言生成最终变体视频：将 master_video（静音）+ 配音 + 字幕合并。
+        逐语言生成最终变体视频：master_video（静音）+ TTS 配音 + BGM/SFX + 字幕。
 
-        FFmpeg 命令策略：
-          - 输入 0：master_video.mp4（静音纯净画面）
-          - 输入 1：voice_{lang}.mp3（该语言配音，可选）
-          - 视频流：subtitles 滤镜烧录字幕（若无字幕则直接 copy）
-          - 音频流：apad 将配音延长至视频总时长，-shortest 以视频长度截断
-          - 若无配音：输出静音视频（-an）
+        输入槽位约定（动态分配，序号严格按加入顺序递增）：
+          [0]       — master_video.mp4（纯净静音画面，永远第一位）
+          [1]       — voice_{lang}.mp3（TTS 配音，若存在）
+          [2..N]    — timeline.audio_tracks 中的 BGM / SFX 文件（按轨道 → clip 顺序）
+
+        音频混音策略：
+          - BGM (audio_type=="bgm")  → volume=0.2 闪避降噪，保护人声清晰度
+          - TTS / SFX / general      → 原始音量直通
+          - 所有有效音频标签用 amix=inputs=N:duration=longest:dropout_transition=2[outa] 合并
+          - 无任何音频输入时 → -an
+
+        视频策略：
+          - 有字幕 → [0:v]subtitles=...[outv]，-map [outv]
+          - 无字幕 → -map 0:v（无 filter_complex 视频部分）
 
         输出文件：output/final_{lang}.mp4
         """
@@ -378,62 +386,119 @@ class FFmpegCompositorNode(BaseNode):
             self.log("No language variants found in Context — skipping variant rendering.")
             return
 
+        # 拉取 timeline，用于读取 BGM/SFX audio_tracks
+        timeline: Timeline = context.get_asset("timeline")
+        audio_tracks = timeline.audio_tracks if timeline else []
+
         for lang, assets in context.variants.items():
             ass_path: str = assets.get("subtitle_ass", "")
             voice_path: str = assets.get("voice_audio", "")
-            # 多进程下用 session_id 区分不同批次的输出文件，避免覆盖
             session_id: str = context.config.get("session_id", "")
             sid_suffix = f"_{session_id}" if session_id else ""
             final_path = f"output/final_{lang}{sid_suffix}.mp4"
 
-            # ── 检查字幕文件 ──────────────────────────────────────────────
-            has_sub = bool(ass_path and os.path.exists(ass_path))
+            has_sub   = bool(ass_path   and os.path.exists(ass_path))
             has_voice = bool(voice_path and os.path.exists(voice_path))
 
             if not has_sub:
-                self.log(f"[{lang}] No subtitle file found — video track will be raw copy.")
+                self.log(f"[{lang}] No subtitle file — video track will be raw copy.")
             if not has_voice:
-                self.log(f"[{lang}] No voice_audio found — output will be silent.")
+                self.log(f"[{lang}] No voice_audio — TTS track skipped.")
 
-            # ── 组装 FFmpeg 输入 ──────────────────────────────────────────
+            # ── Step 1: 收集所有 FFmpeg 输入，严格按槽位编号递增 ──────────────
+            # 槽位 0 = master_video（固定）
             inputs: List[str] = [ffmpeg_bin, "-i", master_path]
+            next_idx: int = 1   # 下一个可用输入槽位编号
+
+            # 第一顺位：TTS 配音
+            voice_label: str = ""           # e.g. "[1:a]"，不存在则为空
             if has_voice:
                 inputs += ["-i", voice_path]
+                voice_label = f"[{next_idx}:a]"
+                next_idx += 1
 
-            # ── 视频滤镜：字幕烧录 ────────────────────────────────────────
+            # 第二顺位：timeline.audio_tracks 中的 BGM / SFX / general
+            # audio_filter_parts : BGM 降噪滤镜语句列表（需写入 filter_complex）
+            # audio_mix_labels   : 最终送入 amix 的标签列表（顺序即混音顺序）
+            audio_filter_parts: List[str] = []
+            audio_mix_labels:   List[str] = []
+
+            if voice_label:
+                audio_mix_labels.append(voice_label)
+
+            for audio_track in audio_tracks:
+                for clip in audio_track.clips:
+                    if not clip.file_path or not os.path.exists(clip.file_path):
+                        self.log(
+                            f"[{lang}] [WARN] Audio clip missing, skipping: {clip.file_path}"
+                        )
+                        continue
+
+                    inputs += ["-i", clip.file_path]
+                    raw_label = f"[{next_idx}:a]"
+                    slot = next_idx
+                    next_idx += 1
+
+                    if audio_track.audio_type == "bgm":
+                        # BGM 闪避：降至 20% 音量，保护 TTS 人声
+                        bgm_out = f"[bgm{slot}]"
+                        audio_filter_parts.append(f"{raw_label}volume=0.2{bgm_out}")
+                        audio_mix_labels.append(bgm_out)
+                        self.log(
+                            f"[{lang}] BGM '{audio_track.name}' [{slot}:a] → volume=0.2 {bgm_out}"
+                        )
+                    else:
+                        # SFX / TTS / general：原音量直通
+                        audio_mix_labels.append(raw_label)
+                        self.log(
+                            f"[{lang}] Audio '{audio_track.name}' "
+                            f"(type={audio_track.audio_type}) [{slot}:a] → {raw_label}"
+                        )
+
+            # ── Step 2: 视频滤镜 — 字幕烧录 ──────────────────────────────────
             if has_sub:
-                # Windows 路径转义：反斜杠 → 正斜杠，盘符冒号加反斜杠转义
+                # Windows 路径转义：反斜杠 → 正斜杠，盘符冒号 "X:" → "X\:"
                 safe_ass = ass_path.replace("\\", "/")
                 if len(safe_ass) >= 2 and safe_ass[1] == ":":
                     safe_ass = safe_ass[0] + "\\:" + safe_ass[2:]
-                video_filter = f"subtitles='{safe_ass}'[outv]"
-                video_fg = f"[0:v]{video_filter}"
+                video_fg  = f"[0:v]subtitles='{safe_ass}'[outv]"
                 video_map = ["-map", "[outv]"]
             else:
-                video_fg = ""
+                video_fg  = ""
                 video_map = ["-map", "0:v"]
 
-            # ── 音频映射：直接映射原始音频流，让 -shortest 以视频流截断 ───────
-            if has_voice:
-                # 直接映射 1:a，不使用 apad 以免无限填充导致 -shortest 失效
-                audio_fg = ""
-                audio_map = ["-map", "1:a"]
-                audio_codec = ["-c:a", "aac", "-b:a", "192k"]
-                shortest = ["-shortest"]
-            else:
-                audio_fg = ""
-                audio_map = ["-an"]
+            # ── Step 3: 音频滤镜 — 动态 amix ─────────────────────────────────
+            n = len(audio_mix_labels)
+            if n == 0:
+                # 无任何音频来源
+                audio_fg    = ""
+                audio_map   = ["-an"]
                 audio_codec = []
-                shortest = []
-
-            # ── 合并 filter_complex ────────────────────────────────────────
-            filter_parts = [p for p in [video_fg, audio_fg] if p]
-            if filter_parts:
-                filter_args = ["-filter_complex", ";".join(filter_parts)]
+                shortest    = []
+            elif n == 1 and not audio_filter_parts:
+                # 单一 TTS/SFX 且无中间滤镜：直接映射，不走 filter_complex 音频部分
+                # audio_mix_labels[0] 形如 "[1:a]"，去括号得 "1:a"
+                audio_fg    = ""
+                audio_map   = ["-map", audio_mix_labels[0].strip("[]")]
+                audio_codec = ["-c:a", "aac", "-b:a", "192k"]
+                shortest    = ["-shortest"]
             else:
-                filter_args = []
+                # 多路混音，或单路但有 BGM volume 中间滤镜（amix=inputs=1 合法）
+                mix_in  = "".join(audio_mix_labels)
+                amix_fg = (
+                    f"{mix_in}"
+                    f"amix=inputs={n}:duration=longest:dropout_transition=2[outa]"
+                )
+                audio_fg    = ";".join(audio_filter_parts + [amix_fg])
+                audio_map   = ["-map", "[outa]"]
+                audio_codec = ["-c:a", "aac", "-b:a", "192k"]
+                shortest    = ["-shortest"]
 
-            # ── 组装完整命令 ──────────────────────────────────────────────
+            # ── Step 4: 合并 filter_complex（视频 + 音频两部分以 ; 连接）────────
+            filter_parts = [p for p in [video_fg, audio_fg] if p]
+            filter_args  = ["-filter_complex", ";".join(filter_parts)] if filter_parts else []
+
+            # ── Step 5: 组装并执行最终命令 ────────────────────────────────────
             cmd: List[str] = (
                 inputs
                 + filter_args
@@ -460,18 +525,20 @@ class FFmpegCompositorNode(BaseNode):
                 )
                 self.log(f"[{lang}] [OK] Variant rendered: {final_path}")
                 context.set_variant_asset(lang, "final_video", final_path)
-                
-                # Check for custom output_dir and copy final render
+
                 custom_output_dir = context.config.get("output_dir")
                 if custom_output_dir:
                     os.makedirs(custom_output_dir, exist_ok=True)
-                    target_file_path = os.path.join(custom_output_dir, os.path.basename(final_path))
+                    target_file_path = os.path.join(
+                        custom_output_dir, os.path.basename(final_path)
+                    )
                     shutil.copy(final_path, target_file_path)
-                    self.log(f"[{lang}] [OK] Copied final video to custom output dir: {target_file_path}")
+                    self.log(
+                        f"[{lang}] [OK] Copied to custom output dir: {target_file_path}"
+                    )
             except FileNotFoundError:
                 self.log(f"[{lang}] [ERROR] ffmpeg binary not found.")
             except subprocess.CalledProcessError as exc:
-                # 只打最后 800 字符，避免日志爆炸
                 error_msg = exc.stderr[-800:] if exc.stderr else "Unknown error"
                 self.log(
                     f"[{lang}] [ERROR] Variant render failed "
