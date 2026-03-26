@@ -9,6 +9,7 @@ _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" els
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.core.logger import logger
 from src.core.timeline import Clip, Timeline, Track
 from src.utils.env_utils import get_ffmpeg_path
 
@@ -309,7 +310,7 @@ class FFmpegCompositorNode(BaseNode):
 
         # 5. 打印命令，方便调试
         self.log("[CMD] Full FFmpeg command:")
-        print(
+        logger.info(
             "\n"
             + " \\\n    ".join(
                 f'-filter_complex "{full_filtergraph}"'
@@ -321,7 +322,7 @@ class FFmpegCompositorNode(BaseNode):
         )
 
         # 6. 真实执行
-        print("⏳ 正在渲染最终母带，请稍候...")
+        logger.info("⏳ 正在渲染最终母带，请稍候...")
         self.log("Rendering master video, please wait...")
         try:
             subprocess.run(

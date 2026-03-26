@@ -28,6 +28,7 @@ import random
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.core.logger import logger
 from src.core.timeline import Timeline
 
 

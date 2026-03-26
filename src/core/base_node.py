@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
+
 from src.core.context import WorkflowContext
+from src.core.logger import logger
+
 
 class BaseNode(ABC):
     """
@@ -23,6 +26,6 @@ class BaseNode(ABC):
         """
         pass
         
-    def log(self, message: str):
-        """统一的节点日志输出"""
-        print(f"[{self.name}] {message}")
+    def log(self, message: str) -> None:
+        """统一的节点日志输出，写入 loguru 全局日志（同时写文件 + 控制台）"""
+        logger.info(f"[{self.name}] {message}")

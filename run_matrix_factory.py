@@ -46,6 +46,8 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
+from src.core.logger import logger
+
 
 # ===========================================================================
 # Worker 函数（运行在独立线程中）
@@ -69,9 +71,6 @@ def _run_single_matrix(session_id: str, user_prompt: str,
     # ── 线程安全的 .env 加载（父线程已加载则幂等；override=False 不覆盖） ──────
     from src.utils.env_utils import load_env
     load_env()
-
-    # ── 导入 logger（线程安全，loguru 天然支持多线程写入） ────────────────────
-    from src.core.logger import logger
 
     logger.info(f"[Worker {session_id}] 线程启动，开始生产矩阵视频...")
 
@@ -218,8 +217,6 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
     Returns:
         所有任务的结果字典列表，按完成顺序排列
     """
-    from src.core.logger import logger
-
     if not user_prompt:
         user_prompt = (
             "帮我生成一个 15 秒的汽车减震器出海短视频，包含英文和阿拉伯语。"
@@ -271,25 +268,25 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
 
 
 def _print_summary(results: list[dict]) -> None:
-    """打印所有任务的最终摘要。"""
-    print("\n" + "=" * 60)
-    print("📊  矩阵工厂生产摘要")
-    print("=" * 60)
+    """将所有任务的最终摘要写入日志。"""
+    logger.info("\n" + "=" * 60)
+    logger.info("📊  矩阵工厂生产摘要")
+    logger.info("=" * 60)
 
     success_count = sum(1 for r in results if r["success"])
-    print(f"\n总计: {len(results)} 个任务，{success_count} 成功，{len(results) - success_count} 失败\n")
+    logger.info(f"\n总计: {len(results)} 个任务，{success_count} 成功，{len(results) - success_count} 失败\n")
 
     for r in results:
         sid = r["session_id"]
         if r["success"]:
             master = r["assets"].get("video_master", "(未生成)")
-            print(f"  ✅ [{sid}] 母带: {master}")
+            logger.info(f"  ✅ [{sid}] 母带: {master}")
             for lang, path in r["assets"].get("variants", {}).items():
-                print(f"         [{lang}]: {path or '(未生成)'}")
+                logger.info(f"         [{lang}]: {path or '(未生成)'}")
         else:
-            print(f"  ❌ [{sid}] 失败: {r.get('error', 'Unknown')}")
+            logger.warning(f"  ❌ [{sid}] 失败: {r.get('error', 'Unknown')}")
 
-    print()
+    logger.info("")
 
 
 # ===========================================================================
@@ -330,7 +327,7 @@ def main():
         user_prompt=args.prompt,
     )
     _print_summary(results)
-    print(f"✅ 矩阵生成完毕！总耗时: {time.time() - start_time:.2f} 秒")
+    logger.info(f"✅ 矩阵生成完毕！总耗时: {time.time() - start_time:.2f} 秒")
 
     all_success = all(r["success"] for r in results)
     sys.exit(0 if all_success else 1)

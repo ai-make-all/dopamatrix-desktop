@@ -26,6 +26,7 @@ from typing import Optional
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.core.logger import logger
 from src.services.llm_provider import BaseLLMProvider, OpenAIProvider
 
 

@@ -21,7 +21,6 @@ AssetSelectNode — Phase 4 升级版：本地矩阵素材选择节点
   - Pexels 降级逻辑保持不变，方便测试与回归。
 """
 
-import logging
 import os
 import random
 import subprocess
@@ -34,10 +33,9 @@ _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" els
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.core.logger import logger
 from src.utils.env_utils import get_ffmpeg_path
 from src.services.asset_provider import BaseAssetProvider, LocalMatrixProvider, PexelsProvider
-
-logger = logging.getLogger(__name__)
 
 
 class AssetSelectNode(BaseNode):

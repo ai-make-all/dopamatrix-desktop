@@ -26,6 +26,7 @@ import edge_tts
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.core.logger import logger
 
 
 # ---------------------------------------------------------------------------

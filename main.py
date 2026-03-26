@@ -35,6 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from pyngrok import ngrok
+
 from src.core.logger import setup_logger, logger
 from src.api.database import engine, Base
 from src.api.schemas import HealthResponse
@@ -50,15 +52,40 @@ setup_logger()
 # ================================================================== #
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期管理：启动时建表，关闭时可做清理。"""
+    """应用生命周期管理：启动时建表 + 开启内网穿透，关闭时清理隧道资源。"""
+    _public_url: str | None = None
+
     # ---- 启动阶段 ---- #
     logger.info("[ClipFlow] 正在初始化数据库表结构…")
     Base.metadata.create_all(bind=engine)
     logger.info("[ClipFlow] 数据库就绪 ✓")
 
+    # ---- Ngrok 内网穿透 ---- #
+    # ngrok.connect 是同步调用，在 lifespan 启动阶段（服务器尚未接受请求时）
+    # 执行不会影响请求处理；若需严格非阻塞可改用 run_in_executor。
+    try:
+        loop = asyncio.get_event_loop()
+        http_tunnel = await loop.run_in_executor(
+            None, lambda: ngrok.connect(8000, bind_tls=True)
+        )
+        _public_url = http_tunnel.public_url
+        os.environ["PUBLIC_BASE_URL"] = _public_url
+        logger.info("=" * 60)
+        logger.info(f"🌍 [内网穿透] Ngrok 公网地址已映射: {_public_url}")
+        logger.info("=" * 60)
+    except Exception as exc:
+        logger.warning(f"[内网穿透] Ngrok 启动失败，将继续使用本地地址: {exc}")
+
     yield  # 应用运行中
 
-    # ---- 关闭阶段（预留） ---- #
+    # ---- 关闭阶段 ---- #
+    if _public_url:
+        try:
+            ngrok.disconnect(_public_url)
+            ngrok.kill()
+            logger.info("[内网穿透] Ngrok 隧道已断开，进程已清理。")
+        except Exception as exc:
+            logger.warning(f"[内网穿透] Ngrok 关闭时出现异常（可忽略）: {exc}")
     logger.info("[ClipFlow] 应用已关闭。")
 
 

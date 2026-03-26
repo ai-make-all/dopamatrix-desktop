@@ -256,7 +256,7 @@ def run_matrix_job(
                 history_assets.append({
                     "path": asset.file_path,
                     "hash": asset.file_hash,
-                    "download_url": f"{base_url}/tasks/assets/{asset.id}/download",
+                    "download_url": f"{base_url}/api/v1/tasks/assets/{asset.id}/download",
                 })
 
         # 4.5. 疲劳值反写闭环（事务一致性保护）

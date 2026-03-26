@@ -37,6 +37,7 @@ _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" els
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
+from src.core.logger import logger
 from src.core.timeline import AudioTrack, Clip, Timeline, Track
 from src.utils.env_utils import get_ffmpeg_path
 from src.api.database import SessionLocal

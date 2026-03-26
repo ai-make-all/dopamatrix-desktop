@@ -49,3 +49,7 @@ web_ui/src-tauri/bin/backend
 .idea/
 .DS_Store
 Thumbs.db
+
+# 忽略根目录下的本地物理渲染依赖
+ffmpeg.exe
+ffprobe.exe

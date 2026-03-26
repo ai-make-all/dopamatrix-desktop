@@ -76,7 +76,10 @@ def get_ffmpeg_path(executable_name: str = "ffmpeg.exe") -> str:
               方便日志排查。
 
       - 开发环境：
-          直接返回去掉 .exe 后缀的命令名，依赖系统 PATH 解析。
+          优先在项目根目录（与 main.py 同级）查找物理可执行文件。
+          例：<project_root>/ffmpeg.exe → 返回绝对路径
+
+          兜底：若根目录无物理文件，返回去掉 .exe 后缀的命令名，依赖系统 PATH 解析。
           例：ffmpeg / ffprobe
 
     Args:
@@ -102,5 +105,12 @@ def get_ffmpeg_path(executable_name: str = "ffmpeg.exe") -> str:
         # 兜底：返回猜测 1 路径，让 subprocess 报出明确的 FileNotFoundError
         return candidate_same_level
 
-    # 开发环境：去掉 .exe 后缀，依赖 PATH
+    # 开发环境：优先在项目根目录（main.py 所在位置）查找物理可执行文件
+    # parents[0] = src/utils/  parents[1] = src/  parents[2] = 项目根目录
+    project_root = Path(__file__).resolve().parents[2]
+    candidate_dev = project_root / executable_name          # 保留 .exe 后缀
+    if candidate_dev.exists():
+        return str(candidate_dev)
+
+    # 终极兜底：根目录也找不到物理文件时，才降级依赖系统 PATH
     return executable_name.replace(".exe", "")

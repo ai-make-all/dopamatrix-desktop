@@ -1,9 +1,9 @@
-# 📐 ClipFlow — PROJECT ROADMAP
+# 📐 DopaMatrix — PROJECT ROADMAP
 
 > **多语言视频内容工厂 · Multilingual Video Content Factory**
 >
-> 本文档是 ClipFlow 项目的**宪法级纲领**，所有后续开发均以此为准。
-> 最后更新：2026-03-19
+> 本文档是 DopaMatrix 项目的**宪法级纲领**，所有后续开发均以此为准。
+> 最后更新：2026-03-23
 
 ---
 
@@ -20,19 +20,29 @@
 
 ## 1. 项目定位 (Mission)
 
-ClipFlow 是一个面向**中东及全球市场**的多语言短视频批量生产系统。
+> **"Marketing is no longer about the stuff that you make, but about the stories you tell and the emotions you trigger."**
 
-| 维度 | 描述 |
-|------|------|
-| **核心能力** | 多轨道混剪 → 母带生成 → 多语言字幕挂载 → 批量变体分发 |
-| **目标用户** | 跨境 MCN / 本地化团队 / AI Agent |
-| **差异壁垒** | FFmpeg 原生槽位渲染 + DAG 工作流编排 + Master-Variant 流式出片 |
+DopaMatrix 绝不仅仅是一个传统的视频剪辑或混剪工具，而是**全球出海市场首个「基于情绪计算的互动叙事引擎 (Interactive Narrative & Affective Computing Engine)」**。
+
+我们深刻认知到：无论是实体商家的洗地机，还是游戏公司的休闲小游戏，现代营销的本质都是**“兜售情绪”**。单向的视听轰炸已经失效，未来的高转化属于**“养成系互动错觉”**。通过捕获观众的互动反馈（如：评论区的“引战”与“神评”），我们赋予受众“造物主特权”，让下一次生成的视频画面和剧情由观众的意图来决定。
+
+DopaMatrix 采用 **“单核双擎 (Single Core, Dual Engines)”** 战略，底层共享极致高并发的 FFmpeg 渲染基建，上层基于心理学框架（如八角行为分析法）重构 X/Y 轴，分为两大核心业务线：
+
+| 业务线 | 定位与愿景 | 核心能力与情绪锚点 | 目标受众 |
+|--------|----------|--------------|--------|
+| **🎮 DopaMatrix UA**<br>(当前尖刀) | **通向 Playable Ads 的 AI 互动买量基建**。<br>将传统的单向广告投放，降维打击为**“与整个平台用户打一局真实的互动游戏”**。 | **众包式剧情生成 (评论篡改 DSL)** / 制造**焦虑、挫败、权力幻想**的 AIGC Hook 工厂 / 互动影游 (FMV) 极速打包管线 | 全球顶级游戏发行商 / 互动短剧出海团队 / 重度 UA 投放手 |
+| **🏬 DopaMatrix Content** | **多语言情绪共鸣内容矩阵**。<br>挖掘实体商品的隐藏情绪价值，实现低门槛全球内容分发。 | 实体生活叙事 DSL 解析 / 制造**治愈、猎奇、FOMO(错失恐惧)** 的 Hook / Master-Variant 防封裂变 | 跨境 MCN / 实体出海门店 / SaaS 代理商 |
 
 > [!IMPORTANT]
-> **战略定位 — 纯粹的高并发底层渲染引擎 (Headless Render Engine)**
+> **终极战略壁垒 — 神经营销流 (NeuroFlow)**
 >
-> ClipFlow 致力于提供**纯粹的音视频渲染管线**。本系统**不包含**复杂的社交媒体抓取与自学习逻辑，而是通过标准化的 **Headless API** 向外暴露全部渲染能力，以便未来无缝接入上层的「**业务增长中枢系统 (GrowthOS)**」。
-> ClipFlow 的边界是：接收结构化任务指令 → 完成高质量渲染 → 返回带指纹与成本估算的结果报告。业务决策、数据学习、爆款分析等高阶逻辑，由 GrowthOS 负责。
+> DopaMatrix 绝不满足于“盲目生成”。我们将建立行业内首个**“情绪营销大模型”**。通过 API 回传全网投放的 ROI 数据，让系统自我学习“哪种商品特征+哪种情绪标签=最高转化率”，形成从“素材生成 → 情绪试错 → 归因回流 → 认知进化”的绝对商业闭环。除了预测流量趋势，NeuroFlow 更将执行**「情绪劫持与算法复苏」**：通过深度监听社交媒体的评论意图，自动反哺并重构底层的渲染坐标（X/Y 轴）。
+>
+> **对游戏买量 (UA) 的毁灭性打击：** 我们已打破“打广告”的传统定义。例如在 TikTok 投放策略游戏，系统可故意生成“选错兵种导致全军覆没”的视频以触发玩家嘲讽。当评论区出现“连弓箭手克制步兵都不懂”的嘲讽时，NeuroFlow 会自动抓取该评论，并极速生成下一个广告变体——开头直接挂出评论截图并回应：“这位网友说我蠢，那这次我全出弓箭手看看能不能赢！”这已然打破了第四面墙，将广告变成了与全平台用户连载互动的群体游戏，形成“素材投放 → 触发嘲讽 → AI 覆写 DSL → 众包剧情裂变”的无限流量闭环。
+
+> DopaMatrix 致力于提供**纯粹的音视频渲染管线**。本系统**不包含**复杂的社交媒体抓取与自学习逻辑，而是通过标准化的 **Headless API** 向外暴露全部渲染能力，以便未来无缝接入上层的「**业务增长中枢系统 (GrowthOS)**」。
+
+> DopaMatrix 致力于提供**纯粹的音视频渲染管线与动态 DSL 解析底座**。我们接收来自云端「GrowthOS」的高阶互动指令，完成高质量渲染，并返回带指纹与成本估算的结果报告。业务决策、数据学习、爆款分析等高阶逻辑，由 GrowthOS 负责。
 
 ---
 
@@ -93,7 +103,7 @@ Master Video (无字幕纯净画面)
 
 ### 2.4 多维混剪与槽位渲染 — X/Y Axis & Slot-based Rendering
 
-这是 ClipFlow 的**核心竞争壁垒**。
+这是 DopaMatrix 的**核心竞争壁垒**。
 
 #### Timeline 数据结构（二维模型）
 
@@ -142,7 +152,7 @@ ffmpeg \
 ## 3. 目录结构 (Project Layout)
 
 ```
-ClipFlow/
+DopaMatrix/
 ├── PROJECT_ROADMAP.md          ← 本文档（宪法）
 ├── requirements.txt
 ├── main.py                     ← 入口 / FastAPI 启动
@@ -365,17 +375,18 @@ workflow_def = {
 **目标**：打破本地信息孤岛，引入 WebSocket 长连接与开源多智能体框架，实现从“单机渲染工具”到“云端控制节点”的跨越，建立视频基因溯源体系。
 
 #### 6.1 WebSocket 长连接与双向策略下发 (The Nervous System)
-- [ ] **建立持久化通道**：在 FastAPI 引入 WebSocket，使本地 ClipFlow 保持对云端 GrowthOS 的长连接监听。
+- [ ] **建立持久化通道**：在 FastAPI 引入 WebSocket，使本地 DopaMatrix 保持对云端 GrowthOS 的长连接监听。
 - [ ] **本地实时进度推送 (无中间件架构)**：坚决摒弃 Redis 等重型中间件，捍卫桌面端“单体免安装”的极致体验。通过 Python 内存事件总线 (Event Bus) 捕获 FFmpeg 子进程进度，并经由 WebSocket 管道像心跳一样平滑推送给前端 UI。
 - [ ] **Copilot 模式 (半托管)**：云端下发策略卡片（如：“检测到近期中东市场 #Tire 标签爆火，是否应用该策略生成 10 个视频？”），UI 弹出确认框，用户一键执行。
 - [ ] **Autopilot 模式 (全托管)**：云端直接下发 JSON 渲染指令，本地引擎在后台静默排队、静默渲染、自动回传，彻底实现“无人值守印钞”。
 
 #### 6.2 多智能体框架集成 (DeerFlow & CrewAI Integration)
-> **设计原则**：ClipFlow 保持纯粹的渲染工具属性（Tool），由外部 Agent 框架负责逻辑推理。
-- [ ] **ClipFlow Tool 封装**：将 `POST /tasks/submit` 封装为标准的 LangChain/CrewAI 可调用工具 (`ClipFlow_Render_Tool`)。
-- [ ] **轻量级编排 (CrewAI)**：构建创意工作组（数据分析师 Agent -> 文案编剧 Agent -> 执行导演 Agent -> 调用 ClipFlow 出片）。
+> **设计原则**：DopaMatrix 保持纯粹的渲染工具属性（Tool），由外部 Agent 框架负责实时感知与预测推理。
+- [ ] **DopaMatrix Tool 封装**：将 `POST /tasks/submit` 封装为标准的 LangChain/CrewAI 可调用工具 (`DopaMatrix_Render_Tool`)。
+- [ ] **轻量级编排 (CrewAI)**：构建创意工作组（数据分析师 Agent -> 文案编剧 Agent -> 执行导演 Agent -> 调用 DopaMatrix 出片）。
 - [ ] **深度数据挖掘 (DeerFlow)**：利用字节 DeerFlow 的强大沙盒与爬虫能力，自动抓取 TikTok/Meta 的行业竞品爆款数据，喂给 CrewAI 进行二次创作。
-- [ ] **动态技能路由 (Dynamic Skills Routing)**：打造“对话即服务”体验。隐藏复杂的节点连线，Agent 根据运营人员自然语言意图，动态加载 `DataRetrieval_Skill`, `Localization_Skill` 等独立技能模块，整理参数后统一抛给底层固定 Workflow 执行。
+- [ ] **全天候流量雷达 (DeerFlow 2.0)**：升级接入 DeerFlow 2.0。利用其强大的沙盒环境与高频数据流处理能力，实时监听 TikTok/Meta 的大盘异动，重点捕捉处于“潜伏期”高增长率的音轨与视觉模因 (Memes)。
+- [ ] **动态技能路由 (Dynamic Skills Routing)**：打造“对话即服务”体验。隐藏复杂的节点连线，Agent 根据运营人员自然语言意图，动态加载 `Trend_Forecasting_Skill`,`DataRetrieval_Skill`, `Localization_Skill` 等独立技能模块，整理参数后统一抛给底层固定 Workflow 执行。
 
 #### 6.3 视频基因溯源机制 (Gene Traceability)
 - [ ] **指纹埋点**：在 Webhook 回调的结案报告中，强绑定 `hook_asset_hash`, `bg_assets_hash`, `script_id` 和 `tts_voice`。
@@ -439,7 +450,57 @@ workflow_def = {
 
 #### 8.3 商业数据闭环 (The Holy Grail)
 - [ ] **生态回流 API**：接入 Meta Ads / TikTok 开发者 API，将变体视频的真实播放量、完播率、转化率拉取回 GrowthOS。
-- [ ] **达尔文进化算法**：GrowthOS 自动分析高 ROI 视频的基因溯源数据。发现某个特定 Hook 爆了，自动调用 ClipFlow 以该 Hook 为核心，再自动裂变 50 个新的混剪变体，实现真正的商业永动机。
+- [ ] **达尔文进化算法**：GrowthOS 自动分析高 ROI 视频的基因溯源数据。发现某个特定 Hook 爆了，自动调用 DopaMatrix 以该 Hook 为核心，再自动裂变 50 个新的混剪变体，实现真正的商业永动机。
+
+---
+
+### Phase 9 — V3.0 互动买量与 Playable 引擎 (The Interactive Frontier) 🚀
+
+**目标**：打破纯视频买量的天花板，解决“货不对板”痛点，实现从“观看”到“试玩”的端到端自动化生成，切入千亿级休闲小游戏分发市场。
+
+#### 9.1 互动影游打包器 (Interactive FMV Pipeline)
+- [ ] **分支逻辑 DSL 支持**：引擎支持解析多分支剧情模板（如：`Video A -> [选项1: 播 B] / [选项2: 播 C]`）。
+- [ ] **`InteractiveExportNode` (H5 互动输出节点)**：替代传统的 FFmpeg `.mp4` 终点，引擎将多段渲染好的视频和控制逻辑（`state.json`）合并，打包输出带有轻量级 Web 播放器外壳的 `.zip` 文件，可直接作为可试玩广告 (Playable Ad) 投放。
+
+#### 9.2 H5 休闲小游戏“换皮”引擎 (AI Reskin Pipeline)
+- [ ] **无头游戏引擎集成**：在云端或本地集成 Cocos/Phaser 的命令行构建工具。
+- [ ] **AIGC 资产动态替换**：系统读取预设的爆款小游戏源码（如：割草、跑酷），调用 AI 大模型自动生成美术序列帧（Sprite Sheet）并替换工程目录，一键编译出全新题材的互动小游戏。
+- [ ] **买量与试玩全自动闭环**：引擎先生成游戏，再自动根据该游戏录屏生成 100 条引流短视频，实现 100% “货板一致”的降维打击。
+
+---
+
+### Phase 10 — V4.0 神经营销流与情感计算中枢 (NeuroFlow & Affective Computing) 🧠
+
+**目标**：彻底告别“人工猜爆款”。建立闭环的强化学习系统，打造专属的“情绪营销大模型”，让平台具备自主推演最高 ROI 情感剧本的能力，形成绝对的商业护城河。
+
+#### 10.1 心理学 Y 轴与标准化情绪字典 (Affective Data Infrastructure)
+- [ ] **情绪标签规范化**：在 SQLite 资产表与 VLM（视觉大模型）打标系统中，强制引入标准心理学分类字典。
+- [ ] **正负向刺激池**：划分“引流钩子（如：Anxiety/焦虑、Frustration/挫败、FOMO/错失恐惧）”与“转化推手（如：Competence/掌控感、Satisfaction/解压治愈）”，确保引擎抽卡具备语义精确性。
+
+#### 10.2 达尔文归因与数据喂养闭环 (Darwinian Attribution Loop)
+- [ ] **ROI 基因反推机制**：对接 Meta/TikTok 开发者 API，抓取矩阵变体视频的真实消耗、CTR 和 CPA。
+- [ ] **权重自我迭代**：系统自动将后端真实的高转化数据，归因回对应的 `Story DSL` 和 `Emotion Tag`。当某类情绪剧本跑赢大盘时，系统自动在底层数据库中提高该标签的组合权重（如：“实体商品+解压 ASMR Hook”权重提升）。
+
+#### 10.3 情绪营销大模型中枢 (The NeuroFlow LLM)
+- [ ] **行业知识库微调 (Fine-tuning & RAG)**：利用百万条“视频基因+ROI 数据”微调开源语言大模型（如 Llama 3 / Qwen）。
+- [ ] **Auto-Scripting (全自动情感编剧)**：用户仅需输入商品名称/游戏包体，NeuroFlow 大模型自动推演全球投放策略：“根据最新大盘数据，中东区 #策略游戏 结合【权力幻想】转化率最高，系统已为您自动生成 50 套极客风宣发矩阵。”
+
+#### 10.4 爆款预言机与动态匹配引擎 (Trend Oracle & Matchmaking) 🔮
+- [ ] **时序情绪预测 (Emotion Trend Forecasting)**：整合 DeerFlow 2.0 采集的大盘特征（如播放量增速、转化率波动），训练专用的时序大模型，精准预测特定【情绪标签】在未来 7-14 天的流量红利期。
+- [ ] **商品-情绪潜空间匹配 (Latent Space Matchmaking)**：建立商品属性与情绪维度的向量空间。当系统预测某一情绪即将爆发时，自动计算库内所有商品（实物/游戏）与该情绪的向量距离。
+- [ ] **先发制人生成 (Prescriptive Generation)**：从“事后归因”进化为“事前指导”。GrowthOS 在流量爆发前夜，主动向客户发起渲染提案（如：“预测【孤独治愈感】将在北美区爆发，您的【香薰机】产品契合度达 92%，是否立即裂变 100 条矩阵视频抢占红利？”），实现真正的算力变现。
+
+#### 10.5 评论区情绪劫持与算法复苏机制 (Sentiment Hijacking & Resuscitation) 🛡️
+> **设计原则**：视频发布不是终点，而是互动的起点。利用自动化机制干预平台推荐算法，延长视频的流量生命周期。
+- [ ] **高频神评挖掘机 (High-Resonance Comment Mining)**：利用 DeerFlow 2.0 监听竞品爆款视频，自动抓取并重写点赞极高、具备强【引战/站队】属性的评论，构建 `Seed_Comments_DB` (种子评论库)。
+- [ ] **流量衰减拦截器 (Decay-Driven Trigger)**：实时监控已发布视频的播放量增速 (Velocity)。当探测到系统推流进入衰减期时，自动触发预设的“马甲号矩阵”，投放强争议性种子评论，人为制造活跃度，触发算法的“二次推流 (Resuscitation)”。
+- [ ] **分享动机逆向归因 (Viral Intent Attribution)**：自动抓取评论区中的 `@艾特` 行为与配文。利用 NeuroFlow 进行自然语言意图分类（如：嘲笑、共鸣、争论），将用户的“真实互动动机”反哺给底层的生成管线，用“神评”指导下一批视频的文案生成（用魔法打败魔法）。
+
+#### 10.6 众包式剧情生成与动态 DSL 覆写 (Crowdsourced Narrative Loop) 🎭
+> **设计原则**：将观众的评论互动，直接升维为驱动视频画面重新编排的渲染参数，实现“养成系”的互动错觉。
+- [ ] **观众意图与实体提取 (Entity & Intent Extraction)**：结合 DeerFlow 2.0，抓取用户在评论区中的“干预性诉求”（如：“为什么不让角色 A 站 C 位？”）。NeuroFlow 大模型自动提取目标实体 (Target Entity) 与动作意图 (Action Intent)。
+- [ ] **语义驱动的 Y 轴篡改 (Feedback-Driven Y-Axis Override)**：NeuroFlow 将提取出的意图，转化为底层的 `Story DSL`。系统在生成下一个序列视频时，第二层 FastAPI 路由会自动拦截并覆写底层的物理坐标（例如：强制将观众提及的“角色 A”的渲染坐标系 `x,y` 移至画面的视觉中心 Slot）。
+- [ ] **互动开场白自动生成 (The Call-Out Hook)**：系统自动截取触发剧情修改的“神评”截图，并在下一个视频的前 3 秒生成画中画 (PiP) 与针对性的 TTS 语音（如：“上期粉丝要求安排，今天他来了”），以此不断触发评论区的造物主特权感与权力幻想，实现流量滚雪球式的指数级裂变。
 
 ---
 
@@ -462,4 +523,4 @@ workflow_def = {
 
 > **This is a living document.** 随着开发推进，各 Phase 的 checkbox 将持续更新。
 >
-> — ClipFlow Chief Architect · February 2026
+> — DopaMatrix Chief Architect · February 2026
