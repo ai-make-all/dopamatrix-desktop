@@ -19,47 +19,32 @@ ScriptGenNode — Phase 3: 文案生成节点
       ...
     ]
   }
+
+System Prompt 来源：
+  所有提示词均以 Jinja2 模板文件存放于 src/prompts/，由 PromptLoader 动态加载渲染。
+  节点本身零硬编码，新增语言或调整措辞只需编辑对应 .jinja 文件。
+
+  script_auto.jinja   — 模式 A：AI 从零智能创作分镜脚本
+  script_rewrite.jinja — 模式 B：基准文案防查重矩阵洗稿
 """
 
 import json
-from typing import Optional
+from typing import List, Optional
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
 from src.core.logger import logger
 from src.services.llm_provider import BaseLLMProvider, OpenAIProvider
+from src.utils.prompt_loader import prompt_loader
 
 
-# ---------------------------------------------------------------------------
-# 系统提示词（决定 LLM 的角色与输出格式，是脚本质量的基石）
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """\
-你是一位专注于出海短视频的资深编导，精通东南亚、中东等新兴市场的内容偏好与平台算法。
-你的任务是根据用户的需求，生成一份专业、结构化的短视频分镜脚本。
-
-【输出格式要求】
-你必须且只能返回一个合法的 JSON 对象，格式如下：
-{
-  "scenes": [
-    {
-      "duration": <整数，该分镜的预估时长，单位：秒>,
-      "visual_prompt": "<英文画面提示词，描述镜头内容、角度、氛围，供视频生成 AI 使用>",
-      "narrations": {
-        "en": "<英文旁白文案>",
-        "ar": "<阿拉伯语旁白文案>"
-      }
-    }
-  ]
+# 模式 → 模板文件名映射表（新增模式只需在此注册）
+_MODE_TEMPLATE: dict[str, str] = {
+    "auto":    "script_auto.jinja",
+    "rewrite": "script_rewrite.jinja",
 }
 
-【创作原则】
-1. scenes 数量要合理，覆盖完整叙事弧（吸引→痛点→解决→行动号召）
-2. visual_prompt 要写实、具体，避免抽象词汇，突出产品核心卖点
-3. narrations 中英文和阿拉伯语均需情感饱满、口语化、贴近当地文化
-4. duration 之和应接近用户要求的总时长
-5. 不要在 JSON 外输出任何额外文字、注释或 Markdown 格式
-"""
+_DEFAULT_LANGUAGES: List[str] = ["en"]
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +62,12 @@ class ScriptGenNode(BaseNode):
     执行后写入 Context：
         context.assets["script_data"]: dict
             解析后的分镜脚本 JSON（格式见模块文档）
+
+    可选 Context 属性（均有安全 fallback）：
+        context.script_mode:      str        — 'auto' | 'rewrite'，默认 'auto'
+        context.batch_size:       int        — 矩阵变体数量，默认 1
+        context.target_duration:  int        — 目标时长（秒），默认 15
+        context.target_languages: List[str]  — 目标语种列表，默认 ["en"]
 
     依赖注入：
         可通过构造器传入任意 BaseLLMProvider 实现，默认使用 OpenAIProvider。
@@ -99,10 +90,11 @@ class ScriptGenNode(BaseNode):
     def execute(self, context: WorkflowContext) -> WorkflowContext:
         """
         执行文案生成流程：
-          1. 从 Context 取出用户提示词
-          2. 调用 LLM Provider 生成结构化 JSON
-          3. 验证 JSON 包含必要字段
-          4. 将结果写入 Context.assets["script_data"]
+          1. 从 Context 取出用户提示词及运行参数
+          2. 根据 script_mode 选择对应 Jinja2 模板并渲染 System Prompt
+          3. 调用 LLM Provider 生成结构化 JSON
+          4. 验证 JSON 包含必要字段
+          5. 将结果写入 Context.assets["script_data"]
         """
         user_prompt: str = context.get_asset("script") or ""
 
@@ -110,48 +102,61 @@ class ScriptGenNode(BaseNode):
             self.log("Warning: context.assets['script'] is empty, skipping.")
             return context
 
-        self.log(f"Calling LLM provider [{type(self._provider).__name__}]...")
-        self.log(f"User prompt: {user_prompt[:80]}{'...' if len(user_prompt) > 80 else ''}")
+        # ── 从 Context 读取运行参数（全部带安全 fallback）──────────────────────
+        script_mode:      str        = getattr(context, "script_mode",      "auto")
+        batch_size:       int        = getattr(context, "batch_size",        1)
+        target_duration:  int        = getattr(context, "target_duration",   15)
+        target_languages: List[str]  = getattr(context, "target_languages",  _DEFAULT_LANGUAGES)
 
-        # --- 动态构建时长约束指令，驯服 LLM 严格控制字数 ---
-        target_duration: int = getattr(context, "target_duration", 15)
+        # 防御：未知模式兜底到 auto
+        if script_mode not in _MODE_TEMPLATE:
+            self.log(f"Warning: unknown script_mode '{script_mode}', falling back to 'auto'.")
+            script_mode = "auto"
+
         word_min = int(target_duration * 2.3)
         word_max = int(target_duration * 2.8)
-        duration_constraint = (
-            f"\n\n\u3010\u6781\u5ea6\u91cd\u8981\u2014\u2014\u65f6\u957f\u63a7\u5236 (DO NOT IGNORE)\u3011\n"
-            f"\u4f60\u751f\u6210\u7684\u914d\u97f3\u6587\u6848\uff08Voiceover\uff09\u5728\u6b63\u5e38\u8bed\u901f\u4e0b\u671d\u8bfb\uff0c\u5fc5\u987b\u6781\u5176\u63a5\u8fd1 {target_duration} \u79d2\u3002\n"
-            f"\u8bf7\u4e25\u683c\u5c06\u6240\u6709 scene \u7684 narrations \u914d\u97f3\u6587\u5b57\u603b\u6570\uff08\u5355\u8bcd\u6570\uff09"
-            f"\u63a7\u5236\u5728 {word_min} \u5230 {word_max} \u4e2a\u5355\u8bcd\u4e4b\u95f4\uff01\n"
-            f"\u7edd\u5bf9\u4e0d\u5141\u8bb8\u8d85\u6807\uff0c\u5426\u5219\u7cfb\u7edf\u4f1a\u5d29\u6e83\uff01"
-        )
-        effective_system_prompt = _SYSTEM_PROMPT + duration_constraint
 
+        self.log(f"Calling LLM provider [{type(self._provider).__name__}]...")
         self.log(
-            f"目标时长: {target_duration}s | 字数生效区间: [{word_min}, {word_max}]"
+            f"script_mode={script_mode} | batch_size={batch_size} "
+            f"| duration={target_duration}s | langs={target_languages} "
+            f"| word_range=[{word_min}, {word_max}]"
+        )
+        self.log(f"User prompt: {user_prompt[:80]}{'...' if len(user_prompt) > 80 else ''}")
+
+        # ── 渲染 System Prompt（Jinja2 模板 → 纯文本）──────────────────────────
+        template_name = _MODE_TEMPLATE[script_mode]
+        effective_system_prompt: str = prompt_loader.render_prompt(
+            template_name,
+            target_languages=target_languages,
+            batch_size=batch_size,
+            target_duration=target_duration,
+            word_min=word_min,
+            word_max=word_max,
         )
 
-        # --- 调用 LLM ---
+        # ── 调用 LLM ────────────────────────────────────────────────────────────
         result: dict = self._provider.generate_script(
             prompt=user_prompt,
             system_prompt=effective_system_prompt,
         )
 
-        # --- 基础结构校验 ---
+        # ── 基础结构校验 ─────────────────────────────────────────────────────────
         if "scenes" not in result or not isinstance(result["scenes"], list):
             raise ValueError(
                 f"[{self.name}] LLM response missing required 'scenes' list.\n"
                 f"Got: {json.dumps(result, ensure_ascii=False)}"
             )
 
-        scene_count = len(result["scenes"])
+        scene_count    = len(result["scenes"])
         total_duration = sum(s.get("duration", 0) for s in result["scenes"])
         self.log(
             f"Script generated: {scene_count} scenes, "
             f"estimated total duration: {total_duration}s"
         )
 
-        # --- 写入 Context ---
+        # ── 写入 Context ─────────────────────────────────────────────────────────
         context.set_asset("script_data", result)
-        self.log("script_data written to Context.assets[\"script_data\"]")
+        self.log('script_data written to Context.assets["script_data"]')
 
         return context

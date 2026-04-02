@@ -1,10 +1,41 @@
 <script setup>
-import { ref, computed, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onUnmounted, onMounted, nextTick, watch } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import { readDir } from '@tauri-apps/plugin-fs'
 import axios from 'axios'
 import Dashboard from './components/Dashboard.vue'
+import Login from './components/Login.vue'
+import AudioAssetCard from './components/AudioAssetCard.vue'
+
+// ── Auth state machine ─────────────────────────────────────────────────────
+const isLoggedIn = ref(false)
+const loggedInUser = ref('')
+
+onMounted(() => {
+  const stored = localStorage.getItem('dopamatrix_user')
+  if (stored) {
+    loggedInUser.value = stored
+    isLoggedIn.value = true
+    axios.defaults.headers.common['X-Local-User'] = stored
+  }
+})
+
+function handleLogin(username) {
+  localStorage.setItem('dopamatrix_user', username)
+  loggedInUser.value = username
+  isLoggedIn.value = true
+  currentView.value = 'dashboard'
+  axios.defaults.headers.common['X-Local-User'] = username
+}
+
+function handleLogout() {
+  localStorage.removeItem('dopamatrix_user')
+  localStorage.removeItem('clipflow_output_dir')
+  loggedInUser.value = ''
+  isLoggedIn.value = false
+  delete axios.defaults.headers.common['X-Local-User']
+}
 
 // ── View routing ───────────────────────────────────────────────────────────
 const currentView = ref('dashboard')  // 'dashboard' | 'assets' | 'workspace' | 'history'
@@ -14,6 +45,12 @@ const POLL_INTERVAL_MS = 3000
 
 // ── Omnibox form state (persistent across sends) ───────────────────────────
 const omniPrompt      = ref('')
+const scriptMode      = ref('auto') // 'auto' | 'rewrite'
+const omniPlaceholder = computed(() =>
+  scriptMode.value === 'rewrite'
+    ? '粘贴您的核心营销文案全文。AI 将在保持卖点绝对不变的前提下，为您裂变出 N 个语气不同的变体文案，完美规避 TikTok 音频查重...'
+    : '描述你想生成的视频内容，如：汽车减震器出海，强调极其耐用，适合中东路况...'
+)
 const batchSize       = ref(1)
 const localAssetDir   = ref('')
 const localLogoDir    = ref('')
@@ -21,6 +58,7 @@ const localStickerDir = ref('')
 const aspectRatio     = ref('9:16')
 const testLanguage    = ref('en')
 const targetDuration  = ref(15)
+const audioVibe       = ref('auto')
 
 const globalOutputDir = ref(localStorage.getItem('clipflow_output_dir') || '')
 
@@ -145,8 +183,9 @@ async function sendTask() {
   await nextTick()
 
   try {
-    const resp = await axios.post(`${API_BASE}/api/v1/tasks/submit`, {
+    const payload = {
       prompt,
+      script_mode:        scriptMode.value,
       batch_size:         batchSize.value || 1,
       local_asset_dir:    localAssetDir.value   || null,
       local_logo_dir:     localLogoDir.value    || null,
@@ -155,7 +194,13 @@ async function sendTask() {
       test_language:      testLanguage.value,
       target_duration:    targetDuration.value,
       output_dir:         globalOutputDir.value || null,
-    })
+    }
+
+    if (['asmr', 'epic', 'funny'].includes(audioVibe.value)) {
+      payload.audio_scape = { bgm: { emotion: audioVibe.value } }
+    }
+
+    const resp = await axios.post(`${API_BASE}/api/v1/tasks/submit`, payload)
 
     const data = resp.data
     const taskId = String(data.task_id ?? data.id ?? '')
@@ -239,12 +284,19 @@ const dashStats = computed(() => ({
 }))
 
 // ── DAM Assets ─────────────────────────────────────────────────────────────
-const activeTab = ref('video') // 'video' | 'logo' | 'sticker'
-const assetList = ref([])
+const activeTab        = ref('video') // 'video' | 'logo' | 'sticker' | 'audio'
+const audioAssetSubTab = ref('audio_bgm') // 'audio_bgm' | 'audio_sfx'
+const assetList        = ref([])
+
+// ── Audio import modal ─────────────────────────────────────────────────────
+const showAudioImportModal = ref(false)
+const pendingAudioFiles    = ref([])
+const pendingEmotionTag    = ref('')
 
 async function fetchAssets() {
+  const type = activeTab.value === 'audio' ? audioAssetSubTab.value : activeTab.value
   try {
-    const resp = await axios.get(`${API_BASE}/api/v1/assets?asset_type=${activeTab.value}`)
+    const resp = await axios.get(`${API_BASE}/api/v1/assets?asset_type=${type}`)
     assetList.value = resp.data
   } catch (err) {
     showToast('获取素材失败: ' + err.message)
@@ -261,6 +313,9 @@ async function importAssets() {
   } else if (activeTab.value === 'sticker') {
     filterName = '互动贴纸'
     filterExts = ['png']
+  } else if (activeTab.value === 'audio') {
+    filterName = '听觉资产 (BGM/SFX)'
+    filterExts = ['mp3', 'wav']
   }
 
   try {
@@ -271,6 +326,13 @@ async function importAssets() {
     
     if (!selected || selected.length === 0) return
 
+    if (activeTab.value === 'audio') {
+      pendingAudioFiles.value = Array.isArray(selected) ? selected : [selected]
+      pendingEmotionTag.value = ''
+      showAudioImportModal.value = true
+      return
+    }
+
     showToast('正在导入并计算素材哈希...')
     const resp = await axios.post(`${API_BASE}/api/v1/assets/import`, {
       file_paths: selected,
@@ -280,12 +342,45 @@ async function importAssets() {
     })
     
     showToast(resp.data.message)
-    
-    // Auto-refresh the asset list if the import was successful
     fetchAssets()
   } catch (err) {
     console.error('[Import Assets] 导入失败：', err)
     showToast('导入失败: ' + (err.response?.data?.detail || err.message))
+  }
+}
+
+async function confirmAudioImport() {
+  if (!pendingEmotionTag.value) {
+    showToast('⚠️ 请先选择情绪标签，这是后端 DopaMatrix 引擎的强制要求！')
+    return
+  }
+  showAudioImportModal.value = false
+  showToast('正在导入并计算音频哈希...')
+  try {
+    const resp = await axios.post(`${API_BASE}/api/v1/assets/import`, {
+      file_paths:  pendingAudioFiles.value,
+      asset_type:  audioAssetSubTab.value,
+      emotion_tag: pendingEmotionTag.value,
+      tags:        [pendingEmotionTag.value],
+    })
+    showToast(resp.data.message)
+    fetchAssets()
+  } catch (err) {
+    showToast('导入失败: ' + (err.response?.data?.detail || err.message))
+  } finally {
+    pendingAudioFiles.value = []
+    pendingEmotionTag.value = ''
+  }
+}
+
+async function updateAudioEmotion(item) {
+  try {
+    await axios.patch(`${API_BASE}/api/v1/assets/${item.id}/emotion`, {
+      emotion_tag: item.emotion_tag
+    })
+    showToast(`🎵 情绪标签已更新为 ${item.emotion_tag}`)
+  } catch (err) {
+    showToast('情绪标签更新失败: ' + (err.response?.data?.detail || err.message))
   }
 }
 
@@ -300,11 +395,13 @@ async function updateVideoRole(item) {
   }
 }
 
-watch([currentView, activeTab], ([newView]) => {
+watch([currentView, activeTab, audioAssetSubTab], ([newView]) => {
   if (newView === 'assets') {
     fetchAssets()
   } else if (newView === 'history') {
     fetchHistory()
+  } else if (newView === 'settings') {
+    loadLlmSettings()
   }
 }, { immediate: true })
 
@@ -330,9 +427,55 @@ async function fetchHistory() {
 }
 
 onUnmounted(clearPollTimer)
+
+// ── LLM Settings (BYOK) ────────────────────────────────────────────────────
+const llmApiKeyInput  = ref('')        // 用户输入的新 Key（明文，保存后即清空）
+const llmMaskedKey    = ref('')        // 后端返回的脱敏显示值，如 sk-ab...1234
+const llmIsConfigured = ref(false)     // 是否已有配置
+const llmSaving       = ref(false)     // 保存中防重复提交
+const showLlmKeyText  = ref(false)     // 密文 / 明文切换
+
+async function loadLlmSettings() {
+  try {
+    const resp = await axios.get(`${API_BASE}/api/v1/settings/llm`)
+    llmMaskedKey.value    = resp.data.api_key    || ''
+    llmIsConfigured.value = resp.data.is_configured ?? false
+  } catch (err) {
+    console.error('[LLM Settings] 获取配置失败：', err)
+  }
+}
+
+async function saveLlmSettings() {
+  const key = llmApiKeyInput.value.trim()
+  if (!key) {
+    showToast('⚠️ 请先输入有效的 API Key')
+    return
+  }
+  llmSaving.value = true
+  try {
+    await axios.post(`${API_BASE}/api/v1/settings/llm`, { api_key: key })
+    llmApiKeyInput.value = ''
+    showLlmKeyText.value = false
+    await loadLlmSettings()
+    showToast('✅ API Key 保存成功！大模型配置已生效。')
+  } catch (err) {
+    const detail = err.response?.data?.detail || err.message
+    showToast(`❌ 保存失败：${detail}`)
+  } finally {
+    llmSaving.value = false
+  }
+}
 </script>
 
 <template>
+  <!-- ── AUTH GATE: Login screen ── -->
+  <Transition name="auth-fade">
+    <Login v-if="!isLoggedIn" @login-success="handleLogin" />
+  </Transition>
+
+  <!-- ── WORKSPACE (only rendered when logged in) ── -->
+  <template v-if="isLoggedIn">
+
   <!-- ── TOAST ── -->
   <Transition name="toast">
     <div v-if="toastVisible" class="toast-wrap" role="alert">
@@ -350,7 +493,7 @@ onUnmounted(clearPollTimer)
       <!-- Logo -->
       <div class="sidebar-logo">
         <div class="logo-icon">⚡</div>
-        <span class="logo-text">ClipFlow</span>
+        <span class="logo-text">DopaMatrix</span>
       </div>
 
       <!-- Nav -->
@@ -394,12 +537,18 @@ onUnmounted(clearPollTimer)
 
       <!-- Footer profile -->
       <div class="sidebar-footer">
-        <div class="profile-avatar">👤</div>
+        <div class="profile-avatar">⬡</div>
         <div class="profile-info">
-          <div class="profile-name">未登录</div>
-          <div class="profile-sub">内测账户</div>
+          <div class="profile-name">@{{ loggedInUser }}</div>
+          <div class="profile-sub">工作区已隔离</div>
         </div>
-        <span class="pulse-dot" style="margin-left:auto;flex-shrink:0"></span>
+        <button class="logout-btn" @click="handleLogout" title="退出 / Logout">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
       </div>
     </aside>
 
@@ -455,10 +604,39 @@ onUnmounted(clearPollTimer)
             <button :class="['tab-btn', activeTab === 'video' ? 'tab-active' : '']" @click="activeTab = 'video'">🎬 视频骨料 (X轴)</button>
             <button :class="['tab-btn', activeTab === 'logo' ? 'tab-active' : '']" @click="activeTab = 'logo'">🏷️ 品牌水印 (Logo)</button>
             <button :class="['tab-btn', activeTab === 'sticker' ? 'tab-active' : '']" @click="activeTab = 'sticker'">✨ 互动贴纸 (Sticker)</button>
+            <button :class="['tab-btn', activeTab === 'audio' ? 'tab-active tab-active-audio' : '']" @click="activeTab = 'audio'">🎵 听觉资产 (Audio)</button>
           </div>
 
-          <!-- Grid -->
-          <div class="assets-grid">
+          <!-- Audio sub-filter pills (only when audio tab is active) -->
+          <Transition name="subtab-fade">
+            <div v-if="activeTab === 'audio'" class="audio-subtabs">
+              <button
+                :class="['audio-subtab-btn', audioAssetSubTab === 'audio_bgm' ? 'audio-subtab-active' : '']"
+                @click="audioAssetSubTab = 'audio_bgm'"
+              >🎼 背景音乐 (BGM)</button>
+              <button
+                :class="['audio-subtab-btn', audioAssetSubTab === 'audio_sfx' ? 'audio-subtab-active' : '']"
+                @click="audioAssetSubTab = 'audio_sfx'"
+              >⚡ 短促音效 (SFX)</button>
+            </div>
+          </Transition>
+
+          <!-- Grid: Audio tab -->
+          <div v-if="activeTab === 'audio'" class="assets-grid">
+            <div v-if="assetList.length === 0" style="color: #64748b; font-size: 0.85rem; padding: 1rem;">
+              暂无听觉资产，请点击右上角导入。
+            </div>
+            <AudioAssetCard
+              v-for="item in assetList"
+              :key="item.id"
+              :item="item"
+              :api-base="API_BASE"
+              @emotion-change="updateAudioEmotion"
+            />
+          </div>
+
+          <!-- Grid: Video / Logo / Sticker tabs -->
+          <div v-else class="assets-grid">
             <div v-if="assetList.length === 0" style="color: #64748b; font-size: 0.85rem; padding: 1rem;">
               暂无素材，请点击右上角导入。
             </div>
@@ -510,6 +688,60 @@ onUnmounted(clearPollTimer)
               </div>
             </div>
           </div>
+
+          <!-- ── Audio Emotion Import Modal ── -->
+          <Transition name="modal-fade">
+            <div v-if="showAudioImportModal" class="modal-overlay" @click.self="showAudioImportModal = false">
+              <div class="modal-box">
+                <div class="modal-header">
+                  <span class="modal-icon">🎵</span>
+                  <div>
+                    <div class="modal-title">打标情绪标签</div>
+                    <div class="modal-sub">DopaMatrix 引擎强制要求，所有听觉资产必须绑定情绪标签才能参与混音调度</div>
+                  </div>
+                </div>
+
+                <div class="modal-files">
+                  <div class="modal-files-label">待导入文件 ({{ pendingAudioFiles.length }} 个)</div>
+                  <div class="modal-file-list">
+                    <div v-for="(f, i) in pendingAudioFiles" :key="i" class="modal-file-item">
+                      🎧 {{ f.split(/[/\\]/).pop() }}
+                    </div>
+                  </div>
+                </div>
+
+                <div class="modal-field">
+                  <label class="modal-label">选择情绪标签 <span class="modal-required">* 必填</span></label>
+                  <div class="modal-emotion-pills">
+                    <button
+                      v-for="opt in [
+                        { value: 'asmr',    label: '🎧 ASMR / 沉浸解压' },
+                        { value: 'epic',    label: '💥 史诗震撼 / 强节奏' },
+                        { value: 'funny',   label: '🤪 荒诞鬼畜 / 模因音效' },
+                        { value: 'general', label: '🎵 通用音乐 (General)' },
+                      ]"
+                      :key="opt.value"
+                      :class="['emotion-pill', pendingEmotionTag === opt.value ? 'emotion-pill--active' : '']"
+                      @click="pendingEmotionTag = opt.value"
+                    >{{ opt.label }}</button>
+                  </div>
+                </div>
+
+                <div class="modal-actions">
+                  <button class="modal-cancel-btn" @click="showAudioImportModal = false">取消</button>
+                  <button
+                    class="modal-confirm-btn"
+                    :class="{ 'modal-confirm-btn--disabled': !pendingEmotionTag }"
+                    @click="confirmAudioImport"
+                  >
+                    <span v-if="!pendingEmotionTag">请先选择标签</span>
+                    <span v-else>✅ 确认导入并打标</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </Transition>
+
         </div>
       </template>
 
@@ -595,11 +827,25 @@ onUnmounted(clearPollTimer)
 
           <!-- ── OMNIBOX (lower 20%) ──────────────────────────────────── -->
           <div class="omnibox">
+            <!-- Script Mode Tab Switcher -->
+            <div class="script-mode-tabs">
+              <button
+                class="script-mode-tab"
+                :class="{ 'script-mode-tab--active': scriptMode === 'auto' }"
+                @click="scriptMode = 'auto'"
+              >✨ AI 智能创作</button>
+              <button
+                class="script-mode-tab"
+                :class="{ 'script-mode-tab--active': scriptMode === 'rewrite' }"
+                @click="scriptMode = 'rewrite'"
+              >📝 专属文案洗稿</button>
+            </div>
+
             <!-- Textarea -->
             <textarea
               v-model="omniPrompt"
               @keydown.enter.ctrl.prevent="sendTask"
-              placeholder="描述你想生成的视频内容，如：汽车减震器出海，强调极其耐用，适合中东路况…"
+              :placeholder="omniPlaceholder"
               class="omni-textarea"
               rows="3"
             ></textarea>
@@ -643,6 +889,18 @@ onUnmounted(clearPollTimer)
                   <option :value="15">短平快 (15秒)</option>
                   <option :value="30">信息流 (30秒)</option>
                   <option :value="60">完整故事 (60秒)</option>
+                </select>
+              </div>
+
+              <!-- ⑦ 声音情绪 -->
+              <div class="tool-select-wrap tool-select-wrap--vibe">
+                <span class="tool-select-icon">🎵</span>
+                <select v-model="audioVibe" class="tool-select tool-select--vibe" title="声音情绪 (Audio Vibe)">
+                  <option value="auto">🎵 AI 智能匹配 (Auto)</option>
+                  <option value="asmr">🎧 ASMR / 沉浸解压</option>
+                  <option value="epic">💥 史诗震撼 / 强节奏</option>
+                  <option value="funny">🤪 荒诞鬼畜 / 模因音效</option>
+                  <option value="none">🔇 纯人声解说 (无 BGM)</option>
                 </select>
               </div>
 
@@ -743,47 +1001,159 @@ onUnmounted(clearPollTimer)
 
       <!-- ─────────────────────────────── SETTINGS ─────────────────────── -->
       <template v-else-if="currentView === 'settings'">
-        <div class="workspace-wrap" style="padding: 2.5rem; overflow-y: auto;">
-          <h2 class="assets-title" style="margin-bottom: 2rem;">全局安全与输出设置</h2>
-          
-          <div class="feed-card" style="padding: 2rem; margin-bottom: 2rem; background: rgba(15,23,42,0.6); border: 1px solid rgba(56,189,248,0.2);">
-            <div style="display:flex; align-items:center; gap: 1.5rem; margin-bottom: 1rem;">
-              <div style="width:60px; height:60px; border-radius:50%; background:#38bdf8; display:flex; align-items:center; justify-content:center; font-size:1.8rem;">
+        <div class="workspace-wrap" style="padding: 2.5rem; overflow-y: auto; gap: 1.5rem; display: flex; flex-direction: column;">
+          <h2 class="assets-title" style="margin-bottom: 0.5rem;">全局安全与输出设置</h2>
+
+          <!-- ── 账户信息占位卡 ── -->
+          <div class="feed-card" style="padding: 2rem; background: rgba(15,23,42,0.6); border: 1px solid rgba(56,189,248,0.2);">
+            <div style="display:flex; align-items:center; gap: 1.5rem;">
+              <div style="width:60px; height:60px; border-radius:50%; background: linear-gradient(135deg,#0ea5e9,#6366f1); display:flex; align-items:center; justify-content:center; font-size:1.8rem; flex-shrink:0;">
                 👨‍💻
               </div>
               <div>
-                <div style="font-size: 1.2rem; font-weight:bold; color:#f8fafc; margin-bottom: 0.2rem;">TeleUser_8891</div>
-                <div style="color: #94a3b8; font-size: 0.9rem;">Telegram 授权账户 (内测阶段待正式对接)</div>
+                <div style="font-size: 1.15rem; font-weight:bold; color:#f8fafc; margin-bottom: 0.2rem;">TeleUser_8891</div>
+                <div style="color: #64748b; font-size: 0.82rem;">Telegram 授权账户 (内测阶段待正式对接)</div>
               </div>
             </div>
           </div>
 
-          <div class="feed-card" style="padding: 2rem; background: rgba(15,23,42,0.6); border: 1px solid rgba(56,189,248,0.2);">
-            <h3 style="color:#e2e8f0; font-size:1.1rem; margin-bottom: 1rem;">📁 本地输出目录绑定</h3>
-            <p style="color:#94a3b8; font-size:0.9rem; margin-bottom: 1.5rem;">
-              设置统一的成品短视频输出绝对路径。若不设置，默认输出至工程 <code style="color:#38bdf8; background: rgba(56,189,248,0.1); padding: 0.15rem 0.35rem; border-radius: 0.25rem;">output/</code> 下。
-            </p>
-            <div style="display:flex; align-items:center; padding: 1rem; background:rgba(0,0,0,0.3); border-radius: 0.5rem; margin-bottom:1.5rem; border: 1px dashed rgba(255,255,255,0.1);">
-              <span style="color:#38bdf8; margin-right: 0.5rem; flex-shrink:0;">当前路径：</span>
-              <span style="color:#f8fafc; word-break: break-all; font-family: monospace;">{{ globalOutputDir || '未设置 (默认跟随引擎输出)' }}</span>
+          <!-- ── LLM 大模型配置卡 ── -->
+          <div class="settings-card settings-card--llm">
+            <!-- 标题行 -->
+            <div class="settings-card-title">
+              <span class="settings-card-icon">🤖</span>
+              <div>
+                <div style="font-size:1.05rem; font-weight:800; color:#e2e8f0;">大模型配置 <span style="color:#64748b; font-size:0.78rem; font-weight:400;">LLM Configuration</span></div>
+                <div style="font-size:0.75rem; color:#475569; margin-top:0.15rem; line-height:1.5;">
+                  采用 BYOK（Bring Your Own Key）零信任架构。Key 仅写入本地 SQLite，绝不外传。
+                </div>
+              </div>
             </div>
-            <div style="display:flex; gap: 1rem; flex-wrap: wrap;">
-              <button @click="pickGlobalOutputFolder" class="cta-glow-btn" style="padding: 0.75rem 1.5rem; width: auto; font-size: 0.95rem;">
-                📁 更改成品视频输出目录
-              </button>
-              <button @click="openDiagnosticLogs" class="cta-glow-btn" style="padding: 0.75rem 1.5rem; width: auto; font-size: 0.95rem; background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15)); border-color: rgba(139,92,246,0.4);">
-                📁 导出/查看诊断日志
+
+            <!-- 配置状态 badge -->
+            <div style="margin-bottom:1.25rem;">
+              <span v-if="llmIsConfigured" class="llm-status-badge llm-status-badge--ok">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0"><circle cx="5" cy="5" r="5" fill="#4ade80"/></svg>
+                已配置 &nbsp;<code style="font-family:'JetBrains Mono',monospace;font-size:0.7rem;opacity:0.8;">{{ llmMaskedKey }}</code>
+              </span>
+              <span v-else class="llm-status-badge llm-status-badge--warn">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0"><circle cx="5" cy="5" r="5" fill="#f87171"/></svg>
+                尚未配置 — 发起生成任务将报错
+              </span>
+            </div>
+
+            <!-- 服务商选择（当前固定 OpenAI，预留扩展位） -->
+            <div class="settings-field">
+              <label class="settings-label">服务提供商</label>
+              <div class="tool-select-wrap" style="width:fit-content; opacity:0.6; pointer-events:none; cursor:default;">
+                <span class="tool-select-icon">🧠</span>
+                <select class="tool-select" style="font-size:0.82rem; padding:0.1rem 0; min-width:14rem;">
+                  <option>OpenAI / Compatible API（DeepSeek · Moonshot · 通义）</option>
+                </select>
+              </div>
+              <p class="settings-hint">后续版本将支持多服务商切换</p>
+            </div>
+
+            <!-- API Key 输入框 -->
+            <div class="settings-field">
+              <label class="settings-label">API Key</label>
+              <div class="llm-key-input-wrap">
+                <input
+                  v-model="llmApiKeyInput"
+                  :type="showLlmKeyText ? 'text' : 'password'"
+                  :placeholder="llmIsConfigured
+                    ? `当前 ${llmMaskedKey}  ·  输入新 Key 可覆盖`
+                    : 'sk-...  或兼容 OpenAI Chat Completions 格式的密钥'"
+                  class="llm-key-input"
+                  autocomplete="off"
+                  spellcheck="false"
+                  @keydown.enter="saveLlmSettings"
+                />
+                <!-- 明文/密文切换眼睛 -->
+                <button
+                  class="llm-eye-btn"
+                  type="button"
+                  @click="showLlmKeyText = !showLlmKeyText"
+                  :title="showLlmKeyText ? '隐藏 Key' : '显示 Key'"
+                >
+                  <!-- 睁眼 (当前密文，点击显示) -->
+                  <svg v-if="!showLlmKeyText" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                    <circle cx="12" cy="12" r="3"/>
+                  </svg>
+                  <!-- 划线眼 (当前明文，点击隐藏) -->
+                  <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                    <line x1="1" y1="1" x2="23" y2="23"/>
+                  </svg>
+                </button>
+              </div>
+              <p class="settings-hint">支持 OpenAI、DeepSeek、Moonshot、通义千问等兼容 OpenAI 格式的服务</p>
+            </div>
+
+            <!-- 保存按钮 -->
+            <div>
+              <button
+                @click="saveLlmSettings"
+                :disabled="llmSaving || !llmApiKeyInput.trim()"
+                class="cta-glow-btn llm-save-btn"
+              >
+                <span v-if="llmSaving" style="display:inline-flex;align-items:center;gap:0.4rem;">
+                  <svg class="spin" width="14" height="14" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+                  </svg>
+                  保存中...
+                </span>
+                <span v-else>🔑 保存 API Key</span>
               </button>
             </div>
           </div>
+
+          <!-- ── 输出目录卡 ── -->
+          <div class="settings-card">
+            <div class="settings-card-title">
+              <span class="settings-card-icon">📁</span>
+              <div>
+                <div style="font-size:1.05rem; font-weight:800; color:#e2e8f0;">本地输出目录绑定</div>
+                <div style="font-size:0.75rem; color:#475569; margin-top:0.15rem;">
+                  成品短视频的统一落地目录。若不设置，默认写入工程
+                  <code style="color:#38bdf8; background:rgba(56,189,248,0.1); padding:0.1rem 0.3rem; border-radius:3px;">output/</code>
+                </div>
+              </div>
+            </div>
+            <div class="settings-path-row">
+              <span style="color:#64748b; font-size:0.75rem; white-space:nowrap; flex-shrink:0;">当前路径：</span>
+              <span style="color:#94a3b8; word-break:break-all; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
+                {{ globalOutputDir || '未设置 (默认跟随引擎 output/)' }}
+              </span>
+            </div>
+            <div style="display:flex; gap: 0.75rem; flex-wrap: wrap;">
+              <button @click="pickGlobalOutputFolder" class="cta-glow-btn" style="padding:0.65rem 1.5rem; width:auto; font-size:0.88rem;">
+                📁 更改输出目录
+              </button>
+              <button @click="openDiagnosticLogs" class="cta-glow-btn" style="padding:0.65rem 1.5rem; width:auto; font-size:0.88rem; background:linear-gradient(135deg,rgba(99,102,241,0.15),rgba(139,92,246,0.15)); border-color:rgba(139,92,246,0.4);">
+                🗒️ 导出 / 查看诊断日志
+              </button>
+            </div>
+          </div>
+
         </div>
       </template>
 
     </main>
   </div>
+
+  </template><!-- end v-if="isLoggedIn" -->
 </template>
 
 <style>
+/* ── Auth fade transition ──────────────────────────────────────────────── */
+.auth-fade-enter-active { transition: opacity 0.3s ease, transform 0.3s ease; }
+.auth-fade-leave-active { transition: opacity 0.4s ease, transform 0.4s ease; }
+.auth-fade-enter-from   { opacity: 0; transform: scale(1.02); }
+.auth-fade-leave-to     { opacity: 0; transform: scale(0.98); }
+
 /* ── App shell ─────────────────────────────────────────────────────────── */
 .app-shell {
   display: flex;
@@ -884,8 +1254,27 @@ onUnmounted(clearPollTimer)
   font-size: 0.9rem;
   flex-shrink: 0;
 }
-.profile-name { font-size: 0.75rem; font-weight: 700; color: #94a3b8; }
+.profile-name { font-size: 0.75rem; font-weight: 700; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
 .profile-sub  { font-size: 0.63rem; color: #475569; }
+
+.logout-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 28px; height: 28px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid rgba(239, 68, 68, 0.18);
+  color: #475569;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+.logout-btn:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #f87171;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.15);
+}
 
 /* ── Main content ─────────────────────────────────────────────────── */
 .main-content {
@@ -1045,6 +1434,42 @@ onUnmounted(clearPollTimer)
   transition: all .2s;
 }
 .feed-dl:hover { color: #38bdf8; border-color: rgba(56,189,248,.3); }
+
+/* Script Mode Tab Switcher */
+.script-mode-tabs {
+  display: flex;
+  gap: 0;
+  align-self: flex-start;
+  border: 1px solid rgba(56,189,248,0.15);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(15,23,42,0.6);
+}
+.script-mode-tab {
+  padding: 0.3rem 0.9rem;
+  font-size: 0.75rem;
+  font-family: 'Inter', sans-serif;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: #475569;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color .18s, background .18s;
+  white-space: nowrap;
+}
+.script-mode-tab + .script-mode-tab {
+  border-left: 1px solid rgba(56,189,248,0.15);
+}
+.script-mode-tab:hover:not(.script-mode-tab--active) {
+  color: #94a3b8;
+  background: rgba(56,189,248,0.05);
+}
+.script-mode-tab--active {
+  color: #0f172a;
+  background: linear-gradient(90deg, #38bdf8, #818cf8);
+  font-weight: 600;
+}
 
 /* Omnibox */
 .omnibox {
@@ -1407,6 +1832,256 @@ onUnmounted(clearPollTimer)
 }
 .tool-btn-primary .tool-label {
   color: #e2e8f0 !important;
+}
+
+/* ── Audio Tab active state ────────────────────────────────────────── */
+.tab-active-audio {
+  background: rgba(167, 139, 250, 0.12) !important;
+  color: #c4b5fd !important;
+  box-shadow: inset 0 0 0 1px rgba(167,139,250,0.25) !important;
+}
+
+/* ── Audio Sub-tabs (BGM / SFX pills) ──────────────────────────────── */
+.audio-subtabs {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.1rem 0 0.5rem;
+}
+.audio-subtab-btn {
+  padding: 0.3rem 0.9rem;
+  border-radius: 99px;
+  border: 1px solid rgba(139,92,246,0.25);
+  background: rgba(139,92,246,0.06);
+  color: #64748b;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .18s;
+}
+.audio-subtab-btn:hover { color: #a78bfa; border-color: rgba(139,92,246,0.45); }
+.audio-subtab-active {
+  background: rgba(139,92,246,0.2) !important;
+  color: #c4b5fd !important;
+  border-color: rgba(167,139,250,0.5) !important;
+  box-shadow: 0 0 10px rgba(139,92,246,0.2);
+}
+
+.subtab-fade-enter-active { transition: all .2s ease; }
+.subtab-fade-leave-active { transition: all .15s ease; }
+.subtab-fade-enter-from, .subtab-fade-leave-to { opacity: 0; transform: translateY(-6px); }
+
+/* ── Audio Import Modal ─────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 9000;
+  background: rgba(0,0,0,0.72);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 1rem;
+}
+.modal-box {
+  width: 100%; max-width: 500px;
+  background: rgba(10,15,35,0.98);
+  border: 1px solid rgba(139,92,246,0.35);
+  border-radius: 16px;
+  padding: 1.75rem;
+  box-shadow: 0 0 60px rgba(139,92,246,0.2), 0 20px 40px rgba(0,0,0,0.6);
+  display: flex; flex-direction: column; gap: 1.25rem;
+}
+.modal-header { display: flex; gap: 0.85rem; align-items: flex-start; }
+.modal-icon { font-size: 1.6rem; flex-shrink: 0; line-height: 1; }
+.modal-title { font-size: 1.05rem; font-weight: 800; color: #e2e8f0; margin-bottom: 0.25rem; }
+.modal-sub { font-size: 0.75rem; color: #64748b; line-height: 1.5; }
+.modal-files-label { font-size: 0.72rem; color: #475569; margin-bottom: 0.4rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+.modal-file-list { display: flex; flex-direction: column; gap: 0.3rem; max-height: 100px; overflow-y: auto; }
+.modal-file-item { font-size: 0.75rem; color: #94a3b8; font-family: 'JetBrains Mono', monospace; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; padding: 0.3rem 0.6rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.modal-label { display: block; font-size: 0.75rem; font-weight: 700; color: #94a3b8; margin-bottom: 0.6rem; }
+.modal-required { color: #f87171; font-size: 0.7rem; }
+.modal-emotion-pills { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.emotion-pill {
+  padding: 0.4rem 0.85rem;
+  border-radius: 99px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.04);
+  color: #64748b;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .18s;
+}
+.emotion-pill:hover { border-color: rgba(139,92,246,0.4); color: #a78bfa; }
+.emotion-pill--active {
+  background: rgba(139,92,246,0.22) !important;
+  border-color: rgba(167,139,250,0.6) !important;
+  color: #e9d5ff !important;
+  box-shadow: 0 0 12px rgba(139,92,246,0.3);
+}
+.modal-actions { display: flex; gap: 0.75rem; justify-content: flex-end; }
+.modal-cancel-btn {
+  padding: 0.5rem 1.1rem; border-radius: 8px;
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
+  color: #64748b; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+  transition: all .18s;
+}
+.modal-cancel-btn:hover { color: #94a3b8; border-color: rgba(255,255,255,0.2); }
+.modal-confirm-btn {
+  padding: 0.5rem 1.4rem; border-radius: 8px;
+  background: linear-gradient(135deg, #7c3aed, #6366f1);
+  border: none; color: #fff; font-size: 0.82rem; font-weight: 800;
+  cursor: pointer; transition: all .2s;
+  box-shadow: 0 0 16px rgba(99,102,241,0.4);
+}
+.modal-confirm-btn:hover:not(.modal-confirm-btn--disabled) {
+  box-shadow: 0 0 28px rgba(99,102,241,0.65); transform: scale(1.03);
+}
+.modal-confirm-btn--disabled { opacity: 0.45; cursor: not-allowed; transform: none !important; }
+.modal-fade-enter-active { transition: all .25s cubic-bezier(.22,1,.36,1); }
+.modal-fade-leave-active { transition: all .18s ease-in; }
+.modal-fade-enter-from, .modal-fade-leave-to { opacity: 0; }
+.modal-fade-enter-from .modal-box { transform: scale(.95) translateY(10px); }
+
+/* ── Audio Vibe selector ───────────────────────────────────────────── */
+.tool-select-wrap--vibe {
+  border-color: rgba(167,139,250,0.25);
+  background: linear-gradient(135deg, rgba(139,92,246,0.08), rgba(56,189,248,0.05));
+  transition: border-color .2s, box-shadow .2s;
+}
+.tool-select-wrap--vibe:hover {
+  border-color: rgba(167,139,250,0.5);
+  box-shadow: 0 0 10px rgba(139,92,246,0.2);
+}
+.tool-select--vibe {
+  color: #c4b5fd;
+  font-weight: 600;
+  min-width: 9rem;
+}
+.tool-select--vibe option { background: #0f172a; color: #e2e8f0; }
+
+/* ── Settings page cards ────────────────────────────────────────────── */
+.settings-card {
+  padding: 1.75rem 2rem;
+  background: rgba(15,23,42,0.6);
+  border: 1px solid rgba(56,189,248,0.15);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+  backdrop-filter: blur(10px);
+}
+.settings-card--llm {
+  border-color: rgba(139,92,246,0.28);
+  background: rgba(12,10,30,0.7);
+  box-shadow: 0 0 40px rgba(139,92,246,0.07), inset 0 0 0 1px rgba(139,92,246,0.06);
+}
+.settings-card-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.9rem;
+}
+.settings-card-icon {
+  font-size: 1.65rem;
+  line-height: 1;
+  flex-shrink: 0;
+  margin-top: 0.05rem;
+}
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.settings-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #475569;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+}
+.settings-hint {
+  margin: 0;
+  font-size: 0.68rem;
+  color: #334155;
+  line-height: 1.5;
+}
+.settings-path-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: rgba(0,0,0,0.25);
+  border-radius: 8px;
+  border: 1px dashed rgba(255,255,255,0.08);
+}
+
+/* ── LLM status badge ────────────────────────────────────────────────── */
+.llm-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.25rem 0.75rem;
+  border-radius: 99px;
+  border: 1px solid;
+  font-family: 'Inter', sans-serif;
+}
+.llm-status-badge--ok   { background: rgba(34,197,94,0.1);  border-color: rgba(34,197,94,0.3);  color: #4ade80; }
+.llm-status-badge--warn { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.25); color: #f87171; }
+
+/* ── LLM Key input ───────────────────────────────────────────────────── */
+.llm-key-input-wrap {
+  display: flex;
+  align-items: stretch;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid rgba(139,92,246,0.22);
+  border-radius: 9px;
+  overflow: hidden;
+  transition: border-color .2s, box-shadow .2s;
+}
+.llm-key-input-wrap:focus-within {
+  border-color: rgba(139,92,246,0.55);
+  box-shadow: 0 0 0 3px rgba(139,92,246,0.1);
+}
+.llm-key-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 0.7rem 0.9rem;
+  color: #e2e8f0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  min-width: 0;
+}
+.llm-key-input::placeholder { color: #2d3748; }
+.llm-eye-btn {
+  flex-shrink: 0;
+  padding: 0 0.8rem;
+  background: transparent;
+  border: none;
+  border-left: 1px solid rgba(255,255,255,0.06);
+  color: #475569;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color .18s, background .18s;
+}
+.llm-eye-btn:hover { color: #a78bfa; background: rgba(139,92,246,0.08); }
+
+/* ── LLM save button ─────────────────────────────────────────────────── */
+.llm-save-btn {
+  padding: 0.65rem 1.75rem;
+  width: auto;
+  font-size: 0.9rem;
+  background: linear-gradient(135deg, rgba(109,40,217,0.85), rgba(99,102,241,0.85));
+  border-color: rgba(139,92,246,0.5);
+  box-shadow: 0 0 24px rgba(99,102,241,0.3);
+}
+.llm-save-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  transform: none !important;
+  box-shadow: none;
 }
 
 </style>

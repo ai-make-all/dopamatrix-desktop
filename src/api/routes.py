@@ -15,7 +15,7 @@ import os
 import uuid
 from typing import List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload
 
@@ -76,8 +76,12 @@ def download_asset(
 def submit_task(
     payload: VideoTaskCreate,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> TaskSubmitAck:
+    # 0. 获取当前租户标识
+    tenant_id: str = request.headers.get("X-Local-User", "default")
+
     # 1. 生成 session_id
     session_id: str = payload.session_id or uuid.uuid4().hex[:12]
 
@@ -113,6 +117,8 @@ def submit_task(
         output_dir        = payload.output_dir,
         webhook_url       = payload.webhook_url,
         client_payload    = payload.client_payload,
+        tenant_id         = tenant_id,
+        script_mode       = payload.script_mode,
     )
 
     from src.core.logger import logger

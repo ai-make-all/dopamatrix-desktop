@@ -28,7 +28,15 @@ class VideoTaskCreate(BaseModel):
         default=None,
         description="可选：指定 session_id；留空则由引擎自动生成 UUID。"
     )
-    prompt:     str = Field(..., min_length=1, description="剧本要求或主题文案。")
+    prompt:      str = Field(..., min_length=1, description="剧本要求或主题文案。")
+    script_mode: str = Field(
+        default="auto",
+        description=(
+            "文案生成模式：\n"
+            "  'auto'    → AI 从零开始智能创作分镜脚本（默认）\n"
+            "  'rewrite' → 以用户提供的基准文案为蓝本，裂变出 N 个变体，规避平台音频查重"
+        ),
+    )
     batch_size: int = Field(default=1, ge=1, le=256, description="矩阵变体数量。")
     aspect_ratio: str = Field(
         default="9:16",

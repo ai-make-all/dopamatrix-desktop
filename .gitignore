@@ -53,3 +53,4 @@ Thumbs.db
 # 忽略根目录下的本地物理渲染依赖
 ffmpeg.exe
 ffprobe.exe
+draft.md

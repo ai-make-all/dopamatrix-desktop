@@ -182,28 +182,6 @@ def get_sidecar_filename():
         return f"backend-{triple}"
 
 
-def copy_env_for_tauri():
-    """
-    将项目根目录的 .env 复制到 web_ui/src-tauri/.env，
-    使 Tauri 能将其作为 resource 打包进安装包。
-
-    安装后，.env 会出现在安装目录根目录（与 backend.exe 同级），
-    load_env() 会在生产模式下从该路径加载 API Key。
-
-    注意：.env 含敏感信息，已被 .gitignore 排除，不会进入版本库。
-    """
-    src = ".env"
-    dst = os.path.join("web_ui", "src-tauri", ".env")
-
-    if not os.path.exists(src):
-        print(f"  ⚠️  警告：项目根目录未找到 .env，安装包将不含 API Key 配置。")
-        print(f"     请在打包前在项目根目录创建 .env 文件。")
-        return
-
-    shutil.copy2(src, dst)
-    print(f"  已复制 {src} → {dst}")
-
-
 def build():
     # ── Step 0: 释放文件锁（关闭正在运行的旧版本） ──────────────────────────
     print("==> [0/4] 终止正在运行的 ClipFlow 进程（释放文件锁）...")
@@ -216,10 +194,6 @@ def build():
 
     print("==> [0.3/4] 执行出厂重置 (清空 output 视频与重置数据库)...")
     prepare_release_data()
-
-    # ── Step 0.5: 将 .env 同步到 src-tauri/ 供 Tauri 打包 ──────────────────
-    print("==> [0.5/4] 同步 .env 到 Tauri 资源目录...")
-    copy_env_for_tauri()
 
     print("==> [1/4] 运行 PyInstaller 打包后端...")
     subprocess.run(
@@ -255,7 +229,6 @@ def build():
 
     print(f"==> [4/4] 完成！")
     print(f"  Sidecar 二进制：{dest_path}")
-    print(f"  .env 已就绪于：web_ui/src-tauri/.env")
     print(f"\n下一步：cd web_ui && npm run tauri build  （打包完整安装包）")
 
 

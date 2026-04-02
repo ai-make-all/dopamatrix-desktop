@@ -8,14 +8,13 @@ src/api/services.py
   - 管理任务生命周期：queued → processing → completed | failed
   - 为每个生成的变体视频计算 MD5 file_hash，写入 video_assets 表
   - 估算任务成本（LLM Token + TTS 时长）并写入 video_tasks 表
-  - 任务终态后发射 Webhook（WEBHOOK_URL 环境变量控制，可选）
+  - 任务终态后直接调用 reporting.notify_task_result 推送 Telegram 战报
 
 关键设计：
   - 本模块函数「不」接收外部 Session，内部独立创建 SessionLocal()
     → 避免 FastAPI 请求 Session 与后台线程共享导致的 SQLAlchemy 状态污染
   - ProcessPoolExecutor 由 run_matrix_factory 内部管理，此层仅做结果收集
-  - Webhook 发射使用 httpx 同步客户端（在后台线程中调用），3 秒超时，
-    发送失败绝不影响任务状态和主流程
+  - 战报推送为进程内直接方法调用（无 HTTP 跳转），失败绝不影响任务状态和主流程
 """
 
 from __future__ import annotations
@@ -28,10 +27,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from src.core.logger import logger
+from src.services.reporting import notify_task_result
 
 # ── 确保子进程输出兼容 Windows GBK 终端 ──────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -71,68 +68,6 @@ def _estimate_cost(tokens: int, tts_seconds: float) -> float:
 
 
 # ------------------------------------------------------------------ #
-# Webhook 发射器 V2（tenacity 指数退避重试，防爆型）                    #
-# ------------------------------------------------------------------ #
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
-async def _send_webhook_async(webhook_url: str, payload: dict) -> None:
-    """
-    异步 POST 结案报告，带 tenacity 指数退避重试。
-
-    重试策略：最多 3 次，首次等待 2s，指数增长，最长 10s。
-    任何 HTTP 4xx/5xx 均会触发 raise_for_status → 触发重试。
-    """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        logger.info(f"[webhook] 正在向 {webhook_url} 发送结案报告…")
-        response = await client.post(webhook_url, json=payload)
-        response.raise_for_status()
-        logger.info(f"[webhook] Webhook 发送成功！HTTP {response.status_code}")
-
-
-def _fire_webhook(
-    task_id:        int,
-    session_id:     str,
-    final_status:   str,            # "completed" | "failed"
-    assets:         list[dict],     # [{"path": ..., "hash": ...}, ...]
-    cost_usd:       float = 0.0,
-    webhook_url:    Optional[str] = None,
-    client_payload: Optional[dict] = None,
-) -> None:
-    """
-    同步包装器：组装结案报告并调用异步发送函数。
-
-    URL 优先级：per-task webhook_url > 环境变量 WEBHOOK_URL。
-    任何网络/重试耗尽异常均被捕获，绝不影响调用方。
-    """
-    url: str = (webhook_url or "").strip() or os.getenv("WEBHOOK_URL", "").strip()
-    if not url:
-        return  # 未配置，静默跳过
-
-    report: dict[str, Any] = {
-        "task_id":            task_id,
-        "session_id":         session_id,
-        "status":             final_status,
-        "assets":             assets,
-        "estimated_cost_usd": round(cost_usd, 6),
-        "client_payload":     client_payload,
-    }
-
-    try:
-        # run_matrix_job 是同步函数，运行于 FastAPI 的线程池 worker 中，
-        # 不存在已运行的事件循环，可以安全使用 asyncio.run()。
-        asyncio.run(_send_webhook_async(url, report))
-    except Exception as exc:
-        # 重试 3 次后仍失败 → 记录警告，绝不崩溃主流程
-        logger.warning(
-            f"[webhook] task_id={task_id} Webhook 最终发送失败（已忽略）: {exc}"
-        )
-
-
-# ------------------------------------------------------------------ #
 # 核心后台任务函数                                                       #
 # ------------------------------------------------------------------ #
 
@@ -147,12 +82,14 @@ def run_matrix_job(
     output_dir:        Optional[str] = None,
     webhook_url:       Optional[str] = None,
     client_payload:    Optional[dict] = None,
+    tenant_id:         str = "default",
+    script_mode:       str = "auto",
 ) -> None:
     """
     矩阵批量生成后台任务。
 
     生命周期：queued → processing → completed | failed
-    任务终态后自动触发 Webhook（per-task webhook_url 优先，回退 WEBHOOK_URL 环境变量）。
+    任务终态后直接调用 reporting.notify_task_result 向 Telegram 群推送战报。
 
     Args:
         task_id:            video_tasks 表的主键
@@ -162,8 +99,8 @@ def run_matrix_job(
         aspect_ratio:       画幅比例
         test_language:      测试语言（仅生成该语种的 TTS+字幕+变体）
         target_duration:    目标视频时长（秒），固定枚举：15 | 30 | 60
-        webhook_url:        渲染完成后的结案报告推送地址（可选）
-        client_payload:     调用方透传上下文，在 Webhook 中原样返回（可选）
+        webhook_url:        保留参数，暂未使用（预留外部回调扩展口）
+        client_payload:     调用方透传上下文，战报中原样展示触发用户信息（可选）
     """
     # load_env() 在 main.py 启动时已全局加载一次；此处补充调用确保
     # 直接调用本函数（如测试场景）时也能正确获取环境变量。
@@ -171,12 +108,15 @@ def run_matrix_job(
     load_env()
 
     from run_matrix_factory import run_matrix_factory
-    from src.api.database import SessionLocal
+    from src.api.database import get_tenant_engine
     from src.api.models import VideoTask, VideoAsset, LocalAsset, TaskHistory
+    from sqlalchemy.orm import sessionmaker
 
     base_url = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
-    db = SessionLocal()
+    engine = get_tenant_engine(tenant_id)
+    TenantSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = TenantSessionLocal()
     start_time = time.time()
 
     # 用于 Webhook 的终态变量（在 finally 块使用）
@@ -206,6 +146,7 @@ def run_matrix_job(
             test_language=test_language,
             target_duration=target_duration,
             output_dir=output_dir,
+            script_mode=script_mode,
         )
 
         # 3. 统计成本 & 收集资产
@@ -322,13 +263,17 @@ def run_matrix_job(
     finally:
         db.close()
 
-        # 6. 发射 Webhook（任务终态后，tenacity 重试，防爆，不崩溃）
-        _fire_webhook(
-            task_id=task_id,
-            session_id=session_id,
-            final_status=_final_status,
-            assets=_webhook_assets,
-            cost_usd=_cost_usd,
-            webhook_url=webhook_url,
-            client_payload=client_payload,
-        )
+        # 6. 直接调用战报播报服务（进程内方法调用，无 HTTP 开销）
+        # run_matrix_job 运行于 FastAPI 线程池 worker，无事件循环，asyncio.run() 安全。
+        _report_payload: dict[str, Any] = {
+            "task_id":            task_id,
+            "session_id":         session_id,
+            "status":             _final_status,
+            "assets":             _webhook_assets,
+            "estimated_cost_usd": round(_cost_usd, 6),
+            "client_payload":     client_payload,
+        }
+        try:
+            asyncio.run(notify_task_result(_report_payload))
+        except Exception as exc:
+            logger.warning(f"[Reporting] task_id={task_id} 战报推送失败（已忽略）: {exc}")

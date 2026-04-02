@@ -57,7 +57,9 @@ def _run_single_matrix(session_id: str, user_prompt: str,
                        aspect_ratio: str = "9:16",
                        test_language: str = "en",
                        target_duration: int = 15,
-                       output_dir: str = None) -> dict:
+                       output_dir: str = None,
+                       batch_size: int = 1,
+                       script_mode: str = "auto") -> dict:
     """
     单个矩阵视频生产 Worker，在独立线程中执行完整 Pipeline。
 
@@ -140,13 +142,16 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             aspect_ratio=aspect_ratio,
             test_language=test_language,
             target_duration=target_duration,
+            batch_size=batch_size,
+            script_mode=script_mode,
         )
         context.config["session_id"] = session_id
         if output_dir:
             context.config["output_dir"] = output_dir
         context.set_asset("script", user_prompt)
         logger.info(
-            f"[Worker {session_id}] 画幅: {aspect_ratio} | 语言: {test_language} | 时长: {target_duration}s"
+            f"[Worker {session_id}] 画幅: {aspect_ratio} | 语言: {test_language} "
+            f"| 时长: {target_duration}s | 模式: {script_mode}"
         )
 
         # ── 确保输出目录存在 ──────────────────────────────────────────────────
@@ -200,7 +205,8 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
                        aspect_ratio: str = "9:16",
                        test_language: str = "en",
                        target_duration: int = 15,
-                       output_dir: str = None) -> list[dict]:
+                       output_dir: str = None,
+                       script_mode: str = "auto") -> list[dict]:
     """
     启动多线程矩阵批量生产。
 
@@ -236,7 +242,8 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
         future_to_session: dict[Future, str] = {
             executor.submit(_run_single_matrix, sid, user_prompt,
-                            aspect_ratio, test_language, target_duration, output_dir): sid
+                            aspect_ratio, test_language, target_duration,
+                            output_dir, batch_size, script_mode): sid
             for sid in sessions
         }
 

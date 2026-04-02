@@ -43,6 +43,8 @@ from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
 from src.api import routes_assets
 from src.api import routes_history
+from src.api import routes_gateway
+from src.api import settings_router
 
 setup_logger()
 
@@ -54,6 +56,16 @@ setup_logger()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期管理：启动时建表 + 开启内网穿透，关闭时清理隧道资源。"""
     _public_url: str | None = None
+
+    # ---- Zero Trust：生产包启动时静默销毁 .env（防止 API Key 泄露） ---- #
+    if getattr(sys, "frozen", False):
+        _env_path = os.path.join(os.path.dirname(sys.executable), ".env")
+        if os.path.exists(_env_path):
+            try:
+                os.remove(_env_path)
+                logger.info("[Zero Trust] 检测到生产环境中残留的 .env 文件，已自动销毁。")
+            except Exception as _e:
+                logger.warning(f"[Zero Trust] 尝试销毁 .env 时出现异常（已忽略）: {_e}")
 
     # ---- 启动阶段 ---- #
     logger.info("[ClipFlow] 正在初始化数据库表结构…")
@@ -146,6 +158,10 @@ async def health_check() -> HealthResponse:
 app.include_router(task_routes.router, prefix="/api/v1")
 app.include_router(routes_assets.router, prefix="/api/v1")
 app.include_router(routes_history.router, prefix="/api/v1")
+# Omnichannel Gateway — 全渠道 IM 消息网关（Telegram / WhatsApp / 企微等统一入口）
+app.include_router(routes_gateway.router, prefix="/api/v1")
+# BYOK 设置接口 — 前端写入 / 读取 LLM API Key
+app.include_router(settings_router.router, prefix="/api/v1")
 
 
 # ================================================================== #

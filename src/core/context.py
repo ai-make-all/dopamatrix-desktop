@@ -10,7 +10,9 @@ class WorkflowContext:
     def __init__(self, session_id: Optional[str] = None,
                  aspect_ratio: str = "9:16",
                  test_language: str = "en",
-                 target_duration: int = 15):
+                 target_duration: int = 15,
+                 batch_size: int = 1,
+                 script_mode: str = "auto"):
         self.session_id = session_id or str(uuid.uuid4())
         # 画幅比例
         self.aspect_ratio: str = aspect_ratio
@@ -18,6 +20,10 @@ class WorkflowContext:
         self.test_language: str = test_language
         # 目标视频时长（秒），固定枚举：15 | 30 | 60
         self.target_duration: int = target_duration
+        # 本次任务的矩阵裂变数量（洗稿模式下用于告知 LLM 需生成多少个变体）
+        self.batch_size: int = batch_size
+        # 文案生成模式：'auto'(智能创作) | 'rewrite'(专属文案洗稿防重)
+        self.script_mode: str = script_mode
         
         # 存放全局配置 (如：目标语言、分辨率、API Keys)
         self.config: Dict[str, Any] = {}
