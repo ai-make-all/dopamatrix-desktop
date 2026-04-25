@@ -39,14 +39,106 @@ run_matrix_factory.py — ClipFlow 高并发矩阵裂变入口
 """
 
 import argparse
-import time
+import json
 import os
 import sys
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
 from src.core.logger import logger
+
+
+# ===========================================================================
+# Manifest 构建工具（引擎层伴生导出）
+# ===========================================================================
+
+def _fmt_time(seconds: float) -> str:
+    """将秒数格式化为 MM:SS 字符串，如 65.3 → '01:05'。"""
+    total = int(seconds)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _build_video_manifest(context, session_id: str, test_language: str) -> dict:
+    """
+    从 WorkflowContext 组装视频基因配方（Video Manifest）。
+
+    数据来源：
+      - X 轴分镜  → context.assets["script_data"].scenes
+                    每个 scene 按位置映射到 hook / body / cta
+      - X 轴台词  → scene.narrations[test_language]
+      - X 轴时间码 → 累积 scene.duration 计算绝对起止秒
+      - Y 轴 BGM  → context.assets["timeline"].audio_tracks (audio_type=="bgm")
+
+    输出格式严格对齐前端 VideoDetailView.vue 的 videoManifest 结构：
+    {
+        "video_id": "vid_<session_id>",
+        "bgm": "<bgm_filename>",
+        "blocks": [
+            {
+                "id": "b1",
+                "type": "hook",
+                "time": "00:00 - 00:03",
+                "emotion": "frustration",
+                "script": "...",
+                "thumb": ""
+            },
+            ...
+        ]
+    }
+
+    注：thumb 字段留空，由后续截帧缩略图任务（Phase 3）异步填充。
+    """
+    # 位置 → 类型 & 情绪的映射策略
+    _POSITION_TO_TYPE   = {0: "hook", -1: "cta"}   # 首 → hook，尾 → cta，其余 → body
+    _TYPE_TO_EMOTION    = {"hook": "frustration", "body": "solution", "cta": "urgency"}
+
+    script_data: dict = context.get_asset("script_data") or {}
+    timeline          = context.get_asset("timeline")
+    scenes: list      = script_data.get("scenes", [])
+    total_scenes      = len(scenes)
+
+    # ── X 轴：遍历 scene 构建 blocks ─────────────────────────────────────────
+    blocks = []
+    cursor = 0.0
+    for idx, scene in enumerate(scenes):
+        duration = float(scene.get("duration", 0))
+        t_start  = cursor
+        t_end    = cursor + duration
+
+        if idx == 0:
+            block_type = "hook"
+        elif idx == total_scenes - 1 and total_scenes > 1:
+            block_type = "cta"
+        else:
+            block_type = "body"
+
+        script_text = (scene.get("narrations") or {}).get(test_language, "")
+
+        blocks.append({
+            "id"      : f"b{idx + 1}",
+            "type"    : block_type,
+            "time"    : f"{_fmt_time(t_start)} - {_fmt_time(t_end)}",
+            "emotion" : _TYPE_TO_EMOTION[block_type],
+            "script"  : script_text,
+            "thumb"   : "",  # Phase 3 截帧任务异步填充
+        })
+        cursor = t_end
+
+    # ── Y 轴：从 Timeline 音频轨道读取 BGM 文件名 ────────────────────────────
+    bgm_name = ""
+    if timeline:
+        for audio_track in timeline.audio_tracks:
+            if audio_track.audio_type == "bgm" and audio_track.clips:
+                bgm_name = os.path.basename(audio_track.clips[0].file_path)
+                break
+
+    return {
+        "video_id" : f"vid_{session_id}",
+        "bgm"      : bgm_name,
+        "blocks"   : blocks,
+    }
 
 
 # ===========================================================================
@@ -59,7 +151,8 @@ def _run_single_matrix(session_id: str, user_prompt: str,
                        target_duration: int = 15,
                        output_dir: str = None,
                        batch_size: int = 1,
-                       script_mode: str = "auto") -> dict:
+                       script_mode: str = "auto",
+                       tenant_id: str = "default") -> dict:
     """
     单个矩阵视频生产 Worker，在独立线程中执行完整 Pipeline。
 
@@ -144,6 +237,7 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             target_duration=target_duration,
             batch_size=batch_size,
             script_mode=script_mode,
+            tenant_id=tenant_id,
         )
         context.config["session_id"] = session_id
         if output_dir:
@@ -166,11 +260,18 @@ def _run_single_matrix(session_id: str, user_prompt: str,
         final_context = engine.run(context)
 
         # ── 收集结果 ──────────────────────────────────────────────────────────
+        video_manifest = _build_video_manifest(final_context, session_id, test_language)
+        logger.info(
+            f"[Worker {session_id}] Manifest 已生成: "
+            f"blocks={len(video_manifest['blocks'])} bgm='{video_manifest['bgm']}'"
+        )
+
         result: dict = {
-            "session_id": session_id,
-            "success": True,
-            "error": None,
+            "session_id"    : session_id,
+            "success"       : True,
+            "error"         : None,
             "used_asset_ids": final_context.assets.get("used_asset_ids", []),
+            "video_manifest": video_manifest,   # ← 基因配方，供 services.py 持久化
             "assets": {
                 "video_master": final_context.get_asset("video_master") or "",
                 "variants": {
@@ -206,7 +307,8 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
                        test_language: str = "en",
                        target_duration: int = 15,
                        output_dir: str = None,
-                       script_mode: str = "auto") -> list[dict]:
+                       script_mode: str = "auto",
+                       tenant_id: str = "default") -> list[dict]:
     """
     启动多线程矩阵批量生产。
 
@@ -243,7 +345,7 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
         future_to_session: dict[Future, str] = {
             executor.submit(_run_single_matrix, sid, user_prompt,
                             aspect_ratio, test_language, target_duration,
-                            output_dir, batch_size, script_mode): sid
+                            output_dir, batch_size, script_mode, tenant_id): sid
             for sid in sessions
         }
 

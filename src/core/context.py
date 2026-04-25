@@ -12,8 +12,11 @@ class WorkflowContext:
                  test_language: str = "en",
                  target_duration: int = 15,
                  batch_size: int = 1,
-                 script_mode: str = "auto"):
+                 script_mode: str = "auto",
+                 tenant_id: str = "default"):
         self.session_id = session_id or str(uuid.uuid4())
+        # 多租户隔离标识，贯穿整个 Pipeline，供各节点使用专属 DB Engine
+        self.tenant_id: str = tenant_id or "default"
         # 画幅比例
         self.aspect_ratio: str = aspect_ratio
         # 测试语言优先：单次任务仅生成此语种的 TTS+字幕+变体

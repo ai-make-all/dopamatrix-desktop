@@ -168,10 +168,12 @@ class TaskSubmitAck(BaseModel):
 # ================================================================== #
 
 class LocalAssetCreate(BaseModel):
-    file_paths: List[str] = Field(..., description="本地素材文件绝对路径列表")
-    asset_type: str = Field(..., description="枚举: 'video', 'logo', 'sticker'")
-    video_role: str = Field(default="general", description="枚举: 'hook', 'body', 'general'")
-    tags: Optional[List[str]] = Field(default=[], description="自定义标签内容，例如 ['高转化', 'Hook']")
+    file_paths:  List[str] = Field(..., description="本地素材文件绝对路径列表")
+    asset_type:  str = Field(..., description="枚举: 'video', 'logo', 'sticker'")
+    video_role:  str = Field(default="general", description="枚举: 'hook', 'body', 'general'")
+    tags:        Optional[List[str]] = Field(default=[], description="自定义标签内容，例如 ['高转化', 'Hook']")
+    entity_id:   Optional[str] = Field(default=None, description="素材归属实体/产品线标识，例如 '@DogFood_BrandA'")
+    asset_name:  Optional[str] = Field(default=None, description="人类可读名称或备注，用于看板绝对寻址拖拽识别")
 
 class AssetRoleUpdate(BaseModel):
     video_role: str = Field(..., description="枚举: 'hook', 'body', 'general'")
@@ -188,13 +190,16 @@ class LocalAssetResponse(BaseModel):
     """
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    file_hash: str
-    file_path: str
-    asset_type: str
-    video_role: str
-    usage_count: int
-    tags: Optional[List[str]] = None
-    is_exhausted: bool
-    created_at: datetime
-    last_used_at: Optional[datetime] = None
+    id:              int
+    file_hash:       str
+    file_path:       str
+    asset_type:      str
+    video_role:      str
+    usage_count:     int
+    tags:            Optional[List[str]] = None
+    is_exhausted:    bool
+    created_at:      datetime
+    last_used_at:    Optional[datetime] = None
+    business_scopes: Optional[List[str]] = None
+    entity_id:       Optional[str] = None
+    asset_name:      Optional[str] = None

@@ -116,9 +116,11 @@ class AssetSelectNode(BaseNode):
 
         # 1. 尝试从数据库获取
         try:
-            from src.api.database import SessionLocal
+            from src.api.database import get_tenant_engine
             from src.api.models import LocalAsset
-            with SessionLocal() as db:
+            from sqlalchemy.orm import sessionmaker as _sessionmaker
+            _engine = get_tenant_engine(context.tenant_id)
+            with _sessionmaker(autocommit=False, autoflush=False, bind=_engine)() as db:
                 logo_asset = db.query(LocalAsset).filter(
                     LocalAsset.asset_type == 'logo',
                     LocalAsset.is_exhausted == False
@@ -234,9 +236,11 @@ class AssetSelectNode(BaseNode):
 
         # ── 1. 从 local_assets_inventory 数据库抽取 ──────────────────────────────
         try:
-            from src.api.database import SessionLocal
+            from src.api.database import get_tenant_engine
             from src.api.models import LocalAsset
-            with SessionLocal() as db:
+            from sqlalchemy.orm import sessionmaker as _sessionmaker
+            _engine = get_tenant_engine(context.tenant_id)
+            with _sessionmaker(autocommit=False, autoflush=False, bind=_engine)() as db:
                 # 步骤 A: 优先抽取 1 个 Hook (如果有的话)
                 hook_asset = db.query(LocalAsset).filter(
                     LocalAsset.asset_type == 'video',

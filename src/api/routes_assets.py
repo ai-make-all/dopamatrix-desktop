@@ -70,6 +70,8 @@ def import_asset(asset_in: LocalAssetCreate, db: Session = Depends(get_db)):
             asset_type=asset_in.asset_type,
             video_role=asset_in.video_role,
             tags=asset_in.tags,
+            entity_id=asset_in.entity_id,
+            asset_name=asset_in.asset_name,
         )
         db.add(new_asset)
         success_count += 1

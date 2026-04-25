@@ -168,3 +168,29 @@
 - [ ] **重铸 API 端点**: 开发 `POST /api/v1/engine/mutate-video`，接收 `{video_id, block_index, prompt}`，实现对指定区块的重新执行与极速 `concat` 缝合。
 - [ ] **Tauri 三栏式 UI 验证**: 前端开发“视频详情页”组件。完成左侧带 ROI 的播放器、中间基于 JSON 渲染的卡片堆叠（DNA Recipe），以及右侧的 Copilot 对话框 UI 打样。
 - [ ] **卡片与播放器联动**: 实现点击中栏的 Hook/Body 卡片，左侧播放器自动 `seek` 到 JSON 中对应的 `start` 时间戳并高亮该区块。
+
+### 28. [储备] 图文矩阵与 Monorepo 前端拆分 (Graphic & Monorepo Prep)
+- [ ] **目录重构**: 将现有的 Vue 前端工程重构为 Monorepo 结构。分离出 `clients/content-desktop` 与 `clients/ua-desktop` 两个独立外壳，共享 `src/core` 基建。
+- [ ] **Tauri 配置隔离**: 为两个 Client 分别配置独立的 `tauri.conf.json`（设定不同的 `productName` 和 `identifier`，实现分别打包出两款独立 .exe 软件）。
+- [ ] **路由命名空间分割**: 在 FastAPI 的 `routes.py` 中，建立 `/api/v1/content/` 和 `/api/v1/ua/` 的命名空间路由树。
+- [ ] **双核调度池基建**: 在 `services.py` 中引入独立的 `GraphicExecutor` 线程池，为后续接入 Playwright 预留无阻塞的异步执行队列。
+- [ ] **数据模型扩容**: 修改全局数据库模型，在任务表和资产表中新增 `task_type` 字段（视频/图文），并在 UI 的历史记录页通过 Icon 兼容混合展示。
+
+### 29. [储备] 情緒彈药库基建 (Meme Hub Prep)
+- [ ] **数据库扩容**: 在 SQLite 多租户模型 的结果表和资产表中，新增支持存储表情包 URL、表情包 ID 和情緒标签的模型。
+- [ ] **本地发送日志库**: 在 SQLite 中新建文件 `dopamatrix_Team_A_memes_log.db`，专门存储Team A 的表情包发送历史和本地Likes 数，为云端遥测（Telemetry）上报做准备。
+- [ ] **Pillow 字体描边节点**: 开发一个专门处理表情包静态图合成的 Python 类（基于 Pillow库），重点实现魔性字体的自动排版和描边。
+- [ ] **FFmpeg 表情包 GIF 切片逻辑**: 利用本地现有的 FFmpeg 命令，开发专门处理把 3 秒内的视频切片转换为GIF并叠加字幕的简单节点路由。
+
+### 30. Gemma 4 云端大脑换芯工程 - [紧急/高优先级]
+- [ ] **环境搭建**: 在云端 GrowthOS 节点完成 vLLM 部署环境配置，预下载 Gemma-4-31B-Dense 权重文件。
+- [ ] **API 适配层开发**: 编写 Python 包装器，将 Gemma 4 的输出适配为现有的 `VideoTaskCreate` 接口规范。
+- [ ] **DeerFlow 管道对接**: 开发数据回流脚本，将 DeerFlow 抓取的 TikTok 评论数据格式化后实时推送到云端大模型的上下文窗口（256K 模式）。
+- [ ] **Function Calling 注册**: 在 `src/api/agent_tools/` 中定义 `RenderVideo` 和 `GenerateMeme` 的 JSON Schema，供 Gemma 4 直接调遣。
+- [ ] **CrewAI 代码清理**: 从依赖库中移除 CrewAI 相关的试验性代码，简化工程结构。
+
+### 31. AI 伴侣桌面端 (Tauri) 基建攻坚战 - [高优先级]
+- [ ] **Airi 手术拆除**：Fork `airi` 开源库，彻底剥离原有的 Transformers.js, ONNX Runtime 等沉重本地 AI 模块。
+- [ ] **音频扳机开发**：在 Rust 层实现 15 秒极低功耗 Rolling Buffer（视频缓存），并对接麦克风输入接口。
+- [ ] **P2P 分发模块**：调研并集成基于 Rust 的 libtorrent 或 WebTorrent 协议，实现模型文件的分块校验与局域网极速传输。
+- [ ] **双轨制 UI 实装**：开发“多巴胺”积分与法币（USD）的双轨制钱包界面，以及战后的“高光多巴胺结算卡片”（Loot Box 交互），规避频繁授权的打扰。

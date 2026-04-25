@@ -44,7 +44,10 @@ from src.api import routes as task_routes
 from src.api import routes_assets
 from src.api import routes_history
 from src.api import routes_gateway
+from src.api import routes_video
+from src.api import routes_ws
 from src.api import settings_router
+from src.api.ws_manager import manager as ws_manager
 
 setup_logger()
 
@@ -71,6 +74,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("[ClipFlow] 正在初始化数据库表结构…")
     Base.metadata.create_all(bind=engine)
     logger.info("[ClipFlow] 数据库就绪 ✓")
+
+    # ---- 注入事件循环到 WebSocket 广播中枢 ---- #
+    # asyncio.get_running_loop() 在 lifespan（async 上下文）中安全可用。
+    # 注入后，运行于 ThreadPoolExecutor 的渲染任务可通过 ws_manager.broadcast_sync()
+    # 跨线程安全地向前端推送实时进度。
+    ws_manager.set_event_loop(asyncio.get_running_loop())
+    logger.info("[ClipFlow] WebSocket 事件总线事件循环已注入 ✓")
 
     # ---- Ngrok 内网穿透 ---- #
     # ngrok.connect 是同步调用，在 lifespan 启动阶段（服务器尚未接受请求时）
@@ -158,10 +168,18 @@ async def health_check() -> HealthResponse:
 app.include_router(task_routes.router, prefix="/api/v1")
 app.include_router(routes_assets.router, prefix="/api/v1")
 app.include_router(routes_history.router, prefix="/api/v1")
+# 视频基因舱详情接口 — manifest 查询 & 资产元信息
+app.include_router(routes_video.router, prefix="/api/v1")
 # Omnichannel Gateway — 全渠道 IM 消息网关（Telegram / WhatsApp / 企微等统一入口）
 app.include_router(routes_gateway.router, prefix="/api/v1")
 # BYOK 设置接口 — 前端写入 / 读取 LLM API Key
 app.include_router(settings_router.router, prefix="/api/v1")
+# 统一事件总线 — 鉴权 REST 接口（买票：POST /api/v1/auth/ws-ticket）
+app.include_router(routes_ws.auth_router, prefix="/api/v1")
+# 统一事件总线 — WebSocket 实时推送端点（持票上船：WS /ws/events?ticket=xxx，无 /api/v1 前缀）
+app.include_router(routes_ws.ws_router)
+# [STRESS_TEST] 压测专用路由 — 测试完成后注释掉此行（同时注释掉 routes_ws.py 中的 test_router 相关代码）
+app.include_router(routes_ws.test_router, prefix="/api/v1")
 
 
 # ================================================================== #

@@ -11,8 +11,8 @@ src/api/services.py
   - 任务终态后直接调用 reporting.notify_task_result 推送 Telegram 战报
 
 关键设计：
-  - 本模块函数「不」接收外部 Session，内部独立创建 SessionLocal()
-    → 避免 FastAPI 请求 Session 与后台线程共享导致的 SQLAlchemy 状态污染
+  - 本模块函数接收 tenant_id，内部通过 get_tenant_engine(tenant_id) 创建专属 Session
+    → 避免 FastAPI 请求 Session 与后台线程共享；同时实现多租户物理 DB 隔离
   - ProcessPoolExecutor 由 run_matrix_factory 内部管理，此层仅做结果收集
   - 战报推送为进程内直接方法调用（无 HTTP 跳转），失败绝不影响任务状态和主流程
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ from typing import Any, Optional
 
 from src.core.logger import logger
 from src.services.reporting import notify_task_result
+from src.api.ws_manager import manager as ws_manager
 
 # ── 确保子进程输出兼容 Windows GBK 终端 ──────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -138,6 +140,21 @@ def run_matrix_job(
             f"| lang={test_language} | 开始运行矩阵工厂…"
         )
 
+        # ── WS 广播①：任务开始运行 ────────────────────────────────────────
+        # 状态映射：后端 "processing" → 前端 TaskStatus "running"
+        # startTime 使用毫秒级 Unix 时间戳，与前端 QueueTask.startTime 对齐。
+        ws_manager.broadcast_sync(
+            ws_manager.make_envelope(
+                "WS_UPDATE",
+                {
+                    "taskId":    str(task_id),
+                    "status":    "running",
+                    "prompt":    prompt,
+                    "startTime": int(start_time * 1000),
+                },
+            )
+        )
+
         # 2. 运行矩阵工厂（内部多进程；此线程阻塞等待全部完成）
         results: list[dict] = run_matrix_factory(
             batch_size=batch_size,
@@ -147,6 +164,7 @@ def run_matrix_job(
             target_duration=target_duration,
             output_dir=output_dir,
             script_mode=script_mode,
+            tenant_id=tenant_id,
         )
 
         # 3. 统计成本 & 收集资产
@@ -170,6 +188,13 @@ def run_matrix_job(
             used_asset_ids.extend(result.get("used_asset_ids", []))
 
             variants: dict[str, str] = result.get("assets", {}).get("variants", {})
+
+            # 每个 worker 的所有语言变体共用同一份 manifest（脚本/BGM 相同，只有语音不同）
+            manifest_json: str = json.dumps(
+                result.get("video_manifest") or {},
+                ensure_ascii=False,
+            )
+
             for lang, file_path in variants.items():
                 if not file_path:
                     continue
@@ -181,6 +206,7 @@ def run_matrix_job(
                     language        = lang,
                     file_hash       = fh,
                     perceptual_hash = "",
+                    manifest_data   = manifest_json,
                     created_at      = _now(),
                 )
                 asset_rows.append(asset)
@@ -249,6 +275,23 @@ def run_matrix_job(
             f"资产数={len(_webhook_assets)}  预估成本=${_cost_usd:.4f} USD"
         )
 
+        # ── WS 广播②：任务完成 ───────────────────────────────────────────
+        # assets 字段携带所有已生成视频的路径与哈希，与前端 QueueTask.assets 结构对齐：
+        #   Array<{ file_path: string; file_hash: string }>
+        ws_manager.broadcast_sync(
+            ws_manager.make_envelope(
+                "WS_UPDATE",
+                {
+                    "taskId": str(task_id),
+                    "status": "completed",
+                    "assets": [
+                        {"file_path": a.file_path, "file_hash": a.file_hash}
+                        for a in asset_rows
+                    ],
+                },
+            )
+        )
+
     except Exception as e:
         logger.exception(f"任务 {task_id} 发生未知崩溃！耗时: {time.time() - start_time:.2f} 秒")
         try:
@@ -259,6 +302,21 @@ def run_matrix_job(
                 db.commit()
         except Exception:
             pass  # DB 本身也出问题时静默处理
+
+        # ── WS 广播③：任务失败 ───────────────────────────────────────────
+        # 即使 DB 操作失败，也尽力向前端推送失败状态，确保 UI 不会无限 pending。
+        try:
+            ws_manager.broadcast_sync(
+                ws_manager.make_envelope(
+                    "WS_UPDATE",
+                    {
+                        "taskId": str(task_id),
+                        "status": "failed",
+                    },
+                )
+            )
+        except Exception as ws_exc:
+            logger.warning(f"[services] task_id={task_id} WS 失败广播发送异常（已忽略）: {ws_exc}")
 
     finally:
         db.close()

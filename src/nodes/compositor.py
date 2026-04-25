@@ -1,12 +1,16 @@
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from typing import List, Tuple
 
 # 隐藏 Windows 下 FFmpeg 子进程的黑色控制台窗口
 _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+from src.api.ws_manager import manager as ws_manager
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
 from src.core.logger import logger
@@ -58,6 +62,50 @@ class FFmpegCompositorNode(BaseNode):
             )
             return (720, 1280)
         return _MAP[key]
+
+    # ------------------------------------------------------------------
+    # 事件总线辅助工具
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quick_hash(path: str) -> str:
+        """
+        读取文件前 64 KB 计算 MD5，供 WS payload 中的 file_hash 字段展示使用。
+
+        设计原则：
+          - 只读前 64 KB（对 100MB+ 视频文件不做全量 IO）
+          - 文件不存在时回退到路径字符串哈希，保证返回值始终有效
+          - 完整内容哈希（perceptual_hash / file_hash 入库）由 services.py 负责
+        """
+        h = hashlib.md5()
+        try:
+            with open(path, "rb") as f:
+                h.update(f.read(65536))
+        except OSError:
+            h.update(path.encode())
+        return h.hexdigest()
+
+    def _ws_broadcast(self, task_id: str, user_id: str, extra: dict) -> None:
+        """
+        防御性 WS 广播包装器。
+
+        职责：
+          1. 按标准信封协议拼装消息（type + payload.taskId + extra 字段）
+          2. 捕获 broadcast_sync 的所有异常——保证事件总线故障绝不中断渲染主流程
+          3. 定向推送（user_id）确保多租户隔离，防止跨用户数据串流
+
+        Args:
+            task_id: 前端 queueWorker 中对应的任务 ID（= context.session_id）
+            user_id: 广播目标用户（= context.tenant_id），传入则为定向推送
+            extra:   追加到 payload 的业务字段（status / progress / assets 等）
+        """
+        try:
+            ws_manager.broadcast_sync(
+                {"type": "WS_UPDATE", "payload": {"taskId": task_id, **extra}},
+                user_id=user_id,
+            )
+        except Exception as exc:
+            logger.warning("[FFmpegCompositorNode] WS 广播异常（不阻断渲染流程）: %r", exc)
 
     # ------------------------------------------------------------------
     # 核心编译器：Timeline → (input_args, video_filtergraph, audio_filtergraph)
@@ -287,24 +335,23 @@ class FFmpegCompositorNode(BaseNode):
         full_filtergraph = video_fg
 
         # 4. 组装完整 FFmpeg 命令（无音频流：生成静音母带）
-        # 读取 session_id 实现多进程输出路径隔离（无 session_id 时使用默认名）
+        task_id:   str = context.session_id   # WS 任务 ID，与前端 queueWorker 对齐
+        user_id:   str = context.tenant_id    # 定向推送目标，防止多租户数据串流
         session_id: str = context.config.get("session_id", "")
         sid_suffix = f"_{session_id}" if session_id else ""
         output_path = f"output/master_video{sid_suffix}.mp4"
         ffmpeg_bin = get_ffmpeg_path("ffmpeg.exe")
 
         map_args = ["-map", "[outv]", "-an"]   # -an: 无音频轨道
-        # superfast: 比 fast 快约 2x，码率略升但对 MVP 演示可接受
-        # threads 0: 让 FFmpeg 自动使用所有 CPU 物理核心
         codec_args = ["-c:v", "libx264", "-preset", "superfast", "-threads", "0"]
 
         cmd: List[str] = (
-            [ffmpeg_bin]
+            # -progress pipe:1 将进度键值对写入 stdout，与 stderr 错误日志完全分离
+            [ffmpeg_bin, "-progress", "pipe:1"]
             + input_args
             + ["-filter_complex", full_filtergraph]
             + map_args
             + codec_args
-            # master_video 是纯视频，无 -shortest 约束
             + ["-y", output_path]
         )
 
@@ -321,21 +368,72 @@ class FFmpegCompositorNode(BaseNode):
             + "\n"
         )
 
-        # 6. 真实执行
+        # ── 生命周期 WS 推送：启动前发 running ──────────────────────────────────
+        self._ws_broadcast(task_id, user_id, {"status": "running", "progress": 0})
         logger.info("⏳ 正在渲染最终母带，请稍候...")
         self.log("Rendering master video, please wait...")
+
+        # 6. 用 Popen 替换 subprocess.run，实现实时进度流读取
         try:
-            subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                check=True,            # 非零退出码 → 抛出 CalledProcessError
-                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,   # 承接 -progress pipe:1 的进度输出
+                stderr=subprocess.PIPE,   # 承接 FFmpeg 的错误/警告日志
                 text=True,
                 encoding="utf-8",
-                errors="replace",      # 兼容 ffmpeg stderr 中的非 UTF-8 字符
+                errors="replace",
                 creationflags=_WIN_NO_WINDOW,
             )
-            self.log("[OK] FFmpeg completed successfully.")
+
+            # ── stderr 独立线程消费，防止缓冲区满导致子进程死锁 ──────────────
+            _stderr_lines: List[str] = []
+
+            def _drain_stderr(pipe) -> None:
+                for line in pipe:
+                    _stderr_lines.append(line)
+
+            _stderr_thread = threading.Thread(
+                target=_drain_stderr, args=(proc.stderr,), daemon=True
+            )
+            _stderr_thread.start()
+
+            # ── 逐行解析 -progress 输出，计算并推送实时进度 ──────────────────
+            # out_time_us: FFmpeg ≥ 4.x 输出的已渲染微秒数（精度优于 out_time_ms）
+            # 总时长以 context.target_duration 为基准（秒 → 微秒），最小值 1 防零除
+            total_us: int = max(context.target_duration * 1_000_000, 1)
+            _last_ws_time: float = 0.0   # 上次广播的 monotonic 时间戳
+            _last_pct: int = -1          # 上次广播的进度百分比
+
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line.startswith("out_time_us="):
+                    continue
+                try:
+                    elapsed_us = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+
+                pct = min(int(elapsed_us * 100 / total_us), 99)  # 保留 100 给 completed 推送
+                now = time.monotonic()
+                # 限速规则：两次广播间隔 ≥ 1s，或进度跳变 ≥ 5%（防止高频刷屏）
+                if now - _last_ws_time >= 1.0 or pct - _last_pct >= 5:
+                    self._ws_broadcast(task_id, user_id, {"status": "running", "progress": pct})
+                    _last_ws_time = now
+                    _last_pct = pct
+
+            proc.wait()
+            _stderr_thread.join(timeout=10)
+            stderr_output = "".join(_stderr_lines)
+
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, cmd, stderr=stderr_output
+                )
+
+            self.log("[OK] FFmpeg master render completed successfully.")
+
         except FileNotFoundError:
+            self._ws_broadcast(task_id, user_id, {"status": "failed"})
             self.log(
                 f"[ERROR] ffmpeg binary not found at '{ffmpeg_bin}'. "
                 "In production, ensure ffmpeg.exe is in the same directory as backend.exe. "
@@ -343,6 +441,7 @@ class FFmpegCompositorNode(BaseNode):
             )
             return context
         except subprocess.CalledProcessError as exc:
+            self._ws_broadcast(task_id, user_id, {"status": "failed"})
             self.log(
                 f"[ERROR] FFmpeg exited with code {exc.returncode}. stderr:\n{exc.stderr}"
             )
@@ -353,7 +452,33 @@ class FFmpegCompositorNode(BaseNode):
         self.log(f"Master video path '{output_path}' written to Context.")
 
         # 8. 逐语言生成最终变体视频（配音 + 字幕 + 画面合并）
-        self._render_variant(context, output_path, ffmpeg_bin)
+        # 任何变体渲染失败均向前端推送 failed，再向上抛出异常保持原有错误传播链
+        try:
+            self._render_variant(context, output_path, ffmpeg_bin)
+        except Exception:
+            self._ws_broadcast(task_id, user_id, {"status": "failed"})
+            raise
+
+        # 9. 全部变体完成 → 推送最终 completed 事件（含所有资产路径）
+        #    优先取 context.variants 中的 final_video（含配音+字幕的完整变体），
+        #    若无变体则回退到母带路径（纯静音画面，至少保证前端能看到产出）
+        all_assets = [
+            {
+                "file_path": v.get("final_video", ""),
+                "file_hash": self._quick_hash(v["final_video"]),
+            }
+            for v in context.variants.values()
+            if v.get("final_video") and os.path.exists(v["final_video"])
+        ]
+        if not all_assets and os.path.exists(output_path):
+            all_assets = [{"file_path": output_path, "file_hash": self._quick_hash(output_path)}]
+
+        if all_assets:
+            self._ws_broadcast(task_id, user_id, {"status": "completed", "assets": all_assets})
+            logger.info(
+                "[FFmpegCompositorNode] ✅ 渲染全部完成，已向事件总线推送 %d 个资产。",
+                len(all_assets),
+            )
 
         return context
 
@@ -387,6 +512,10 @@ class FFmpegCompositorNode(BaseNode):
             self.log("No language variants found in Context — skipping variant rendering.")
             return
 
+        # WS 推送上下文（与 execute() 保持一致，使用同一 task_id / user_id）
+        task_id: str = context.session_id
+        user_id: str = context.tenant_id
+
         # 拉取 timeline，用于读取 BGM/SFX audio_tracks
         timeline: Timeline = context.get_asset("timeline")
         audio_tracks = timeline.audio_tracks if timeline else []
@@ -407,8 +536,8 @@ class FFmpegCompositorNode(BaseNode):
                 self.log(f"[{lang}] No voice_audio — TTS track skipped.")
 
             # ── Step 1: 收集所有 FFmpeg 输入，严格按槽位编号递增 ──────────────
-            # 槽位 0 = master_video（固定）
-            inputs: List[str] = [ffmpeg_bin, "-i", master_path]
+            # 槽位 0 = master_video（固定）；-progress pipe:1 分离进度与 stderr
+            inputs: List[str] = [ffmpeg_bin, "-progress", "pipe:1", "-i", master_path]
             next_idx: int = 1   # 下一个可用输入槽位编号
 
             # 第一顺位：TTS 配音
@@ -514,16 +643,60 @@ class FFmpegCompositorNode(BaseNode):
             self.log(f"[{lang}] Rendering variant → {final_path}")
             self.log(f"[{lang}] CMD: {' '.join(cmd)}")
 
+            # ── 生命周期推送：变体渲染开始 ────────────────────────────────────
+            self._ws_broadcast(task_id, user_id, {"status": "running", "progress": 0, "lang": lang})
+
             try:
-                subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
-                    check=True,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     creationflags=_WIN_NO_WINDOW,
                 )
+
+                # stderr 消费线程，防止缓冲区满阻塞子进程
+                _stderr_lines: List[str] = []
+
+                def _drain(pipe) -> None:
+                    for line in pipe:
+                        _stderr_lines.append(line)
+
+                _t = threading.Thread(target=_drain, args=(proc.stderr,), daemon=True)
+                _t.start()
+
+                # 实时进度推送（变体渲染通常比母带快，限速 1s/次即可）
+                total_us: int = max(context.target_duration * 1_000_000, 1)
+                _last_ws_time: float = 0.0
+
+                for raw_line in proc.stdout:
+                    line = raw_line.strip()
+                    if not line.startswith("out_time_us="):
+                        continue
+                    try:
+                        elapsed_us = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    now = time.monotonic()
+                    if now - _last_ws_time >= 1.0:
+                        pct = min(int(elapsed_us * 100 / total_us), 99)
+                        self._ws_broadcast(
+                            task_id, user_id,
+                            {"status": "running", "progress": pct, "lang": lang},
+                        )
+                        _last_ws_time = now
+
+                proc.wait()
+                _t.join(timeout=10)
+                stderr_output = "".join(_stderr_lines)
+
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, cmd, stderr=stderr_output
+                    )
+
                 self.log(f"[{lang}] [OK] Variant rendered: {final_path}")
                 context.set_variant_asset(lang, "final_video", final_path)
 
@@ -537,8 +710,10 @@ class FFmpegCompositorNode(BaseNode):
                     self.log(
                         f"[{lang}] [OK] Copied to custom output dir: {target_file_path}"
                     )
+
             except FileNotFoundError:
                 self.log(f"[{lang}] [ERROR] ffmpeg binary not found.")
+                raise
             except subprocess.CalledProcessError as exc:
                 error_msg = exc.stderr[-800:] if exc.stderr else "Unknown error"
                 self.log(

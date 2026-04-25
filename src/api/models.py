@@ -77,6 +77,7 @@ class VideoAsset(Base):
     language         = Column(String(16),  nullable=False)        # "zh" / "ar" / "en" …
     file_hash        = Column(String(64),  nullable=False, index=True)   # MD5 hex
     perceptual_hash  = Column(String(128), nullable=False, default="")   # pHash；可预留空
+    manifest_data    = Column(Text,        nullable=True)         # 视频基因配方 JSON（对齐前端 VideoDetailView）
     created_at       = Column(DateTime(timezone=True), nullable=False, default=_now)
 
     # ---- 关联 ----------------------------------------------------- #
@@ -108,9 +109,13 @@ class LocalAsset(Base):
     usage_count  = Column(Integer, nullable=False, default=0)
     tags         = Column(JSON, nullable=True)                # 自定义标签列表
     emotion_tag  = Column(String(50), index=True, nullable=True)         # BGM 情绪抽卡标签（如 asmr, cyberpunk）
-    is_exhausted = Column(Boolean, nullable=False, default=False)
-    created_at   = Column(DateTime(timezone=True), nullable=False, default=_now)
-    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    is_exhausted     = Column(Boolean, nullable=False, default=False)
+    created_at       = Column(DateTime(timezone=True), nullable=False, default=_now)
+    last_used_at     = Column(DateTime(timezone=True), nullable=True)
+    business_scopes  = Column(JSON, nullable=True,
+                              default=lambda: ["content", "ua"])  # 跨界业务线可见性白名单
+    entity_id        = Column(String(128), index=True, nullable=True)  # 素材归属实体/产品线（如 @DogFood_BrandA）
+    asset_name       = Column(String(255), nullable=True)              # 人类可读名称，用于看板绝对寻址
 
     def __repr__(self) -> str:
         return f"<LocalAsset id={self.id} type={self.asset_type} hash={self.file_hash[:8]}…>"

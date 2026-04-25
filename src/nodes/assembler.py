@@ -40,8 +40,6 @@ from src.core.context import WorkflowContext
 from src.core.logger import logger
 from src.core.timeline import AudioTrack, Clip, Timeline, Track
 from src.utils.env_utils import get_ffmpeg_path
-from src.api.database import SessionLocal
-from src.api.models import LocalAsset
 
 
 class AssemblyNode(BaseNode):
@@ -362,7 +360,11 @@ class AssemblyNode(BaseNode):
 
         if bgm_emotion:
             self.log(f"BGM emotion tag detected: '{bgm_emotion}' — querying DAM...")
-            db = SessionLocal()
+            from src.api.database import get_tenant_engine
+            from src.api.models import LocalAsset
+            from sqlalchemy.orm import sessionmaker as _sessionmaker
+            _engine = get_tenant_engine(context.tenant_id)
+            db = _sessionmaker(autocommit=False, autoflush=False, bind=_engine)()
             try:
                 bgm_asset: Optional[LocalAsset] = (
                     db.query(LocalAsset)

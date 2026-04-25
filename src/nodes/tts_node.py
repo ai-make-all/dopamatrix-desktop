@@ -109,7 +109,11 @@ class TTSNode(BaseNode):
         事件喂给 SubMaker。流结束后，将 SRT 内容转换为 WebVTT 格式写入文件。
         整个过程无需 subprocess，不依赖任何外部可执行文件。
         """
-        communicate = edge_tts.Communicate(text, voice, rate=self._rate)
+        # edge-tts v7.x 新增 boundary 参数，默认值为 "SentenceBoundary"。
+        # 必须显式声明 "WordBoundary" 才能让服务端开启逐词时间戳事件，
+        # 否则 SubMaker.feed() 永远收不到 WordBoundary chunk，VTT 文件输出为空，
+        # 导致 SubtitleNode 降级为单行 Dialogue（全文字幕静态堆叠 Bug）。
+        communicate = edge_tts.Communicate(text, voice, rate=self._rate, boundary="WordBoundary")
         submaker = edge_tts.SubMaker()
 
         with open(str(output_path), "wb") as audio_file:
@@ -119,10 +123,11 @@ class TTSNode(BaseNode):
                 elif chunk["type"] == "WordBoundary":
                     submaker.feed(chunk)
 
-        # SRT → WebVTT：添加 WEBVTT 头，并将时间戳分隔符从逗号改为句点
+        # SRT → WebVTT：添加 WEBVTT 头，逗号毫秒分隔符 → 点号（SubtitleNode 解析器已兼容两种，但标准 VTT 用点号）
+        # newline='\n'：Windows 默认文本模式会把 \n 转成 \r\n，破坏 SubtitleNode 的时间行正则匹配。
         srt_content = submaker.get_srt()
         vtt_content = "WEBVTT\n\n" + srt_content.replace(",", ".")
-        with open(str(vtt_path), "w", encoding="utf-8") as vtt_file:
+        with open(str(vtt_path), "w", encoding="utf-8", newline="\n") as vtt_file:
             vtt_file.write(vtt_content)
 
     def _run_tts(self, voice: str, text: str, output_path: Path, vtt_path: Path) -> None:

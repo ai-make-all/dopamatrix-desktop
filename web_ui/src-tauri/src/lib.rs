@@ -22,9 +22,9 @@ pub fn run() {
                 )?;
             }
 
-            // 生产环境下启动 Python FastAPI 后端 Sidecar
-            #[cfg(not(debug_assertions))]
-            {
+            // 生产环境下启动 Python FastAPI 后端 Sidecar；
+            // 开发环境（debug_assertions）下跳过，避免与手动运行的 `python main.py` 冲突。
+            if !cfg!(debug_assertions) {
                 use tauri_plugin_shell::ShellExt;
                 let sidecar_command = app
                     .shell()
@@ -33,12 +33,14 @@ pub fn run() {
                 let (mut rx, child) = sidecar_command
                     .spawn()
                     .expect("Failed to spawn sidecar");
+                // 将 child 句柄移入 async 任务，通过持有所有权防止 Drop 提前触发进程回收。
+                // rx 的持续消费确保 Tauri 内部管道不会因积压而阻塞 sidecar 输出。
                 tauri::async_runtime::spawn(async move {
-                    let _keep_alive = child; // 持有句柄，防止 Drop 导致进程被提前回收
-                    while let Some(_event) = rx.recv().await {
-                        // 持续监听直到 sidecar 退出
-                    }
+                    let _keep_alive = child;
+                    while let Some(_event) = rx.recv().await {}
                 });
+            } else {
+                println!("Running in dev mode: skipping sidecar spawn. Please start python backend manually.");
             }
 
             Ok(())

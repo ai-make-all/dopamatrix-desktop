@@ -392,13 +392,13 @@ workflow_def = {
 - [ ] **Copilot 模式 (半托管)**：云端下发策略卡片（如：“检测到近期中东市场 #Tire 标签爆火，是否应用该策略生成 10 个视频？”），UI 弹出确认框，用户一键执行。
 - [ ] **Autopilot 模式 (全托管)**：云端直接下发 JSON 渲染指令，本地引擎在后台静默排队、静默渲染、自动回传，彻底实现“无人值守印钞”。
 
-#### 6.2 多智能体框架集成 (DeerFlow & CrewAI Integration)
-> **设计原则**：DopaMatrix 保持纯粹的渲染工具属性（Tool），由外部 Agent 框架负责实时感知与预测推理。
-- [ ] **DopaMatrix Tool 封装**：将 `POST /tasks/submit` 封装为标准的 LangChain/CrewAI 可调用工具 (`DopaMatrix_Render_Tool`)。
-- [ ] **轻量级编排 (CrewAI)**：构建创意工作组（数据分析师 Agent -> 文案编剧 Agent -> 执行导演 Agent -> 调用 DopaMatrix 出片）。
-- [ ] **深度数据挖掘 (DeerFlow)**：利用字节 DeerFlow 的强大沙盒与爬虫能力，自动抓取 TikTok/Meta 的行业竞品爆款数据，喂给 CrewAI 进行二次创作。
-- [ ] **全天候流量雷达 (DeerFlow 2.0)**：升级接入 DeerFlow 2.0。利用其强大的沙盒环境与高频数据流处理能力，实时监听 TikTok/Meta 的大盘异动，重点捕捉处于“潜伏期”高增长率的音轨与视觉模因 (Memes)。
-- [ ] **动态技能路由 (Dynamic Skills Routing)**：打造“对话即服务”体验。隐藏复杂的节点连线，Agent 根据运营人员自然语言意图，动态加载 `Trend_Forecasting_Skill`,`DataRetrieval_Skill`, `Localization_Skill` 等独立技能模块，整理参数后统一抛给底层固定 Workflow 执行。
+#### 6.2 原生智能体大脑集成 (Gemma 4 & DeerFlow Integration)
+> **设计原则**：废弃冗余的 CrewAI/LangChain 编排框架，利用 Gemma 4 原生的智能体（Agentic）工作流和超长上下文能力，实现从“手动连线”到“意图驱动”的跨越。
+
+- [ ] **Gemma 4 核心大脑部署**：在云端 GrowthOS 私有化部署 Gemma-4-31B 模型，作为全系统的“总导演”。利用其 256K 超长上下文，实现对芒果长篇小说剧本的深度理解与 Story DSL 转化。
+- [ ] **原生 Function Calling 调度**：利用 Gemma 4 的原生函数调用能力，直接指挥底层的 `DopaMatrix_Render_Tool`（FFmpeg 渲染）和 `Graphic_Render_Tool`（Playwright 渲染），无需中间层编排。
+- [ ] **DeerFlow 2.0 流量雷达连通**：维持 DeerFlow 2.0 的独立地位，利用其强大的沙盒爬虫能力实时抓取 TikTok/Meta 异动数据，并作为“实时情报”源源不断喂给 Gemma 4 进行流行趋势预测。
+- [ ] **动态技能即服务 (DSaaS)**：Agent 根据自然语言意图，自主调用 `Trend_Forecasting` 或 `Localization` 技能模块，实现“对话即出片”的极简交互。
 
 #### 6.3 视频基因溯源机制 (Gene Traceability)
 - [ ] **指纹埋点**：在 Webhook 回调的结案报告中，强绑定 `hook_asset_hash`, `bg_assets_hash`, `script_id` 和 `tts_voice`。
@@ -607,6 +607,24 @@ workflow_def = {
 - [ ] **动态资产注入 (Dynamic Asset Injection)**：提供极简的 GUI 表单。客户仅需上传透明序列帧 (Sprite Sheet)、Spine 骨骼动画文件及场景背景，并填入简单的数值参数（如移动速度、血量）。
 - [ ] **极限单文件导出 (Single-File Export)**：在编译阶段引入极其严苛的 Tree-shaking 和 Base64 编码流。将所有美术资源、音频和引擎 Runtime 强行打包为一个体积严格 `< 5MB` 的纯 `.html` 文件，完美符合 Google UAC / AppLovin 等顶尖网盟的投放标准。
 - [ ] **买量与试玩全自动闭环**：引擎先生成游戏，再自动根据该游戏录屏生成 100 条引流短视频，实现 100% “货板一致”的降维打击。
+
+---
+
+### Phase 14 — 全模态矩阵与模块化单体架构 (Omni-Modal Matrix & Modular Monolith) 🖼️
+> **设计原则**：图文矩阵（快图轮播/海报）在特定平台（如小红书、Instagram）拥有远超视频的转化率且算力成本极低。平台将演进为“视频+图文”双模态内容兵工厂。同时，彻底剥离“实体商家 (Content)”与“游戏买量 (UA)”的业务端，实现底层大一统、顶层物种隔离。
+
+- [ ] **前端 Monorepo 物理撕裂 (Dual Shells)**：将前端重构为单体仓库多包管理。剥离出 `clients/content-desktop`（主打精致排版与电商参数）与 `clients/ua-desktop`（主打梗图生成与高反差字效）。底层共享状态与网络请求，UI 交互绝对隔离。
+- [ ] **领域驱动后台 (Domain-Driven API)**：FastAPI 后端演进为“模块化单体 (Modular Monolith)”。在一个进程内，通过命名空间 `/api/v1/content/*` 和 `/api/v1/ua/*` 彻底隔离两套业务逻辑的接口，互不污染。
+- [ ] **多模态任务大盘 (Polymorphic Tasks)**：升级现有的任务表结构，支持 `task_type="video" | "graphic"`。在统一的历史记录和统一的资产库 (Shared DAM) 中，无缝混合管理视频与图文资产。
+
+---
+
+### Phase 15 — 情緒彈药库与热门评论归因 (Emotional Ammunition & Meme Analytics) 🎭
+> **设计原则**：表情包（MEMEs/Dynamic Stickers）是社交媒体评论区的情绪爆点，是短剧/游戏推广的核心整活工具。平台不仅需要具备批量生成、管理、下发动态表情包的能力，更需要对表情包带来的互动转化（likes, replies）进行商业归因分析，反哺 Story DSL 引擎的情绪调教。
+
+- [ ] **AI 做表情包工具 (UGC Meme Tool)**：在桌面端集成基于 Pillow/FFmpeg 的极简表情包合成引擎。操作员在引导用户评论环节，点选“情绪标签”（frustration, laugh, attack），AI 大脑 (NeuroFlow) 自动生成魔性台词并匹配基底情绪原图，瞬间合成一张 PNG 或 GIF 表情包递给操作员。
+- [ ] **多租户表情包隔离管理**：在多租户 SQLite 中新增 `meme_assets` 表。支持根据地区、行业（如 Men 汽配、UA 游戏）对表情包进行打标、分类和疲劳度控制。确保 Team A 的魔性贴纸绝不出现在 Team B 的客户群组里。
+- [ ] **表情包热门评论归因 (Telemetry)**：统计每一张表情包在各平台的发送记录（Tauri 端本地 SQLite）及其引发的 Likes 和 Replies（Telemetry 上报至云端 PostgreSQL）。云端大脑自动归因分析：“在 MENA 地区，使用该类型的表情包能将热门评论几率提升 X%”，并将此情绪因子反馈给 DSLParser 优化剧本策略。
 
 ---
 
