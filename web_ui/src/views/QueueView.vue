@@ -1,186 +1,54 @@
 <script setup lang="ts">
 /**
- * QueueView.vue — 任务队列视图
+ * QueueView.vue — Phase 7.1 双轨隔离重构版
  *
- * 布局策略：
- *   ┌─────────────────────────────────────────┐
- *   │  StatsHeader  (position: sticky, top:0) │  ← 固定高度，显示倒计时与汇总统计
- *   ├─────────────────────────────────────────┤
- *   │                                         │
- *   │  TaskScrollArea  (flex-grow: 1,         │  ← 占据全部剩余高度
- *   │                   overflow-y: auto)     │
- *   │                                         │
- *   └─────────────────────────────────────────┘
+ * Tab 1 (processing): 轰鸣流水线 — 极简监控条，DOM 超轻量，并发 20+ 无压力
+ * Tab 2 (completed):  战果阅兵场 — Phase 7 完整三行式高密度卡片
  *
- * 虚拟列表集成指南（vue-virtual-scroller）：
- *   1. 安装依赖：npm install vue-virtual-scroller@next
- *   2. 在 main.js 全局注册（或在此处局部引入）：
- *        import { RecycleScroller } from 'vue-virtual-scroller'
- *        import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
- *   3. 将下方 <TaskScrollArea> 内的 v-for 替换为 <RecycleScroller>：
- *        <RecycleScroller
- *          class="task-scroller"
- *          :items="queueStore.tasks"
- *          :item-size="TASK_CARD_HEIGHT"
- *          key-field="id"
- *          v-slot="{ item }"
- *        >
- *          <TaskCard :task="item" />
- *        </RecycleScroller>
- *      其中 TASK_CARD_HEIGHT 为像素高度常量（如 88）。
- *      RecycleScroller 要求宿主元素有明确的固定高度，因此 .task-scroller
- *      需要 height: 100% 并继承父容器的 flex-grow: 1 撑满高度。
+ * 性能核心：
+ *   - v-if / v-else 物理隔离两个 Tab 的 DOM 树，切换时彻底销毁对方节点
+ *   - 流水线 Tab 零 <video>/<img> 渲染，每条目仅约 8 个 DOM 节点
  */
 
-import { onMounted, onUnmounted, computed, ref } from 'vue'
-import { useQueueStore }                    from '../stores/useQueueStore'
-import type { QueueTask }                  from '../stores/useQueueStore'
-import { useAppStore }                     from '../stores/appStore'
+import { onMounted, onUnmounted, computed, ref, reactive } from 'vue'
+import { useQueueStore }  from '../stores/useQueueStore'
+import type { QueueTask } from '../stores/useQueueStore'
+import { useAppStore }    from '../stores/appStore'
+import MasterPreviewModal from '../components/MasterPreviewModal.vue'
 
 const queueStore = useQueueStore()
-// ==================== 🚧 极限压力测试脚本 🚧 ====================
-
-// 定义一个压测标志位，防止重复点击
-const isStressTesting = ref(false)
-
-// [STRESS_TEST] 真实 WS 洪流压测标志位，防止重复点击
-// 测试完成后注释掉：isRealWsFlooding + triggerRealWsFlood 整个函数
-const isRealWsFlooding = ref(false)
-
-/**
- * [STRESS_TEST] 触发后端真实 WS 洪流压测。
- *
- * 向 POST /api/v1/test/flood-ws 发起请求，携带当前用户的 X-Local-User。
- * 后端收到后在 BackgroundTask 中执行 run_ws_flood_test()，
- * 通过真实的 broadcast_sync → WebSocket 管道将 500 个任务推送到前端。
- *
- * 测试完成后应注释掉：
- *   1. isRealWsFlooding ref
- *   2. 本函数（triggerRealWsFlood）
- *   3. 模板中的 [WS-REAL-TEST] 按钮
- */
-const triggerRealWsFlood = async () => {  // [STRESS_TEST]
-  if (isRealWsFlooding.value) return
-  isRealWsFlooding.value = true
-
-  const userId = appStore.loggedInUser || 'default'
-  console.log(`🌊 [WS-REAL-TEST] 正在向后端发起真实 WebSocket 洪流压测，user=${userId}...`)
-
-  try {
-    const res = await fetch('http://127.0.0.1:8000/api/v1/test/flood-ws', {
-      method:  'POST',
-      headers: { 'X-Local-User': userId },
-    })
-
-    if (res.ok) {
-      const data = await res.json()
-      console.log('🌊 [WS-REAL-TEST] 压测已启动，后端正在通过真实 WebSocket 管道推送 500 条消息：', data)
-    } else {
-      console.error(`🌊 [WS-REAL-TEST] 压测接口返回错误 HTTP ${res.status}，请确认后端已启动且 test_router 已挂载。`)
-    }
-  } catch (err) {
-    console.error('🌊 [WS-REAL-TEST] 请求失败（后端未启动或网络异常）：', err)
-  } finally {
-    // 后端异步执行，约 15-30s 后完成；前端标志位在请求返回后立即解锁（允许重复触发）
-    isRealWsFlooding.value = false
-  }
-}
-
-const runStressTest = () => {
-  if (isStressTesting.value) return
-  isStressTesting.value = true
-  console.log('🚀 [压测启动] 正在注入 500 个并发任务...')
-
-  // 1. 瞬间造 500 个假任务（模拟历史数据初始化）
-  const mockTasks: QueueTask[] = Array.from({ length: 500 }).map((_, i) => {
-    const now = Date.now() - Math.random() * 10000;
-    const ts = new Date(now).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    return {
-      id: `mock_test_task_${i}`,
-      type: 'pending', // 初始全部设为排队中
-      prompt: `【极限压测】第 ${i} 号并发渲染任务。模拟极端复杂的 Prompt，包含赛博朋克风格、多巴胺色彩、极速运镜和阿拉伯语唇形同步要求...`,
-      ts: ts,
-      startTime: now,
-      startTs: ts,
-      assets: []
-    }
-  })
-
-  // 瞬间推入 Worker 引擎
-  queueStore.initTasks(mockTasks)
-
-  // 2. 模拟高频 WebSocket 状态洪水 (WebSocket Flood Simulation)
-  console.log('🌊 [压测中] 启动高频状态流推送 (50ms/次)...')
-  
-  const floodInterval = setInterval(() => {
-    // 从 store 中实时获取当前各状态的任务池
-    const pendingTasks = queueStore.tasks.filter(t => t.type === 'pending')
-    const runningTasks = queueStore.tasks.filter(t => t.type === 'running')
-
-    if (pendingTasks.length === 0 && runningTasks.length === 0) {
-      clearInterval(floodInterval)
-      isStressTesting.value = false
-      console.log('✅ [压测结束] 500 个任务已全部模拟执行完毕！')
-      return
-    }
-
-    // 动作 A：随机拉起 1~3 个 pending 任务进入 running 状态
-    if (pendingTasks.length > 0 && Math.random() > 0.4) {
-      const idx = Math.floor(Math.random() * pendingTasks.length)
-      queueStore.pushTaskUpdate({
-        taskId: pendingTasks[idx].id,
-        status: 'running',
-        startTime: Date.now()
-      })
-    }
-
-    // 动作 B：随机把 1 个 running 任务变成 completed (附带模拟渲染好的视频文件)
-    if (runningTasks.length > 0 && Math.random() > 0.6) {
-      const idx = Math.floor(Math.random() * runningTasks.length)
-      queueStore.pushTaskUpdate({
-        taskId: runningTasks[idx].id,
-        status: 'completed',
-        assets: [
-          { file_path: `/mock/output_${runningTasks[idx].id}.mp4`, file_hash: `hash_${Math.random().toString(16).slice(2, 10)}` }
-        ]
-      })
-    }
-    
-    // 每 50ms 触发一次，这比真实的 WebSocket 并发还要快 10 倍！
-  }, 50) 
-}
-// ==============================================================
-
 const appStore   = useAppStore()
 
 // ── 生命周期 ─────────────────────────────────────────────────────────────────
-
 onMounted(() => {
   queueStore.initWorker()
-
-  /**
-   * 持票上船：先向后端申请一次性船票，再建立鉴权 WebSocket 连接。
-   * 断线后 _scheduleWsReconnect 会自动重新购票，无需手动干预。
-   * 任务列表仅由 WebSocket 实时驱动，不再从本地缓存同步旧数据。
-   */
   queueStore.connectEventBus(appStore.loggedInUser || 'default')
 })
-
 onUnmounted(() => {
-  // 离开队列页时释放 Worker 与 WebSocket，避免后台持续占用资源
   queueStore.dispose()
 })
 
-// ── 统计派生计算 ──────────────────────────────────────────────────────────────
+// ── Tab 视口状态 ──────────────────────────────────────────────────────────────
+const activeTab = ref<'processing' | 'completed'>('processing')
 
+// ── 双轨计算流 ────────────────────────────────────────────────────────────────
+const processingTasks = computed<QueueTask[]>(() =>
+  queueStore.tasks.filter(t => t.type === 'pending' || t.type === 'running' || t.type === 'failed')
+)
+const completedTasks = computed<QueueTask[]>(() =>
+  queueStore.tasks.filter(t => t.type === 'completed')
+)
+
+// ── Tab 气泡计数 ──────────────────────────────────────────────────────────────
+const processingBadge = computed(() => queueStore.stats.totalPending + queueStore.stats.totalRunning)
+
+// ── 统计 ─────────────────────────────────────────────────────────────────────
 const etaDisplay = computed<string>(() => {
   const s = queueStore.stats.estimatedETA_seconds
   if (s <= 0) return '--'
   const m = Math.floor(s / 60)
   const r = s % 60
-  return m > 0
-    ? `${m}分 ${String(r).padStart(2, '0')}秒`
-    : `${r} 秒`
+  return m > 0 ? `${m}分 ${String(r).padStart(2, '0')}秒` : `${r} 秒`
 })
 
 const progressPct = computed<number>(() => {
@@ -189,76 +57,188 @@ const progressPct = computed<number>(() => {
   return total === 0 ? 0 : Math.round((totalCompleted / total) * 100)
 })
 
-// ── 工具函数 ─────────────────────────────────────────────────────────────────
-
+// ── 工具 ─────────────────────────────────────────────────────────────────────
 function statusLabel(type: QueueTask['type']): string {
   return { pending: '排队中', running: '生成中', completed: '已完成', failed: '失败' }[type] ?? type
 }
-
 function statusClass(type: QueueTask['type']): string {
-  return {
-    pending:   'badge-pending',
-    running:   'badge-running',
-    completed: 'badge-completed',
-    failed:    'badge-failed',
-  }[type] ?? ''
+  return { pending: 'badge-pending', running: 'badge-running', completed: 'badge-completed', failed: 'badge-failed' }[type] ?? ''
+}
+
+// ── Row-2 展开状态（completed tab 专用）──────────────────────────────────────
+const expandedPrompts = reactive<Set<string>>(new Set())
+function togglePrompt(id: string) {
+  if (expandedPrompts.has(id)) expandedPrompts.delete(id)
+  else expandedPrompts.add(id)
+}
+
+// ── Row-3 轮播状态（completed tab 专用）─────────────────────────────────────
+interface CarouselState { page: number; activeIdx: number }
+const carouselMap = reactive<Map<string, CarouselState>>(new Map())
+
+function getCarousel(taskId: string): CarouselState {
+  if (!carouselMap.has(taskId)) carouselMap.set(taskId, { page: 0, activeIdx: 1 })
+  return carouselMap.get(taskId)!
+}
+
+const PAGE_SIZE = 3
+
+function carouselPrev(taskId: string, total: number, e: Event) {
+  e.stopPropagation()
+  const c = getCarousel(taskId)
+  if (c.page > 0) {
+    c.page--
+    c.activeIdx = c.page * PAGE_SIZE + 1
+  }
+}
+
+function carouselNext(taskId: string, total: number, e: Event) {
+  e.stopPropagation()
+  const c = getCarousel(taskId)
+  const maxPage = Math.ceil(total / PAGE_SIZE) - 1
+  if (c.page < maxPage) {
+    c.page++
+    c.activeIdx = Math.min(c.page * PAGE_SIZE + 1, total - 1)
+  }
+}
+
+function getVisibleAssets(task: QueueTask) {
+  const c = getCarousel(task.id)
+  const start = c.page * PAGE_SIZE
+  return (task.assets ?? []).slice(start, start + PAGE_SIZE)
+}
+
+function getGlobalIdx(task: QueueTask, localIdx: number): number {
+  const c = getCarousel(task.id)
+  return c.page * PAGE_SIZE + localIdx
+}
+
+// ── MasterPreviewModal 控制 ──────────────────────────────────────────────────
+const modalOpen     = ref(false)
+const modalTask     = ref<QueueTask | null>(null)
+const modalAssetIdx = ref(0)
+
+function openModal(task: QueueTask, globalIdx: number) {
+  const c = getCarousel(task.id)
+  c.activeIdx     = globalIdx
+  modalTask.value     = task
+  modalAssetIdx.value = globalIdx
+  modalOpen.value     = true
+}
+
+function onModalClose() {
+  modalOpen.value = false
+}
+
+// ── 向上透传"微调"事件 ────────────────────────────────────────────────────────
+const emit = defineEmits<{ (e: 'open-detail', hash: string): void }>()
+
+function onOpenDetail(hash: string) {
+  modalOpen.value = false
+  emit('open-detail', hash)
+}
+
+// ── 压力测试（保留）──────────────────────────────────────────────────────────
+const isStressTesting  = ref(false)
+const isRealWsFlooding = ref(false)
+
+const runStressTest = () => {
+  if (isStressTesting.value) return
+  isStressTesting.value = true
+
+  const mockTasks: QueueTask[] = Array.from({ length: 500 }).map((_, i) => {
+    const now = Date.now() - Math.random() * 10000
+    const ts  = new Date(now).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    return { id: `mock_test_task_${i}`, type: 'pending', prompt: `【极限压测】第 ${i} 号并发任务`, ts, startTime: now, startTs: ts, assets: [] }
+  })
+  queueStore.initTasks(mockTasks)
+
+  const floodInterval = setInterval(() => {
+    const pending = queueStore.tasks.filter(t => t.type === 'pending')
+    const running = queueStore.tasks.filter(t => t.type === 'running')
+    if (pending.length === 0 && running.length === 0) {
+      clearInterval(floodInterval)
+      isStressTesting.value = false
+      return
+    }
+    if (pending.length > 0 && Math.random() > 0.4) {
+      const idx = Math.floor(Math.random() * pending.length)
+      queueStore.pushTaskUpdate({ taskId: pending[idx].id, status: 'running', startTime: Date.now() })
+    }
+    if (running.length > 0 && Math.random() > 0.6) {
+      const idx = Math.floor(Math.random() * running.length)
+      queueStore.pushTaskUpdate({
+        taskId: running[idx].id, status: 'completed',
+        assets: [
+          { file_path: `/mock/output_${running[idx].id}_a.mp4`, file_hash: `hash_${Math.random().toString(16).slice(2, 10)}` },
+          { file_path: `/mock/output_${running[idx].id}_b.mp4`, file_hash: `hash_${Math.random().toString(16).slice(2, 10)}` },
+          { file_path: `/mock/output_${running[idx].id}_c.mp4`, file_hash: `hash_${Math.random().toString(16).slice(2, 10)}` },
+          { file_path: `/mock/output_${running[idx].id}_d.mp4`, file_hash: `hash_${Math.random().toString(16).slice(2, 10)}` },
+          { file_path: `/mock/output_${running[idx].id}_e.mp4`, file_hash: `hash_${Math.random().toString(16).slice(2, 10)}` },
+        ]
+      })
+    }
+  }, 50)
+}
+
+const triggerRealWsFlood = async () => {
+  if (isRealWsFlooding.value) return
+  isRealWsFlooding.value = true
+  try {
+    const userId = appStore.loggedInUser || 'default'
+    const res = await fetch('http://127.0.0.1:8000/api/v1/test/flood-ws', {
+      method: 'POST',
+      headers: { 'X-Local-User': userId },
+    })
+    if (!res.ok) console.error(`[WS-REAL-TEST] HTTP ${res.status}`)
+  } catch (err) {
+    console.error('[WS-REAL-TEST] 请求失败：', err)
+  } finally {
+    isRealWsFlooding.value = false
+  }
 }
 </script>
 
 <template>
   <div class="queue-layout">
 
-    <!-- ══════════════════════════════════════════════════════════════════════ -->
-    <!--  StatsHeader — sticky 顶部统计栏                                      -->
-    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <!-- ══ StatsHeader ════════════════════════════════════════════════════════ -->
     <header class="stats-header">
-
       <div class="stat-item">
         <span class="stat-label">⏳ 预计剩余</span>
         <span class="stat-value stat-eta">{{ etaDisplay }}</span>
       </div>
-
       <div class="stat-divider" />
-
       <div class="stat-item">
         <span class="stat-label">📋 排队</span>
         <span class="stat-value">{{ queueStore.stats.totalPending }}</span>
       </div>
-
       <div class="stat-item">
         <span class="stat-label">⚡ 生成中</span>
         <span class="stat-value stat-running">{{ queueStore.stats.totalRunning }}</span>
       </div>
-
       <div class="stat-item">
         <span class="stat-label">✓ 完成</span>
         <span class="stat-value stat-done">{{ queueStore.stats.totalCompleted }}</span>
       </div>
-
       <div class="stat-item">
         <span class="stat-label">✕ 失败</span>
         <span class="stat-value stat-fail">{{ queueStore.stats.totalFailed }}</span>
       </div>
 
-      <button 
-        @click="runStressTest" 
+      <button
+        @click="runStressTest"
         :disabled="isStressTesting"
-        style="margin-left: auto; padding: 4px 12px; background: #ef4444; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer;"
-      >
-        {{ isStressTesting ? '🌋 压测洪水中...' : '🚀 注入 500 任务压测' }}
-      </button>
+        class="debug-btn debug-btn--red"
+      >{{ isStressTesting ? '🌋 压测中...' : '🚀 注入 500 任务' }}</button>
 
-      <!-- [WS-REAL-TEST] 真实 WebSocket 洪流压测按钮 — 测试完成后注释掉此整段 button -->
       <button
         @click="triggerRealWsFlood"
         :disabled="isRealWsFlooding"
-        style="padding: 4px 12px; background: #3b82f6; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; opacity: 1;"
+        class="debug-btn debug-btn--blue"
         :style="isRealWsFlooding ? { opacity: '0.6', cursor: 'not-allowed' } : {}"
-      >
-        {{ isRealWsFlooding ? '🌊 WS 压测发送中...' : '🌊 启动 WS 真实压测' }}
-      </button>
+      >{{ isRealWsFlooding ? '🌊 WS 压测中...' : '🌊 WS 真实压测' }}</button>
 
-      <!-- 进度条 -->
       <div class="progress-track">
         <div
           class="progress-fill"
@@ -269,337 +249,728 @@ function statusClass(type: QueueTask['type']): string {
           aria-valuemax="100"
         />
       </div>
-
     </header>
 
-    <!-- ══════════════════════════════════════════════════════════════════════ -->
-    <!--  TaskScrollArea — 可滚动任务列表（此处挂载虚拟列表）                  -->
-    <!--                                                                       -->
-    <!--  【虚拟列表替换方案】                                                  -->
-    <!--  将下方的 <div v-for ...> 整块替换为：                                 -->
-    <!--                                                                       -->
-    <!--    <RecycleScroller                                                    -->
-    <!--      class="task-scroller"                                            -->
-    <!--      :items="queueStore.tasks"                                        -->
-    <!--      :item-size="88"                                                  -->
-    <!--      key-field="id"                                                   -->
-    <!--      v-slot="{ item }"                                                -->
-    <!--    >                                                                   -->
-    <!--      <TaskCard :task="item" />                                        -->
-    <!--    </RecycleScroller>                                                 -->
-    <!--                                                                       -->
-    <!--  注意：.task-scroller 需要继承父容器高度（height: 100%），            -->
-    <!--  RecycleScroller 自身负责管理 overflow-y: auto。                     -->
-    <!-- ══════════════════════════════════════════════════════════════════════ -->
-    <section class="task-scroll-area">
+    <!-- ══ Tab 导航栏 ══════════════════════════════════════════════════════════ -->
+    <nav class="tab-nav">
+      <button
+        :class="['tab-btn', { 'tab-btn--active': activeTab === 'processing' }]"
+        @click="activeTab = 'processing'"
+      >
+        <span class="tab-icon">⏳</span>
+        <span class="tab-label">轰鸣流水线</span>
+        <Transition name="badge-pop">
+          <span v-if="processingBadge > 0" class="tab-badge tab-badge--hot">{{ processingBadge }}</span>
+        </Transition>
+      </button>
 
-      <div v-if="queueStore.tasks.length === 0" class="empty-state">
-        <div class="empty-icon">🎬</div>
-        <p>暂无任务，前往工作台创建矩阵任务</p>
+      <button
+        :class="['tab-btn', { 'tab-btn--active': activeTab === 'completed' }]"
+        @click="activeTab = 'completed'"
+      >
+        <span class="tab-icon">🏆</span>
+        <span class="tab-label">战果阅兵场</span>
+        <Transition name="badge-pop">
+          <span v-if="queueStore.stats.totalCompleted > 0" class="tab-badge tab-badge--gold">
+            {{ queueStore.stats.totalCompleted }}
+          </span>
+        </Transition>
+      </button>
+    </nav>
+
+    <!-- ══ 轰鸣流水线（v-if — 切换时物理销毁对方 DOM 树）════════════════════ -->
+    <section v-if="activeTab === 'processing'" class="task-scroll-area">
+
+      <div v-if="processingTasks.length === 0" class="empty-state">
+        <div class="empty-icon">⚡</div>
+        <p>流水线空闲，前往工作台创建矩阵任务</p>
       </div>
 
-      <!-- RecycleScroller 虚拟列表：只渲染可视区域内的卡片，DOM 节点数恒定 -->
+      <!-- item-size = strip(52px) + margin-bottom(8px) = 60 -->
       <RecycleScroller
+        v-else
         class="task-scroller"
-        :items="queueStore.tasks"
-        :item-size="110"
-        :prerender="10"
+        :items="processingTasks"
+        :item-size="60"
+        :prerender="14"
         key-field="id"
         v-slot="{ item }"
       >
-        <div :class="['task-card', `task-card--${item.type}`]">
-          <!-- 卡片头部 -->
-          <div class="task-card__header">
-            <!-- 状态动画图标 -->
-            <svg
-              v-if="item.type === 'running'"
-              class="spin-icon"
-              fill="none"
-              viewBox="0 0 24 24"
-            >
-              <circle class="spin-track" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/>
-              <path class="spin-fill" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
-            </svg>
-            <span v-else-if="item.type === 'completed'" class="icon-done">✓</span>
-            <span v-else-if="item.type === 'failed'"    class="icon-fail">✕</span>
-            <span v-else                                class="icon-pending">·</span>
+        <!-- 极简监控条：零 <video>/<img>，~8 DOM 节点 -->
+        <div :class="['monitor-strip', `monitor-strip--${item.type}`]">
 
-            <span :class="['status-badge', statusClass(item.type)]">
-              {{ statusLabel(item.type) }}
-            </span>
-
-            <span class="task-id">Task #{{ item.id }}</span>
-
-            <span v-if="item.duration" class="task-duration">{{ item.duration }}</span>
-            <span v-else-if="item.startTs" class="task-ts">{{ item.startTs }}</span>
+          <div class="ms-left">
+            <span :class="['ms-pulse', { 'ms-pulse--running': item.type === 'running' }]" />
+            <span class="ms-id">#{{ item.id.slice(-8) }}</span>
+            <span :class="['ms-badge', statusClass(item.type)]">{{ statusLabel(item.type) }}</span>
           </div>
 
-          <!-- Prompt 摘要 -->
-          <p class="task-prompt">{{ item.prompt || '（无描述）' }}</p>
+          <p class="ms-prompt">{{ item.prompt || '（无描述）' }}</p>
 
-          <!-- 完成时展示资产缩略 -->
-          <div v-if="item.type === 'completed' && item.assets?.length" class="task-assets">
-            <div
-              v-for="(asset, idx) in item.assets"
-              :key="idx"
-              class="asset-chip"
-            >
-              <span class="asset-chip__hash">{{ asset.file_hash?.slice(0, 8) }}…</span>
-            </div>
+          <div class="ms-right">
+            <template v-if="item.type === 'running'">
+              <div class="ms-bar" aria-hidden="true">
+                <div class="ms-bar-fill" />
+              </div>
+              <svg class="ms-spin" fill="none" viewBox="0 0 24 24" width="14" height="14">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" opacity="0.25"/>
+                <path fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" opacity="0.8"/>
+              </svg>
+            </template>
+            <span v-else-if="item.type === 'failed'" class="ms-fail-tag">✕ 错误</span>
+            <span v-else class="ms-ts">{{ item.startTs || '--' }}</span>
           </div>
+
         </div>
       </RecycleScroller>
 
     </section>
 
+    <!-- ══ 战果阅兵场（v-else — 切换时物理销毁流水线 DOM 树）════════════════ -->
+    <section v-else class="task-scroll-area">
+
+      <div v-if="completedTasks.length === 0" class="empty-state">
+        <div class="empty-icon">🏆</div>
+        <p>暂无完成成果，等待流水线产出战果</p>
+      </div>
+
+      <!-- item-size = card(220px) + margin-bottom(12px) = 232 -->
+      <RecycleScroller
+        v-else
+        class="task-scroller"
+        :items="completedTasks"
+        :item-size="232"
+        :prerender="8"
+        key-field="id"
+        v-slot="{ item }"
+      >
+        <!-- ── Phase 7 完整三行式卡片 ── -->
+        <div class="task-card task-card--completed">
+
+          <!-- ══ ROW 1: 元数据 ══ -->
+          <div class="row-meta">
+            <div class="meta-left">
+              <span class="meta-task-id">#{{ item.id.slice(-8) }}</span>
+              <span v-if="item.assets?.length" class="meta-batch">包含 {{ item.assets.length }} 个视频</span>
+              <span class="status-badge badge-completed">已完成</span>
+            </div>
+            <div class="meta-right">
+              <span v-if="item.startTs" class="meta-time">
+                {{ item.startTs }}<template v-if="item.endTs"> → {{ item.endTs }}</template>
+              </span>
+              <span v-if="item.duration" class="meta-duration">{{ item.duration }}</span>
+            </div>
+          </div>
+
+          <!-- ══ ROW 2: 提示词（可展开）══ -->
+          <div class="row-prompt" :class="{ 'row-prompt--expanded': expandedPrompts.has(item.id) }">
+            <p class="prompt-text" :class="{ 'prompt-text--clamp': !expandedPrompts.has(item.id) }">
+              {{ item.prompt || '（无描述）' }}
+            </p>
+            <button
+              v-if="(item.prompt?.length ?? 0) > 60"
+              class="prompt-toggle"
+              @click.stop="togglePrompt(item.id)"
+              :aria-label="expandedPrompts.has(item.id) ? '折叠' : '展开'"
+            >
+              <svg
+                class="toggle-arrow"
+                :class="{ 'toggle-arrow--up': expandedPrompts.has(item.id) }"
+                width="12" height="12" viewBox="0 0 24 24"
+                fill="none" stroke="currentColor" stroke-width="2.5"
+                stroke-linecap="round" stroke-linejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
+            </button>
+          </div>
+
+          <!-- ══ ROW 3: 资产轮播（1:1 强制比例横向轮播）══ -->
+          <template v-if="item.assets?.length">
+            <div class="row-carousel">
+              <!-- 左翻页 -->
+              <button
+                class="carousel-arrow carousel-arrow--left"
+                :disabled="getCarousel(item.id).page === 0"
+                @click="carouselPrev(item.id, item.assets.length, $event)"
+                v-show="item.assets.length > PAGE_SIZE"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2.5"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="15 18 9 12 15 6"/>
+                </svg>
+              </button>
+
+              <!-- 轮播视口 -->
+              <div class="carousel-viewport">
+                <div
+                  v-for="(asset, localIdx) in getVisibleAssets(item)"
+                  :key="asset.file_hash || localIdx"
+                  :class="[
+                    'carousel-cell',
+                    { 'carousel-cell--active': getGlobalIdx(item, localIdx) === getCarousel(item.id).activeIdx }
+                  ]"
+                  @click.stop="openModal(item, getGlobalIdx(item, localIdx))"
+                >
+                  <video
+                    :src="appStore.buildVideoUrl(asset.file_path)"
+                    class="carousel-thumb"
+                    preload="none"
+                    muted
+                    playsinline
+                    @mouseenter="(e) => (e.target as HTMLVideoElement).play()"
+                    @mouseleave="(e) => { const v = e.target as HTMLVideoElement; v.pause(); v.currentTime = 0 }"
+                  />
+                  <span class="carousel-hash">{{ asset.file_hash?.slice(0, 6) }}</span>
+                </div>
+              </div>
+
+              <!-- 右翻页 -->
+              <button
+                class="carousel-arrow carousel-arrow--right"
+                :disabled="getCarousel(item.id).page >= Math.ceil(item.assets.length / PAGE_SIZE) - 1"
+                @click="carouselNext(item.id, item.assets.length, $event)"
+                v-show="item.assets.length > PAGE_SIZE"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2.5"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="9 18 15 12 9 6"/>
+                </svg>
+              </button>
+
+              <!-- 页码点 -->
+              <div v-if="item.assets.length > PAGE_SIZE" class="carousel-dots">
+                <span
+                  v-for="p in Math.ceil(item.assets.length / PAGE_SIZE)"
+                  :key="p"
+                  :class="['dot', { 'dot--active': p - 1 === getCarousel(item.id).page }]"
+                />
+              </div>
+            </div>
+          </template>
+          <template v-else>
+            <div class="row-empty" />
+          </template>
+
+        </div>
+      </RecycleScroller>
+
+    </section>
+
+    <!-- ══ MasterPreviewModal ════════════════════════════════════════════════ -->
+    <MasterPreviewModal
+      v-if="modalOpen && modalTask"
+      :task="modalTask"
+      :initial-index="modalAssetIdx"
+      @close="onModalClose"
+      @open-detail="onOpenDetail"
+    />
+
   </div>
 </template>
 
 <style scoped>
-/* ── 顶层容器：占满父级高度，纵向弹性布局 ─────────────────────────────────── */
+/* ── Layout ──────────────────────────────────────────────────────────────── */
 .queue-layout {
   display:        flex;
   flex-direction: column;
   height:         100%;
-  min-height:     0;       /* 防止 flex 子元素撑破父容器 */
+  min-height:     0;
   background:     #0f172a;
   color:          #e2e8f0;
-  font-family:    inherit;
 }
 
-/* ── StatsHeader ──────────────────────────────────────────────────────────── */
+/* ── StatsHeader ─────────────────────────────────────────────────────────── */
 .stats-header {
-  position:         sticky;
-  top:              0;
-  z-index:          10;
-  display:          flex;
-  align-items:      center;
-  gap:              1.25rem;
-  flex-wrap:        wrap;
-  padding:          0.75rem 1.25rem;
-  background:       rgba(15, 23, 42, 0.92);
-  backdrop-filter:  blur(12px);
-  border-bottom:    1px solid rgba(148, 163, 184, 0.12);
-  flex-shrink:      0;   /* 不随 flex 压缩 */
+  position:        sticky;
+  top:             0;
+  z-index:         10;
+  display:         flex;
+  align-items:     center;
+  gap:             1.1rem;
+  flex-wrap:       wrap;
+  padding:         0.65rem 1.25rem;
+  background:      rgba(15, 23, 42, 0.94);
+  backdrop-filter: blur(12px);
+  border-bottom:   1px solid rgba(148, 163, 184, 0.1);
+  flex-shrink:     0;
 }
-
 .stat-item {
   display:        flex;
   flex-direction: column;
   align-items:    center;
-  gap:            0.15rem;
-  min-width:      3.5rem;
+  gap:            0.1rem;
+  min-width:      3rem;
 }
-
-.stat-label {
-  font-size:   0.68rem;
-  color:       #64748b;
-  white-space: nowrap;
-  font-weight: 500;
-}
-
-.stat-value {
-  font-size:   1.25rem;
-  font-weight: 700;
-  line-height: 1;
-  color:       #e2e8f0;
-}
-
+.stat-label { font-size: 0.62rem; color: #64748b; white-space: nowrap; font-weight: 500; }
+.stat-value { font-size: 1.1rem; font-weight: 700; color: #e2e8f0; line-height: 1; }
 .stat-eta     { color: #38bdf8; font-variant-numeric: tabular-nums; }
 .stat-running { color: #facc15; }
 .stat-done    { color: #4ade80; }
 .stat-fail    { color: #f87171; }
-
-.stat-divider {
-  width:       1px;
-  height:      2rem;
-  background:  rgba(148, 163, 184, 0.15);
-  flex-shrink: 0;
-}
-
-/* 进度条 */
+.stat-divider { width: 1px; height: 2rem; background: rgba(148, 163, 184, 0.15); flex-shrink: 0; }
 .progress-track {
-  flex:             1 1 100%;
-  height:           3px;
-  background:       rgba(148, 163, 184, 0.1);
-  border-radius:    2px;
-  overflow:         hidden;
-  margin-top:       0.25rem;
+  flex: 1 1 100%; height: 3px; background: rgba(148, 163, 184, 0.1);
+  border-radius: 2px; overflow: hidden; margin-top: 0.2rem;
 }
-
 .progress-fill {
-  height:           100%;
-  background:       linear-gradient(90deg, #38bdf8, #818cf8);
-  border-radius:    2px;
-  transition:       width 0.6s ease;
-  will-change:      width;
+  height: 100%; background: linear-gradient(90deg, #38bdf8, #818cf8);
+  border-radius: 2px; transition: width 0.6s ease;
 }
+.debug-btn {
+  padding: 3px 10px; border: none; border-radius: 4px;
+  color: white; font-weight: 700; font-size: 0.7rem; cursor: pointer;
+}
+.debug-btn--red  { background: #ef4444; }
+.debug-btn--blue { background: #3b82f6; }
 
-/* ── TaskScrollArea ────────────────────────────────────────────────────────── */
+/* ── Tab 导航栏 ──────────────────────────────────────────────────────────── */
+.tab-nav {
+  display:       flex;
+  flex-shrink:   0;
+  background:    rgba(9, 14, 30, 0.97);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.12);
+  padding:       0 0.5rem;
+}
+.tab-btn {
+  position:    relative;
+  display:     flex;
+  align-items: center;
+  gap:         0.4rem;
+  padding:     0.6rem 1.1rem;
+  background:  transparent;
+  border:      none;
+  border-bottom: 2px solid transparent;
+  color:       #475569;
+  font-size:   0.78rem;
+  font-weight: 600;
+  cursor:      pointer;
+  letter-spacing: 0.02em;
+  transition:  color 0.15s, border-color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+.tab-btn:hover { color: #94a3b8; background: rgba(99, 102, 241, 0.04); }
+.tab-btn--active {
+  color:         #a5b4fc;
+  border-bottom-color: #6366f1;
+  background:    rgba(99, 102, 241, 0.06);
+}
+.tab-icon  { font-size: 0.9rem; }
+.tab-label { }
+
+.tab-badge {
+  min-width:    18px;
+  height:       18px;
+  padding:      0 5px;
+  border-radius: 9px;
+  font-size:    0.6rem;
+  font-weight:  700;
+  display:      inline-flex;
+  align-items:  center;
+  justify-content: center;
+  line-height:  1;
+}
+.tab-badge--hot  {
+  background: linear-gradient(135deg, #f59e0b, #ef4444);
+  color: #fff;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.4);
+}
+.tab-badge--gold {
+  background: linear-gradient(135deg, #4ade80, #22d3ee);
+  color: #0f172a;
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.3);
+}
+.badge-pop-enter-active, .badge-pop-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.badge-pop-enter-from, .badge-pop-leave-to       { opacity: 0; transform: scale(0.5); }
+
+/* ── ScrollArea ──────────────────────────────────────────────────────────── */
 .task-scroll-area {
-  flex:           1 1 0;     /* flex-grow: 1，占据全部剩余高度 */
-  min-height:     200px;     /* 防御性最小高度，避免初始高度为 0 导致渲染死循环 */
-  overflow-y:     hidden;    /* RecycleScroller 自身接管滚动，此处关闭 */
+  flex:           1 1 0;
+  min-height:     200px;
+  overflow-y:     hidden;
   display:        flex;
   flex-direction: column;
 }
-
-/* RecycleScroller 容器：继承父高度，自身负责 overflow-y: auto */
 .task-scroller {
-  height:  100%;
-  padding: 1rem 1.25rem;
-
-  /* 自定义滚动条（Webkit） */
+  height:          100%;
+  padding:         0.6rem 0.9rem;
   scrollbar-width: thin;
   scrollbar-color: rgba(148, 163, 184, 0.2) transparent;
 }
-
 .task-scroller::-webkit-scrollbar       { width: 5px; }
 .task-scroller::-webkit-scrollbar-track { background: transparent; }
-.task-scroller::-webkit-scrollbar-thumb {
-  background:    rgba(148, 163, 184, 0.2);
-  border-radius: 3px;
-}
+.task-scroller::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.2); border-radius: 3px; }
 
-/* ── 空状态 ────────────────────────────────────────────────────────────────── */
+/* ── Empty State ─────────────────────────────────────────────────────────── */
 .empty-state {
-  display:         flex;
-  flex-direction:  column;
-  align-items:     center;
-  justify-content: center;
-  gap:             0.75rem;
-  height:          100%;
-  color:           #475569;
-  user-select:     none;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 0.75rem; height: 100%;
+  color: #475569; user-select: none;
+}
+.empty-icon { font-size: 3rem; opacity: 0.18; }
+.empty-state p { font-size: 0.82rem; max-width: 260px; text-align: center; line-height: 1.5; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   轰鸣流水线 — 极简监控条
+   高度：52px + margin-bottom 8px = 60px（匹配 RecycleScroller item-size）
+══════════════════════════════════════════════════════════════════════════ */
+.monitor-strip {
+  height:         52px;
+  box-sizing:     border-box;
+  margin-bottom:  8px;
+  padding:        0 0.85rem;
+  border-radius:  8px;
+  border:         1px solid rgba(148, 163, 184, 0.08);
+  background:     rgba(22, 32, 52, 0.7);
+  display:        flex;
+  align-items:    center;
+  gap:            0.75rem;
+  transition:     border-color 0.2s, background 0.2s;
+  overflow:       hidden;
+}
+.monitor-strip--pending { border-left: 3px solid #64748b; }
+.monitor-strip--running {
+  border-left: 3px solid #38bdf8;
+  background:  rgba(56, 189, 248, 0.04);
+}
+.monitor-strip--failed  {
+  border-left: 3px solid #f87171;
+  opacity:     0.65;
 }
 
-.empty-icon {
-  font-size:  3.5rem;
-  opacity:    0.18;
+/* 左侧信息组 */
+.ms-left {
+  display:     flex;
+  align-items: center;
+  gap:         0.45rem;
+  flex-shrink: 0;
 }
 
-.empty-state p {
-  font-size:    0.85rem;
-  max-width:    280px;
-  text-align:   center;
-  line-height:  1.5;
+/* 脉冲指示灯 */
+.ms-pulse {
+  width:         8px;
+  height:        8px;
+  border-radius: 50%;
+  flex-shrink:   0;
+  background:    #475569;
+  transition:    background 0.2s;
+}
+.ms-pulse--running {
+  background: #38bdf8;
+  box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.6);
+  animation:  pulse-ring 1.4s ease-out infinite;
+}
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0   rgba(56, 189, 248, 0.6); }
+  70%  { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0);   }
+  100% { box-shadow: 0 0 0 0   rgba(56, 189, 248, 0);   }
 }
 
-/* ── TaskCard ──────────────────────────────────────────────────────────────── */
-/* height(100px) + margin-bottom(10px) = 110px，与 RecycleScroller item-size 严格对齐 */
-.task-card {
-  height:        100px;
-  box-sizing:    border-box;
-  margin-bottom: 10px;
-  padding:       0.65rem 0.9rem;
-  border-radius: 8px;
-  border:        1px solid rgba(148, 163, 184, 0.1);
-  background:    rgba(30, 41, 59, 0.6);
-  transition:    border-color 0.2s, background 0.2s;
-  overflow:      hidden;   /* 防止内容超出固定高度时撑破虚拟列表布局 */
+.ms-id {
+  font-size:    0.68rem;
+  font-weight:  700;
+  color:        #475569;
+  font-family:  'Courier New', monospace;
+  font-variant-numeric: tabular-nums;
+  white-space:  nowrap;
+}
+.ms-badge {
+  font-size:    0.6rem;
+  font-weight:  600;
+  padding:      1px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+  white-space:  nowrap;
 }
 
-.task-card--pending   { border-left: 3px solid #64748b; }
-.task-card--running   { border-left: 3px solid #38bdf8; background: rgba(56, 189, 248, 0.04); }
-.task-card--completed { border-left: 3px solid #4ade80; }
-.task-card--failed    { border-left: 3px solid #f87171; opacity: 0.7; }
+/* 提示词（中间截断单行）*/
+.ms-prompt {
+  flex:          1 1 0;
+  min-width:     0;
+  font-size:     0.75rem;
+  color:         #64748b;
+  white-space:   nowrap;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  margin:        0;
+}
 
-.task-card__header {
+/* 右侧状态区 */
+.ms-right {
   display:     flex;
   align-items: center;
   gap:         0.5rem;
-  flex-wrap:   wrap;
-  margin-bottom: 0.35rem;
-}
-
-/* 旋转动画图标 */
-.spin-icon {
-  width:       16px;
-  height:      16px;
-  color:       #38bdf8;
   flex-shrink: 0;
-  animation:   spin 1s linear infinite;
 }
 
-.spin-track { opacity: 0.25; }
-.spin-fill  { opacity: 0.75; }
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
+/* 不定态进度条 */
+.ms-bar {
+  width:         80px;
+  height:        4px;
+  border-radius: 2px;
+  background:    rgba(56, 189, 248, 0.12);
+  overflow:      hidden;
+  flex-shrink:   0;
+}
+.ms-bar-fill {
+  height:     100%;
+  width:      40%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, #38bdf8, transparent);
+  background-size: 200% 100%;
+  animation:  sweep 1.5s ease-in-out infinite;
+}
+@keyframes sweep {
+  0%   { background-position: -100% 0; }
+  100% { background-position:  200% 0; }
 }
 
-.icon-done    { color: #4ade80; font-size: 0.95rem; line-height: 1; }
-.icon-fail    { color: #f87171; font-size: 0.95rem; line-height: 1; }
-.icon-pending { color: #64748b; font-size: 1.2rem;  line-height: 1; }
+/* running 旋转图标 */
+.ms-spin {
+  color:     #38bdf8;
+  flex-shrink: 0;
+  animation: spin-icon 1s linear infinite;
+}
+@keyframes spin-icon { to { transform: rotate(360deg); } }
 
-/* 状态徽章 */
+/* 失败标签 */
+.ms-fail-tag {
+  font-size:   0.65rem;
+  font-weight: 700;
+  color:       #f87171;
+  white-space: nowrap;
+}
+
+/* 时间戳 */
+.ms-ts {
+  font-size:    0.65rem;
+  color:        #334155;
+  font-family:  monospace;
+  font-variant-numeric: tabular-nums;
+  white-space:  nowrap;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   战果阅兵场 — Phase 7 完整三行式卡片
+   高度：220px + margin-bottom 12px = 232px（匹配 RecycleScroller item-size）
+══════════════════════════════════════════════════════════════════════════ */
+.task-card {
+  height:         220px;
+  box-sizing:     border-box;
+  margin-bottom:  12px;
+  padding:        0.6rem 0.85rem 0.5rem;
+  border-radius:  10px;
+  border:         1px solid rgba(148, 163, 184, 0.1);
+  background:     rgba(30, 41, 59, 0.62);
+  overflow:       hidden;
+  display:        flex;
+  flex-direction: column;
+  gap:            0;
+  transition:     border-color 0.2s, background 0.2s;
+}
+.task-card--completed { border-left: 3px solid #4ade80; }
+
+/* ── Row 1: Meta ─────────────────────────────────────────────────────────── */
+.row-meta {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  gap:             0.5rem;
+  flex-shrink:     0;
+  height:          24px;
+  margin-bottom:   5px;
+}
+.meta-left, .meta-right {
+  display:     flex;
+  align-items: center;
+  gap:         0.4rem;
+  min-width:   0;
+}
+.meta-task-id {
+  font-size:    0.7rem;
+  font-weight:  700;
+  color:        #475569;
+  font-family:  'Courier New', monospace;
+  font-variant-numeric: tabular-nums;
+  white-space:  nowrap;
+}
+.meta-batch {
+  font-size:    0.65rem;
+  color:        #a78bfa;
+  background:   rgba(167, 139, 250, 0.1);
+  border:       1px solid rgba(167, 139, 250, 0.22);
+  border-radius: 10px;
+  padding:      1px 7px;
+  white-space:  nowrap;
+}
+.meta-time {
+  font-size:    0.65rem;
+  color:        #475569;
+  font-family:  'Courier New', monospace;
+  font-variant-numeric: tabular-nums;
+  white-space:  nowrap;
+}
+.meta-duration {
+  font-size:    0.7rem;
+  font-weight:  600;
+  color:        #38bdf8;
+  font-variant-numeric: tabular-nums;
+  white-space:  nowrap;
+}
 .status-badge {
-  font-size:     0.68rem;
-  font-weight:   600;
-  padding:       0.12rem 0.45rem;
-  border-radius: 4px;
-  letter-spacing: 0.02em;
-  white-space:   nowrap;
+  font-size: 0.62rem; font-weight: 600;
+  padding: 1px 7px; border-radius: 4px;
+  letter-spacing: 0.02em; white-space: nowrap;
 }
-
 .badge-pending   { background: rgba(100, 116, 139, 0.2); color: #94a3b8; }
 .badge-running   { background: rgba(56,  189, 248, 0.15); color: #38bdf8; }
 .badge-completed { background: rgba(74,  222, 128, 0.15); color: #4ade80; }
 .badge-failed    { background: rgba(248, 113, 113, 0.15); color: #f87171; }
 
-.task-id {
-  font-size:    0.68rem;
-  color:        #475569;
-  font-variant-numeric: tabular-nums;
-  margin-left:  auto;
+/* ── Row 2: Prompt ───────────────────────────────────────────────────────── */
+.row-prompt {
+  position:    relative;
+  flex-shrink: 0;
+  display:     flex;
+  align-items: flex-start;
+  gap:         0.25rem;
+  margin-bottom: 6px;
+  max-height:  36px;
+  transition:  max-height 0.3s ease;
+  overflow:    hidden;
 }
-
-.task-duration {
-  font-size:    0.72rem;
-  font-weight:  600;
-  color:        #38bdf8;
-  font-variant-numeric: tabular-nums;
+.row-prompt--expanded { max-height: 200px; }
+.prompt-text {
+  font-size:   0.78rem;
+  color:       #94a3b8;
+  line-height: 1.45;
+  margin:      0;
+  flex:        1;
+  min-width:   0;
 }
-
-.task-ts {
-  font-size: 0.68rem;
-  color:     #475569;
-}
-
-/* Prompt 摘要 */
-.task-prompt {
-  font-size:     0.8rem;
-  color:         #94a3b8;
-  margin:        0;
-  line-height:   1.5;
-  /* 超长文本折叠为 2 行 */
+.prompt-text--clamp {
   display:             -webkit-box;
   -webkit-line-clamp:  2;
   -webkit-box-orient:  vertical;
   overflow:            hidden;
 }
-
-/* 资产 chip 列表 */
-.task-assets {
-  display:   flex;
-  flex-wrap: wrap;
-  gap:       0.35rem;
-  margin-top: 0.45rem;
+.row-prompt--expanded .prompt-text--clamp {
+  display:             block;
+  overflow:            visible;
+  -webkit-line-clamp:  unset;
 }
-
-.asset-chip {
-  display:       flex;
-  align-items:   center;
-  gap:           0.25rem;
-  padding:       0.1rem 0.5rem;
+.prompt-toggle {
+  flex-shrink: 0;
+  width:       20px;
+  height:      20px;
+  display:     flex;
+  align-items: center;
+  justify-content: center;
+  border:      none;
+  background:  transparent;
+  cursor:      pointer;
+  color:       #64748b;
   border-radius: 4px;
-  background:    rgba(56, 189, 248, 0.1);
-  border:        1px solid rgba(56, 189, 248, 0.2);
+  padding:     0;
+  transition:  color 0.15s, background 0.15s;
+  margin-top:  1px;
 }
+.prompt-toggle:hover { color: #a5b4fc; background: rgba(99, 102, 241, 0.1); }
+.toggle-arrow { transition: transform 0.25s ease; }
+.toggle-arrow--up { transform: rotate(180deg); }
 
-.asset-chip__hash {
-  font-size:   0.65rem;
-  color:       #7dd3fc;
-  font-family: monospace;
+/* ── Row 3: Carousel ─────────────────────────────────────────────────────── */
+.row-carousel {
+  flex:     1 1 0;
+  display:  flex;
+  align-items: center;
+  gap:      0.3rem;
+  min-height: 0;
+  position: relative;
 }
+.carousel-viewport {
+  flex:     1 1 0;
+  display:  flex;
+  gap:      0.4rem;
+  align-items: stretch;
+  height:   100%;
+  overflow: hidden;
+}
+.carousel-cell {
+  flex:     1 1 0;
+  position: relative;
+  cursor:   pointer;
+  border-radius: 7px;
+  border:   2px solid transparent;
+  overflow: hidden;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+  aspect-ratio: 1 / 1;
+  background: #000;
+}
+.carousel-cell:hover { transform: scale(1.03); border-color: rgba(99, 102, 241, 0.5); }
+.carousel-cell--active {
+  border-color: #a78bfa !important;
+  box-shadow:   0 0 0 2px rgba(167, 139, 250, 0.35), 0 0 16px rgba(167, 139, 250, 0.4);
+}
+.carousel-thumb {
+  width:       100%;
+  height:      100%;
+  object-fit:  cover;
+  display:     block;
+  aspect-ratio: 1 / 1;
+}
+.carousel-hash {
+  position:    absolute;
+  bottom:      3px;
+  left:        0;
+  right:       0;
+  text-align:  center;
+  font-size:   0.55rem;
+  font-family: monospace;
+  color:       rgba(255,255,255,0.55);
+  background:  rgba(0,0,0,0.45);
+  padding:     1px 0;
+  pointer-events: none;
+}
+.carousel-arrow {
+  flex-shrink: 0;
+  width:       24px;
+  height:      24px;
+  border:      1px solid rgba(99, 102, 241, 0.3);
+  background:  rgba(15, 23, 42, 0.8);
+  color:       #94a3b8;
+  border-radius: 6px;
+  display:     flex;
+  align-items: center;
+  justify-content: center;
+  cursor:      pointer;
+  padding:     0;
+  transition:  border-color 0.15s, color 0.15s, background 0.15s;
+}
+.carousel-arrow:hover:not(:disabled) {
+  border-color: #a78bfa;
+  color:        #a78bfa;
+  background:   rgba(167, 139, 250, 0.1);
+}
+.carousel-arrow:disabled { opacity: 0.25; cursor: not-allowed; }
+.carousel-dots {
+  position:  absolute;
+  bottom:    -2px;
+  right:     28px;
+  display:   flex;
+  gap:       3px;
+  pointer-events: none;
+}
+.dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: rgba(148, 163, 184, 0.3);
+  transition: background 0.2s;
+}
+.dot--active { background: #a78bfa; }
+
+/* ── Empty Placeholder ───────────────────────────────────────────────────── */
+.row-empty { flex: 1 1 0; }
 </style>

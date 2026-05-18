@@ -1,11 +1,18 @@
 """
-AssetSelectNode — Phase 4 升级版：本地矩阵素材选择节点
+AssetSelectNode — Phase 5 升级版：双轨寻址素材选择节点
 
 职责：
-  优先模式（LocalMatrixProvider）：
-    读取 Context 中的 script_data，计算视频总时长，
-    调用 LocalMatrixProvider.get_clips_for_duration() 从本地素材库随机抽取素材，
-    将路径列表写入 context.assets["scene_clips"] 供 AssemblyNode 使用。
+  支持两条素材寻址轨道（Double-Track Addressing）：
+
+  [路径一] 绝对指纹直通车（Locked Bypass）：
+    当 timeline 场景块中 address_mode == "locked" 时，读取 asset_hashes 列表，
+    按文件指纹（file_hash）直接定位数据库物理路径，强制绕过疲劳度权重计算。
+    用户锁定 N 个素材时，内部循环随机排列以填满所需 clip 数量。
+
+  [路径二] 智能抽卡（Smart Select）：
+    address_mode == "smart" 或缺省时，沿用 LRU 防疲劳算法，
+    并强制注入 entity_id 实体隔离过滤（来自 context.config["project_entity"]），
+    从底层杜绝跨实体"串戏"事故（如猫粮/狗粮混剪）。
 
   降级模式（PexelsProvider）：
     若构建时显式传入 PexelsProvider 实例，则退回到逐场景关键词检索的原有逻辑，
@@ -13,11 +20,16 @@ AssetSelectNode — Phase 4 升级版：本地矩阵素材选择节点
 
 数据流：
   读取 → context.assets["script_data"]      (ScriptGenNode 生成的分镜脚本)
+         └─ scenes[*].address_mode          ("locked" | "smart", 缺省 "smart")
+         └─ scenes[*].asset_hashes          (locked 模式下的 file_hash 列表)
+         context.config["project_entity"]   (实体隔离 ID，如 "@DogFood_BrandA")
   写入 → context.assets["scene_clips"]      (List[str] 本地 .mp4 路径列表)
 
 设计说明：
-  - 采用依赖注入：构造器接受 provider 参数，默认 None（使用 LocalMatrixProvider）。
-  - 本地模式下一次性按总时长抽取素材，不再逐场景处理，更适合矩阵批量生产场景。
+  - 双轨 DSL 解析在 _run_local_mode 入口完成；业务逻辑分别委托给
+    _select_locked_clips 和 _select_smart_clips。
+  - Locked 模式：hash 未命中时，自动 Fallback 到 Smart 模式并打印警告，不中断流程。
+  - 所有 DB 查询均走多租户 get_tenant_engine(context.tenant_id)。
   - Pexels 降级逻辑保持不变，方便测试与回归。
 """
 
@@ -123,7 +135,8 @@ class AssetSelectNode(BaseNode):
             with _sessionmaker(autocommit=False, autoflush=False, bind=_engine)() as db:
                 logo_asset = db.query(LocalAsset).filter(
                     LocalAsset.asset_type == 'logo',
-                    LocalAsset.is_exhausted == False
+                    LocalAsset.is_exhausted == False,  # noqa: E712
+                    LocalAsset.is_deleted.is_(False),
                 ).order_by(LocalAsset.usage_count.asc()).first()
                 if logo_asset:
                     logo_path = logo_asset.file_path
@@ -132,7 +145,8 @@ class AssetSelectNode(BaseNode):
 
                 sticker_asset = db.query(LocalAsset).filter(
                     LocalAsset.asset_type == 'sticker',
-                    LocalAsset.is_exhausted == False
+                    LocalAsset.is_exhausted == False,  # noqa: E712
+                    LocalAsset.is_deleted.is_(False),
                 ).order_by(LocalAsset.usage_count.asc()).first()
                 if sticker_asset:
                     sticker_path = sticker_asset.file_path
@@ -188,27 +202,37 @@ class AssetSelectNode(BaseNode):
         return self._run_pexels_mode(context, scenes)
 
     # ------------------------------------------------------------------
-    # 本地矩阵模式
+    # 本地矩阵模式（Phase 5：双轨寻址入口）
     # ------------------------------------------------------------------
 
     def _run_local_mode(
         self, context: WorkflowContext, script_data: dict, scenes: list
     ) -> WorkflowContext:
         """
-        【本地矩阵模式】：按脚本总时长，从数据库 LocalAsset 表提取素材。
-        基于防疲劳 LRU 算法抽取（usage_count 升序），抽取文件供拼装节点使用，
-        并记录使用过的 ID 以便引擎终结时反写。
+        【本地矩阵模式 — 双轨寻址调度器】
+
+        1. 音频霸权时长控制：用 ffprobe 读取真实音频时长，估算所需 clip 数量。
+        2. DSL 解析：扫描所有 scene 块，收集 address_mode == "locked" 的 asset_hashes。
+        3. 分发：
+           - 有锁定 hash → _select_locked_clips（指纹直通，绕过疲劳度）
+             └ hash 全部不命中时 → 自动 Fallback 到 _select_smart_clips
+           - 无锁定 hash → _select_smart_clips（LRU + 实体隔离）
+        4. 如果数据库两条路都没结果 → 系统默认素材池兜底。
         """
-        # 🎯 音频霸权时长控制 (Audio Hegemony Duration Control)
+        # ── 音频霸权时长控制（Audio Hegemony Duration Control）──────────────
         target_lang = getattr(context, "test_language", "en") or "en"
         voice_audio = context.variants.get(target_lang, {}).get("voice_audio")
-        
+
         total_duration = 0.0
         if voice_audio and os.path.exists(voice_audio):
             try:
-                # 使用 ffprobe 读取真实物理时长
                 result = subprocess.run(
-                    [get_ffmpeg_path("ffprobe.exe"), "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", voice_audio],
+                    [
+                        get_ffmpeg_path("ffprobe.exe"), "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        voice_audio,
+                    ],
                     capture_output=True, text=True, check=True,
                     creationflags=_WIN_NO_WINDOW,
                 )
@@ -227,75 +251,61 @@ class AssetSelectNode(BaseNode):
             return context
 
         target_duration = total_duration + 1.0
-
         AVG_CLIP_DURATION = 5.0
-        original_needed = max(1, int(target_duration / AVG_CLIP_DURATION) + 1)
-        needed = original_needed
-        scene_clips = []
-        used_ids = context.assets.get("used_asset_ids", [])
+        needed = max(1, int(target_duration / AVG_CLIP_DURATION) + 1)
 
-        # ── 1. 从 local_assets_inventory 数据库抽取 ──────────────────────────────
-        try:
-            from src.api.database import get_tenant_engine
-            from src.api.models import LocalAsset
-            from sqlalchemy.orm import sessionmaker as _sessionmaker
-            _engine = get_tenant_engine(context.tenant_id)
-            with _sessionmaker(autocommit=False, autoflush=False, bind=_engine)() as db:
-                # 步骤 A: 优先抽取 1 个 Hook (如果有的话)
-                hook_asset = db.query(LocalAsset).filter(
-                    LocalAsset.asset_type == 'video',
-                    LocalAsset.video_role == 'hook',
-                    LocalAsset.is_exhausted == False
-                ).order_by(LocalAsset.usage_count.asc()).first()
-                
-                if hook_asset:
-                    scene_clips.append(hook_asset.file_path)
-                    used_ids.append(hook_asset.id)
-                    self.log(f"[Local Mode] 🎯 选取 Hook 片头 ID={hook_asset.id}: {hook_asset.file_path}")
-                    needed -= 1
-                else:
-                    self.log("[Local Mode] ⚠️ 警告: 库里完全没有设置 Hook 素材，退化为原来的全盘随机抽取逻辑。")
+        # ── DSL 解析：扫描所有场景，收集锁定素材指纹 ───────────────────────
+        raw_locked: List[str] = []
+        for scene in scenes:
+            if scene.get("address_mode") == "locked":
+                raw_locked.extend(scene.get("asset_hashes") or [])
 
-                if needed > 0:
-                    # 步骤 B & C: 去查 video_role in ('body', 'general') 且未耗尽的视频
-                    # 绝对禁止跨界抽取 video_role == 'hook'
-                    fill_assets = db.query(LocalAsset).filter(
-                        LocalAsset.asset_type == 'video',
-                        LocalAsset.video_role.in_(['body', 'general']),
-                        LocalAsset.is_exhausted == False
-                    ).order_by(LocalAsset.usage_count.asc()).limit(needed).all()
-                    
-                    # 极端兜底：如果连符合条件的都没有，只回退到 general（依旧不能用 hook）
-                    if not fill_assets:
-                        self.log("[Local Mode] ⚠️ 警告: 库里完全没有未耗尽的 Body 素材，只能将就复用其他 general 素材 (严格排查 hook)。")
-                        fill_assets = db.query(LocalAsset).filter(
-                            LocalAsset.asset_type == 'video',
-                            LocalAsset.video_role == 'general',
-                            LocalAsset.is_exhausted == False
-                        ).order_by(LocalAsset.usage_count.asc()).limit(needed).all()
+        # 去重，保留原始顺序
+        seen: set = set()
+        unique_locked: List[str] = []
+        for h in raw_locked:
+            if h and h not in seen:
+                seen.add(h)
+                unique_locked.append(h)
 
-                    if fill_assets:
-                        # 继续使用剩余素材，直到填满总时长
-                        while len(scene_clips) < original_needed:
-                            for asset in fill_assets:
-                                scene_clips.append(asset.file_path)
-                                used_ids.append(asset.id)
-                                if len(scene_clips) >= original_needed:
-                                    break
-                        self.log(f"[Local Mode] 📂 数据库选取 {len(fill_assets)} 种 Body (或兜底) 素材，循环平铺至完整时长。")
-        except Exception as exc:
-            self.log(f"[Local-DB] 数据库读取视频素材失败或未配置: {exc}")
+        used_ids: list = list(context.assets.get("used_asset_ids", []))
+        scene_clips: List[str] = []
 
-        # ── 2. 降级：系统默认素材池（如果 DB 没有查到有效结果）───────────────────
-        if not scene_clips:
+        # ── 路径一：绝对指纹直通车（Locked Bypass）─────────────────────────
+        if unique_locked:
             self.log(
-                f"[Local Mode] {len(scenes)} scene(s), total duration: {total_duration:.1f}s. "
-                f"Selecting clips from default pool '{self._pool_dir}'..."
+                f"[Double-Track] 检测到 {len(unique_locked)} 个锁定 hash，"
+                f"进入绝对指纹直通车模式。"
+            )
+            scene_clips, used_ids = self._select_locked_clips(
+                context, unique_locked, needed, used_ids
+            )
+            if not scene_clips:
+                self.log(
+                    "[Double-Track] ⚠️ 锁定 hash 全部未命中，"
+                    "自动 Fallback 到智能抽卡（保证流程不中断）。"
+                )
+                scene_clips, used_ids = self._select_smart_clips(
+                    context, needed, used_ids
+                )
+        else:
+            # ── 路径二：智能抽卡 + 实体隔离（Smart Select）─────────────────
+            self.log("[Double-Track] 无锁定 hash，进入智能抽卡（Smart）模式。")
+            scene_clips, used_ids = self._select_smart_clips(
+                context, needed, used_ids
             )
 
+        # ── 兜底：系统默认素材池（数据库双路均无结果）───────────────────────
+        if not scene_clips:
+            self.log(
+                f"[Local Mode] 数据库无可用素材，回退默认池 '{self._pool_dir}' "
+                f"(scenes={len(scenes)}, duration={total_duration:.1f}s)..."
+            )
             try:
                 local_provider = LocalMatrixProvider(pool_dir=self._pool_dir)
-                scene_clips = local_provider.get_clips_for_duration(target_duration=total_duration)
+                scene_clips = local_provider.get_clips_for_duration(
+                    target_duration=total_duration
+                )
             except RuntimeError as exc:
                 self.log(f"[Local Mode] ✗ 默认素材池读取失败: {exc}")
                 raise ValueError(
@@ -309,9 +319,201 @@ class AssetSelectNode(BaseNode):
             f"[Local Mode] ✓ {len(scene_clips)} clip(s) selected "
             f"(total ~{total_duration:.1f}s). Written to context.assets['scene_clips']."
         )
-
         self._set_overlay_clips(context, pool_dir=self._pool_dir)
         return context
+
+    # ------------------------------------------------------------------
+    # 路径一：绝对指纹直通车
+    # ------------------------------------------------------------------
+
+    def _select_locked_clips(
+        self,
+        context: WorkflowContext,
+        hashes: List[str],
+        needed: int,
+        used_ids: list,
+    ) -> tuple[List[str], list]:
+        """
+        按 file_hash 列表从数据库直接定位物理路径，强制跳过疲劳度权重。
+
+        - 完整命中：将命中的素材循环随机排列，填满 needed 数量。
+        - 部分命中：警告缺失 hash，使用命中部分继续循环。
+        - 全部未命中：返回空列表（调用方负责 Fallback）。
+        - 所有查询走多租户 get_tenant_engine(context.tenant_id)。
+        """
+        resolved_paths: List[str] = []
+        resolved_ids: list = []
+        missing: List[str] = []
+
+        try:
+            from src.api.database import get_tenant_engine
+            from src.api.models import LocalAsset
+            from sqlalchemy.orm import sessionmaker as _sessionmaker
+
+            _engine = get_tenant_engine(context.tenant_id)
+            with _sessionmaker(autocommit=False, autoflush=False, bind=_engine)() as db:
+                for h in hashes:
+                    asset = db.query(LocalAsset).filter(
+                        LocalAsset.file_hash == h,
+                        LocalAsset.is_deleted.is_(False),
+                    ).first()
+                    if asset:
+                        resolved_paths.append(str(asset.file_path))
+                        resolved_ids.append(asset.id)
+                        self.log(
+                            f"[Locked Bypass] ✓ hash={h[:12]}… → "
+                            f"ID={asset.id} {asset.file_path}"
+                        )
+                    else:
+                        missing.append(h)
+        except Exception as exc:
+            self.log(f"[Locked Bypass] 数据库查询异常: {exc}")
+            return [], used_ids
+
+        if missing:
+            self.log(
+                f"[Locked Bypass] ⚠️ {len(missing)}/{len(hashes)} 个 hash 未在数据库中找到，"
+                f"已跳过: {[h[:12] + '…' for h in missing]}"
+            )
+
+        if not resolved_paths:
+            return [], used_ids
+
+        # 循环随机排列组合，填满 needed 数量（不超出用户指定素材池）
+        pool = list(resolved_paths)
+        clips: List[str] = []
+        while len(clips) < needed:
+            random.shuffle(pool)
+            clips.extend(pool)
+        clips = clips[:needed]
+
+        # 每个命中 hash 只记录一次 used_id（不随循环倍增）
+        new_used_ids = list(used_ids) + resolved_ids
+        self.log(
+            f"[Locked Bypass] ✓ {len(resolved_paths)} 个锁定素材，"
+            f"循环填满 {len(clips)} clips（usage_count 权重已绕过）"
+        )
+        return clips, new_used_ids
+
+    # ------------------------------------------------------------------
+    # 路径二：智能抽卡 + 实体隔离
+    # ------------------------------------------------------------------
+
+    def _select_smart_clips(
+        self,
+        context: WorkflowContext,
+        needed: int,
+        used_ids: list,
+    ) -> tuple[List[str], list]:
+        """
+        LRU 防疲劳智能抽卡，强制注入 entity_id 实体隔离过滤条件。
+
+        entity_id 来源：context.config.get("project_entity")
+        - 有值：WHERE entity_id = '<project_entity>'（杜绝跨品牌串戏）
+        - 无值：不加过滤（兼容未设置实体的历史任务）
+
+        抽卡策略与原有逻辑相同：
+          A. 优先抽 1 个 video_role == 'hook'
+          B. 剩余配额从 body / general 中 LRU 抽取并循环平铺
+          C. body 无结果时降级到纯 general（严格排除 hook）
+        """
+        entity_id: Optional[str] = context.config.get("project_entity")
+        entity_tag = f" [entity={entity_id}]" if entity_id else ""
+
+        scene_clips: List[str] = []
+        new_used_ids = list(used_ids)
+        original_needed = needed
+
+        try:
+            from src.api.database import get_tenant_engine
+            from src.api.models import LocalAsset
+            from sqlalchemy.orm import sessionmaker as _sessionmaker
+
+            _engine = get_tenant_engine(context.tenant_id)
+            with _sessionmaker(autocommit=False, autoflush=False, bind=_engine)() as db:
+
+                def _apply_entity(q):
+                    """注入实体隔离过滤（仅 entity_id 非空时生效）。"""
+                    if entity_id:
+                        return q.filter(LocalAsset.entity_id == entity_id)
+                    return q
+
+                # 步骤 A：优先抽取 1 个 Hook
+                hook_q = _apply_entity(
+                    db.query(LocalAsset).filter(
+                        LocalAsset.asset_type == "video",
+                        LocalAsset.video_role == "hook",
+                        LocalAsset.is_exhausted == False,   # noqa: E712
+                        LocalAsset.is_deleted.is_(False),
+                    )
+                )
+                hook_asset = hook_q.order_by(LocalAsset.usage_count.asc()).first()
+
+                if hook_asset:
+                    scene_clips.append(str(hook_asset.file_path))
+                    new_used_ids.append(hook_asset.id)
+                    needed -= 1
+                    self.log(
+                        f"[Smart] 🎯 Hook ID={hook_asset.id}{entity_tag}: "
+                        f"{hook_asset.file_path}"
+                    )
+                else:
+                    self.log(
+                        f"[Smart] ⚠️ 无 Hook 素材{entity_tag}，退化为全盘随机抽取。"
+                    )
+
+                # 步骤 B：body / general 填充（严格禁止抽 hook）
+                if needed > 0:
+                    fill_q = _apply_entity(
+                        db.query(LocalAsset).filter(
+                            LocalAsset.asset_type == "video",
+                            LocalAsset.video_role.in_(["body", "general"]),
+                            LocalAsset.is_exhausted == False,   # noqa: E712
+                            LocalAsset.is_deleted.is_(False),
+                        )
+                    )
+                    fill_assets = (
+                        fill_q.order_by(LocalAsset.usage_count.asc())
+                        .limit(needed)
+                        .all()
+                    )
+
+                    # 步骤 C：极端兜底——纯 general（依旧严禁 hook）
+                    if not fill_assets:
+                        self.log(
+                            f"[Smart] ⚠️ 无未耗尽 Body 素材{entity_tag}，"
+                            f"降级为纯 general 兜底（严格排除 hook）。"
+                        )
+                        fallback_q = _apply_entity(
+                            db.query(LocalAsset).filter(
+                                LocalAsset.asset_type == "video",
+                                LocalAsset.video_role == "general",
+                                LocalAsset.is_exhausted == False,   # noqa: E712
+                                LocalAsset.is_deleted.is_(False),
+                            )
+                        )
+                        fill_assets = (
+                            fallback_q.order_by(LocalAsset.usage_count.asc())
+                            .limit(needed)
+                            .all()
+                        )
+
+                    if fill_assets:
+                        while len(scene_clips) < original_needed:
+                            for asset in fill_assets:
+                                scene_clips.append(str(asset.file_path))
+                                new_used_ids.append(asset.id)
+                                if len(scene_clips) >= original_needed:
+                                    break
+                        self.log(
+                            f"[Smart] 📂 {len(fill_assets)} 种 Body/General 素材{entity_tag}，"
+                            f"循环平铺至完整时长。"
+                        )
+
+        except Exception as exc:
+            self.log(f"[Smart-DB] 数据库读取视频素材失败或未配置: {exc}")
+
+        return scene_clips, new_used_ids
 
 
     # ------------------------------------------------------------------

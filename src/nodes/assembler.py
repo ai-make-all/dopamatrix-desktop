@@ -372,6 +372,7 @@ class AssemblyNode(BaseNode):
                         LocalAsset.asset_type == "audio_bgm",
                         LocalAsset.emotion_tag == bgm_emotion,
                         LocalAsset.is_exhausted == False,  # noqa: E712
+                        LocalAsset.is_deleted.is_(False),
                     )
                     .order_by(LocalAsset.usage_count.asc())   # LRU：优先抽用量最少的
                     .first()

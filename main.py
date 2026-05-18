@@ -33,7 +33,6 @@ load_env()
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from pyngrok import ngrok
 
@@ -42,8 +41,10 @@ from src.api.database import engine, Base
 from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
 from src.api import routes_assets
+from src.api import routes_dsl
 from src.api import routes_history
 from src.api import routes_gateway
+from src.api import routes_media
 from src.api import routes_video
 from src.api import routes_ws
 from src.api import settings_router
@@ -135,11 +136,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- 静态文件：挂载 output 目录，前端可直接通过 URL 播放视频 ---- #
-_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-os.makedirs(_OUTPUT_DIR, exist_ok=True)
-app.mount("/output", StaticFiles(directory=_OUTPUT_DIR), name="output")
-
 
 # ================================================================== #
 # 路由 — 健康检查                                                        #
@@ -168,6 +164,10 @@ async def health_check() -> HealthResponse:
 app.include_router(task_routes.router, prefix="/api/v1")
 app.include_router(routes_assets.router, prefix="/api/v1")
 app.include_router(routes_history.router, prefix="/api/v1")
+# Story DSL 意图解析器 — Dry-run 渲染蓝图接口 (Phase 4.1)
+app.include_router(routes_dsl.router, prefix="/api/v1")
+# 动态流媒体网关 — 替代 StaticFiles 挂载，支持任意绝对路径透传预览
+app.include_router(routes_media.router, prefix="/api/v1")
 # 视频基因舱详情接口 — manifest 查询 & 资产元信息
 app.include_router(routes_video.router, prefix="/api/v1")
 # Omnichannel Gateway — 全渠道 IM 消息网关（Telegram / WhatsApp / 企微等统一入口）

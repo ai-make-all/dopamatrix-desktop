@@ -110,6 +110,7 @@ class LocalAsset(Base):
     tags         = Column(JSON, nullable=True)                # 自定义标签列表
     emotion_tag  = Column(String(50), index=True, nullable=True)         # BGM 情绪抽卡标签（如 asmr, cyberpunk）
     is_exhausted     = Column(Boolean, nullable=False, default=False)
+    is_deleted       = Column(Boolean, nullable=False, default=False, index=True)  # DAM 逻辑删除 → 回收站
     created_at       = Column(DateTime(timezone=True), nullable=False, default=_now)
     last_used_at     = Column(DateTime(timezone=True), nullable=True)
     business_scopes  = Column(JSON, nullable=True,

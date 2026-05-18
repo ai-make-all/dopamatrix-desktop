@@ -194,3 +194,12 @@
 - [ ] **音频扳机开发**：在 Rust 层实现 15 秒极低功耗 Rolling Buffer（视频缓存），并对接麦克风输入接口。
 - [ ] **P2P 分发模块**：调研并集成基于 Rust 的 libtorrent 或 WebTorrent 协议，实现模型文件的分块校验与局域网极速传输。
 - [ ] **双轨制 UI 实装**：开发“多巴胺”积分与法币（USD）的双轨制钱包界面，以及战后的“高光多巴胺结算卡片”（Loot Box 交互），规避频繁授权的打扰。
+
+### 32. 全自动图文底模生成 MVP (Auto-Templating Graphic MVP) - [规划中]
+- [ ] **大模型 Prompt 工程**: 编写并测试专门针对 Gemma 4 的 `System Prompt`，要求其根据输入的图片，严格输出带有固定 `id` 占位符（如 `dm-text-1`, `dm-img-1`）的单文件 HTML/CSS 代码。
+- [ ] **底模数据库扩容**: 修改 SQLite/PostgreSQL 中资产表的 `asset_type`，新增枚举值 `html_template`。字段直接存储大模型生成的 HTML 文本字符串。
+- [ ] **Playwright 渲染沙盒**: 升级 `services.py` 中的 `GraphicExecutor`。在启动无头浏览器上下文时，强制挂载沙盒参数，确保安全渲染 AI 生成的代码。
+- [ ] **C 端接口对接**: 开放 `/api/v1/memes/templates/latest` 路由，让“嘴强鸭”客户端能够实时拉取并展示最近 1 小时内由 AI 自动撰写并生成出来的最新互动图文梗模板。
+- [ ] **[架构共识]**: 确认图文引擎与视频引擎共用 `DSLParserNode`。
+- [ ] **[逻辑隔离]**: 开发 `PathResolver` 模块，根据任务类型强制分流至不同的本地物理文件夹。
+- [ ] **[渲染联调]**: 准备在图文轨道试行“代码积木”，直接注入 HTML 字符串进行渲染测试。

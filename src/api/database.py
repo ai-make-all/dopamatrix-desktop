@@ -144,7 +144,8 @@ def evolve_schema(engine) -> None:
 
     except Exception:
         logger.error(
-            "[evolve_schema] Schema 自愈失败，跳过迁移，主程序不受影响。",
+            "[evolve_schema] Schema 自愈失败，跳过迁移，主程序不受影响。"
+            " 请检查模型定义与数据库文件是否一致，或手动执行 ALTER TABLE。",
             exc_info=True,
         )
 

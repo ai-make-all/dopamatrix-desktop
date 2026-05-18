@@ -628,6 +628,22 @@ workflow_def = {
 
 ---
 
+### Phase 16 — V5.0 全自动造模与代码驱动流 (Data-Driven Auto-Templating) 🤖
+> **设计原则**：彻底打破“人类设计师手工制作底模”的产能瓶颈。让系统具备自主“看懂热点 -> 提炼基因 -> 自动写代码造模”的能力，实现底模资产的无限自生闭环。首期 MVP 强制在图文/梗图 (Graphic/Meme) 领域试水。
+
+- [ ] **热点自动感知 (DeerFlow Sensing)**：利用 DeerFlow 2.0 爬虫，24 小时监控 TikTok/小红书/X(Twitter) 上的爆款梗图与图文排版版式。
+- [ ] **AI 逆向工程 (VLM Reverse-Engineering)**：将抓取到的爆款截图喂给云端 Gemma 4 (视觉版)。大模型自动解构其排版逻辑（如：“左边是主角抠图，右边是大字报，背景是高斯模糊”）。
+- [ ] **代码生成即造模 (Code-as-Template)**：Gemma 4 直接输出带有 `{{VAR}}` 占位符的 HTML/CSS 代码。这段**代码即底模**，自动存入 PostgreSQL 资产库，无需任何人工 UI 连线。
+- [ ] **C 端灰度测试 (C-End Canary Release)**：新生成的 HTML 梗图底模，瞬间通过 API 下发至 C 端“嘴强鸭”App。大学生用户套用该底模发疯，若该底模分享率（K因子）超过阈值，则正式升格为 B 端商用模板。
+- [ ] **多态解析适配 (Parser Polymorphism)**：
+    - [ ] 重构 `DSLParserNode`，增加对 `engine_type: graphic` 的识别支持。
+    - [ ] 确保解析器能调用 Playwright 渲染节点处理 AI 生成的 HTML/CSS 底模。
+- [ ] **物理路径 Sandbox 升级**：
+    - [ ] 在 `services.py` 中实现基于任务类型的根目录动态切换逻辑。
+    - [ ] 确保图文引擎生成的 Meme/Poster 资产存储在独立的 `graphic_tasks` 目录。
+
+---
+
 ## 6. 技术红线 (Hard Constraints)
 
 > [!CAUTION]

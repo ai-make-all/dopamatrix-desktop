@@ -1,14 +1,19 @@
 <script setup>
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { open } from '@tauri-apps/plugin-dialog'
-import { readDir } from '@tauri-apps/plugin-fs'
 import axios from 'axios'
-import { useAppStore } from '../stores/appStore'
-import QueueView from './QueueView.vue'
+import { useAppStore }         from '../stores/appStore'
+import { useQueueStore }       from '../stores/useQueueStore'
+import QueueView               from './QueueView.vue'
+import DslOrchestratorDrawer   from './DslOrchestratorDrawer.vue'
+import VideoDetailDrawer       from './VideoDetailDrawer.vue'
 
-const router = useRouter()
-const store  = useAppStore()
+const router     = useRouter()
+const store      = useAppStore()
+const queueStore = useQueueStore()
+
+// ── 沉浸式详情抽屉（零路由跳转，父页面状态完全保留）──────────────────────
+const activeDetailHash = ref('')
 
 // ── Omnibox form state ──────────────────────────────────────────────────────
 const omniPrompt      = ref('')
@@ -18,89 +23,170 @@ const omniPlaceholder = computed(() =>
     ? '粘贴您的核心营销文案全文。AI 将在保持卖点绝对不变的前提下，为您裂变出 N 个语气不同的变体文案，完美规避 TikTok 音频查重...'
     : '描述你想生成的视频内容，如：汽车减震器出海，强调极其耐用，适合中东路况...'
 )
-const batchSize       = ref(1)
-const aspectRatio     = ref('9:16')
-const testLanguage    = ref('en')
-const targetDuration  = ref(15)
-const audioVibe       = ref('auto')
+const batchSize      = ref(1)
+const aspectRatio    = ref('9:16')
+const testLanguage   = ref('en')
+const targetDuration = ref(15)
+const audioVibe      = ref('auto')
 
-// ── Tauri-backed local dirs ────────────────────────────────────────────────
-const localAssetDir   = ref('')
-const localLogoDir    = ref('')
-const localStickerDir = ref('')
-const xAssetCount     = ref(0)
-const isBatchOverLimit = computed(() => batchSize.value > Math.floor(xAssetCount.value * 1.5))
+// ── DB 素材列表（真相源：后端 API）──────────────────────────────────────────
+const dbAssetList = ref([])
 
-async function pickFolder(type, label) {
+// 全域资产注册表：所有维度并发拉取，扁平合并
+const ASSET_REGISTRY = ['video', 'image', 'audio_bgm', 'vfx', 'sfx']
+
+async function fetchDbAssets() {
   try {
-    const selected = await open({ directory: true, multiple: false })
-    if (selected && typeof selected === 'string') {
-      if (type === 'xAsset') localAssetDir.value   = selected
-      else if (type === 'logo')    localLogoDir.value    = selected
-      else if (type === 'sticker') localStickerDir.value = selected
-
-      if (type === 'xAsset') {
-        try {
-          const entries = await readDir(selected)
-          xAssetCount.value = entries.filter(e =>
-            e.name && (e.name.toLowerCase().endsWith('.mp4') || e.name.toLowerCase().endsWith('.mov'))
-          ).length
-        } catch (e) {
-          console.error('[Tauri FS] 读取 X轴素材 目录失败：', e)
-          xAssetCount.value = 0
-        }
-      }
-    }
+    const results = await Promise.all(
+      ASSET_REGISTRY.map(type =>
+        axios.get(`${store.API_BASE}/api/v1/assets?asset_type=${type}`)
+          .then(r => r.data)
+          .catch(() => [])
+      )
+    )
+    dbAssetList.value = results.flat()
   } catch (err) {
-    console.error(`[Tauri Dialog] ${label} 打开失败：`, err)
+    store.showToast('⚠️ 素材库加载失败：' + (err.response?.data?.detail || err.message))
   }
 }
 
-// ── Submit ─────────────────────────────────────────────────────────────────
+onMounted(fetchDbAssets)
+
+// ── 业务引擎模板系统 ────────────────────────────────────────────────────────
+const dslTemplates = {
+  content: [
+    { id: 'hook',    name: '👑 Hook',    role: 'hook' },
+    { id: 'context', name: '📖 Context', role: 'body' },
+    { id: 'build',   name: '🛠️ Build',   role: 'body' },
+    { id: 'reveal',  name: '✨ Reveal',  role: 'body' },
+    { id: 'cta',     name: '🎯 CTA',     role: 'cta'  },
+  ],
+  ua: [
+    { id: 'problem',  name: '💥 Problem',  role: 'hook' },
+    { id: 'failure',  name: '💀 Failure',  role: 'body' },
+    { id: 'near_win', name: '📈 Near Win', role: 'body' },
+    { id: 'reward',   name: '🏆 Reward',   role: 'cta'  },
+  ],
+}
+
+const currentTemplate = ref('content')
+
+// ── Story DSL 轨道状态（规范数据层，由抽屉写入）────────────────────────────
+const dslTracks = ref(dslTemplates.content.map(t => ({ ...t, items: [] })))
+
+// ── 抽屉控制 ────────────────────────────────────────────────────────────────
+const showOrchestrator = ref(false)
+
+function onOrchestratorConfirm({ tracks, template }) {
+  dslTracks.value   = tracks
+  currentTemplate.value = template
+}
+
+// ── 已装填积木总数（用于 Badge 气泡）──────────────────────────────────────
+const stagedBlockCount = computed(() =>
+  dslTracks.value.reduce((sum, t) => sum + t.items.length, 0)
+)
+
+// ── 兼容层：lockedAssetHashes（作战状态栏 & 发送按钮样式）────────────────
+const lockedAssetHashes = computed(() => {
+  const seen = new Set()
+  for (const track of dslTracks.value)
+    for (const item of track.items)
+      if (item.hash) seen.add(item.hash)
+  return [...seen]
+})
+
+// ── 提交条件 ────────────────────────────────────────────────────────────────
+const isSubmitting = ref(false)
+
+const canSubmit = computed(() => {
+  const hasPrompt = omniPrompt.value.trim().length > 0
+  const hasBlocks = dslTracks.value.some(t => t.items.length > 0)
+  return !isSubmitting.value && (hasPrompt || hasBlocks)
+})
+
+// ── Submit ───────────────────────────────────────────────────────────────────
 async function sendTask() {
-  const prompt = omniPrompt.value.trim()
-  if (!prompt) return
+  const hasPrompt = omniPrompt.value.trim().length > 0
+  const hasBlocks = dslTracks.value.some(t => t.items.length > 0)
 
-  omniPrompt.value = ''
+  if (!hasPrompt && !hasBlocks) {
+    store.showToast('⚠️ 请输入提示词，或在战术板中装填素材 / 语义标签')
+    return
+  }
 
-  const localFeedId = store.pushQueuedItem(prompt)
-  await nextTick()
+  isSubmitting.value = true
+
+  const activeBeatCount = dslTracks.value.filter(t => t.items.length > 0).length
+  const displayLabel = omniPrompt.value.trim() ||
+    `DSL · ${currentTemplate.value} · ${activeBeatCount} 个节拍 · ${aspectRatio.value}`
 
   try {
+    const timeline = hasBlocks
+      ? dslTracks.value
+          .map(track => {
+            const physicals = track.items.filter(i => i.type === 'physical_asset' || !i.type)
+            const tags      = track.items.filter(i => i.type === 'semantic_tag')
+            return {
+              beat:          track.id,
+              role:          track.role,
+              address_mode:  physicals.length > 0 ? 'locked' : 'smart',
+              asset_hashes:  physicals.map(i => i.hash),
+              semantic_tags: tags.map(i => i.tag),
+            }
+          })
+          .filter(b => b.asset_hashes.length > 0 || b.semantic_tags.length > 0)
+      : dslTracks.value.map(track => ({
+          beat:          track.id,
+          role:          track.role,
+          address_mode:  'smart',
+          asset_hashes:  [],
+          semantic_tags: [],
+        }))
+
     const payload = {
-      prompt,
-      script_mode:       scriptMode.value,
-      batch_size:        batchSize.value || 1,
-      local_asset_dir:   localAssetDir.value   || null,
-      local_logo_dir:    localLogoDir.value    || null,
-      local_sticker_dir: localStickerDir.value || null,
-      aspect_ratio:      aspectRatio.value,
-      test_language:     testLanguage.value,
-      target_duration:   targetDuration.value,
-      output_dir:        store.globalOutputDir || null,
+      engine_type:     currentTemplate.value,
+      timeline,
+      aspect_ratio:    aspectRatio.value,
+      target_duration: targetDuration.value,
+      batch_size:      batchSize.value,
+      test_language:   testLanguage.value,
+      tenant_id:       store.loggedInUser || 'default',
+      ...(hasPrompt && { prompt: omniPrompt.value.trim() }),
     }
 
-    if (['asmr', 'epic', 'funny'].includes(audioVibe.value)) {
-      payload.audio_scape = { bgm: { emotion: audioVibe.value } }
-    }
+    const resp   = await axios.post(`${store.API_BASE}/api/v1/tasks/submit-dsl`, payload)
+    const taskId = resp.data.task_id
+    if (!taskId) throw new Error('后端未返回 task_id，请检查后端日志')
 
-    const resp   = await axios.post(`${store.API_BASE}/api/v1/tasks/submit`, payload)
-    const data   = resp.data
-    const taskId = String(data.task_id ?? data.id ?? '')
-    if (!taskId) throw new Error('后端未返回任务 id')
+    // batch_size 个子渲染全部共用同一 task_id，只推一张卡片；
+    // 全部渲染完成后后端发送一次 completed 事件，轮播展示所有视频。
+    queueStore.pushTaskUpdate({
+      taskId,
+      status:    'pending',
+      prompt:    displayLabel,
+      startTime: Date.now(),
+    })
+    await nextTick()
 
-    store.setFeedItemTaskId(localFeedId, taskId)
-    store.startGlobalPolling()
+    dslTracks.value.forEach(t => { t.items = [] })
+    omniPrompt.value = ''
+
+    const bs = batchSize.value
+    store.showToast(
+      bs > 1
+        ? `✅ 已下发批量任务 ×${bs} · ID: ${taskId.slice(0, 8)}…`
+        : `✅ 渲染任务已下发 · ID: ${taskId.slice(0, 8)}…`
+    )
 
   } catch (err) {
-    const raw = err.response?.data?.detail
-    let detail
-    if (Array.isArray(raw))              detail = raw.map(e => e.msg ?? JSON.stringify(e)).join('；')
-    else if (raw && typeof raw === 'string') detail = raw
-    else                                 detail = err.message ?? '未知错误'
-
+    const raw    = err.response?.data?.detail
+    const detail = Array.isArray(raw)
+      ? raw.map(e => e.msg ?? JSON.stringify(e)).join('；')
+      : (typeof raw === 'string' ? raw : (err.message ?? '未知错误'))
     store.showToast(`[${err.response?.status ?? 'ERR'}] 提交失败：${detail}`)
-    store.markFeedItemFailed(localFeedId)
+  } finally {
+    isSubmitting.value = false
   }
 }
 </script>
@@ -108,12 +194,12 @@ async function sendTask() {
 <template>
   <div class="workspace-wrap">
 
-    <!-- ── TASK FEED (高性能 Worker 驱动的虚拟列表) ────────────────────── -->
+    <!-- ── 任务监控流（全宽）───────────────────────────────────────────────── -->
     <div class="task-feed">
-      <QueueView />
+      <QueueView @open-detail="hash => activeDetailHash = hash" />
     </div>
 
-    <!-- ── OMNIBOX ─────────────────────────────────────────────────────────── -->
+    <!-- ── 底部 Omnibox ──────────────────────────────────────────────────── -->
     <div class="omnibox">
       <div class="script-mode-tabs">
         <button
@@ -137,12 +223,17 @@ async function sendTask() {
       ></textarea>
 
       <div class="omni-toolbar">
-        <button class="tool-btn tool-btn-primary" @click="router.push('/assets')" title="打开 DAM 添加素材">
-          <span style="font-size: 1.1rem;">📦</span>
-          <span class="tool-label">从素材库装载弹药</span>
+
+        <!-- ⚡ 装填弹药 ── 唤起编排抽屉 -->
+        <button class="ammo-load-btn" @click="showOrchestrator = true">
+          <span class="ammo-icon">⚡</span>
+          <span class="ammo-label">装填弹药</span>
+          <Transition name="badge-pop">
+            <span v-if="stagedBlockCount > 0" class="ammo-badge">{{ stagedBlockCount }}</span>
+          </Transition>
         </button>
 
-        <div class="tool-divider"></div>
+        <div class="omni-toolbar-divider" />
 
         <div class="tool-select-wrap">
           <span class="tool-select-icon">📐</span>
@@ -173,7 +264,7 @@ async function sendTask() {
 
         <div class="tool-select-wrap tool-select-wrap--vibe">
           <span class="tool-select-icon">🎵</span>
-          <select v-model="audioVibe" class="tool-select tool-select--vibe" title="声音情绪 (Audio Vibe)">
+          <select v-model="audioVibe" class="tool-select tool-select--vibe">
             <option value="auto">🎵 AI 智能匹配 (Auto)</option>
             <option value="asmr">🎧 ASMR / 沉浸解压</option>
             <option value="epic">💥 史诗震撼 / 强节奏</option>
@@ -192,40 +283,303 @@ async function sendTask() {
           />
         </div>
 
-        <button
-          @click="sendTask"
-          :disabled="!omniPrompt.trim()"
-          class="send-btn"
-        >🚀 发送</button>
-      </div>
+        <!-- 购物车状态指示器 -->
+        <Transition name="cart-pop">
+          <div v-if="lockedAssetHashes.length > 0" class="cart-indicator">
+            🔒 已锁定 <strong>{{ lockedAssetHashes.length }}</strong> 个素材
+          </div>
+        </Transition>
 
-      <div v-if="xAssetCount > 0 && isBatchOverLimit" style="color:#facc15; font-size:0.75rem; display:flex; align-items:center; gap:0.4rem;">
-        <span>⚠️</span>
-        <span style="opacity:0.9">当前素材量仅为 {{ xAssetCount }} 段，生成超过 {{ Math.floor(xAssetCount * 1.5) }} 条变体极易触发平台查重限流，请谨慎操作！</span>
+        <div class="send-btn-wrap">
+          <button
+            @click="sendTask"
+            :disabled="!canSubmit"
+            class="send-btn"
+            :class="{ 'send-btn--locked': lockedAssetHashes.length > 0 }"
+          >
+            {{ isSubmitting ? '⏳ 下发中…' : lockedAssetHashes.length > 0 ? '🔒 锁定渲染' : '🚀 渲染' }}
+          </button>
+          <Transition name="hint-fade">
+            <div
+              v-if="omniPrompt.trim() && !dslTracks.some(t => t.items.length > 0)"
+              class="auto-mode-hint"
+            >
+              💡 全自动模式，系统将根据提示词智能匹配素材
+            </div>
+          </Transition>
+        </div>
+
       </div>
     </div>
+
+    <!-- ── DSL 编排抽屉 ─────────────────────────────────────────────────── -->
+    <DslOrchestratorDrawer
+      v-model="showOrchestrator"
+      :db-asset-list="dbAssetList"
+      :dsl-tracks="dslTracks"
+      :templates="dslTemplates"
+      :current-template="currentTemplate"
+      :build-video-url="store.buildVideoUrl"
+      :api-base="store.API_BASE"
+      :show-toast="store.showToast"
+      @confirm="onOrchestratorConfirm"
+    />
+
+    <!-- ── 沉浸式视频详情抽屉（position:fixed, 零路由跳转）──────────────── -->
+    <VideoDetailDrawer
+      v-if="activeDetailHash"
+      :asset-hash="activeDetailHash"
+      @close="activeDetailHash = ''"
+    />
 
   </div>
 </template>
 
 <style scoped>
-.asset-btn-row {
-  display: flex;
-  gap: 6px;
-  margin-top: auto;
+/* ── 整体布局：纯双行，任务流占满全宽 ────────────────────────────────────── */
+.workspace-wrap {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  grid-template-areas:
+    "feed"
+    "omni";
+  height:   100%;
+  overflow: hidden;
 }
-.asset-btn-copy {
-  flex: 1;
+
+.task-feed {
+  grid-area: feed;
+  overflow:  hidden;
+  min-height: 0;
 }
-.asset-btn-dna {
-  flex: 1;
-  background: linear-gradient(135deg, rgba(56,189,248,0.12), rgba(167,139,250,0.12)) !important;
-  border-color: rgba(167,139,250,0.35) !important;
-  color: #a78bfa !important;
-  transition: background 0.2s, box-shadow 0.2s !important;
+
+/* ── Omnibox ─────────────────────────────────────────────────────────────── */
+.omnibox {
+  grid-area: omni;
+  background: rgba(9, 14, 30, 0.98);
+  border-top: 1px solid rgba(56, 189, 248, 0.12);
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
 }
-.asset-btn-dna:hover {
-  background: linear-gradient(135deg, rgba(56,189,248,0.22), rgba(167,139,250,0.22)) !important;
-  box-shadow: 0 0 10px rgba(167,139,250,0.35);
+
+.script-mode-tabs {
+  display:     flex;
+  gap:         0;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.1);
 }
+
+.script-mode-tab {
+  flex:           1;
+  background:     transparent;
+  border:         none;
+  color:          #475569;
+  font-size:      0.72rem;
+  font-weight:    500;
+  padding:        0.45rem 0.75rem;
+  cursor:         pointer;
+  transition:     color 0.15s, background 0.15s;
+  letter-spacing: 0.01em;
+}
+.script-mode-tab:hover { color: #94a3b8; background: rgba(99, 102, 241, 0.04); }
+.script-mode-tab--active {
+  color:       #a5b4fc !important;
+  background:  rgba(99, 102, 241, 0.08) !important;
+  border-bottom: 2px solid #6366f1;
+}
+
+.omni-textarea {
+  width:       100%;
+  box-sizing:  border-box;
+  background:  transparent;
+  border:      none;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
+  color:       #e2e8f0;
+  font-size:   0.85rem;
+  line-height: 1.6;
+  padding:     0.75rem 1rem;
+  resize:      none;
+  outline:     none;
+  font-family: inherit;
+}
+.omni-textarea::placeholder { color: #334155; }
+
+/* ── Omni Toolbar ────────────────────────────────────────────────────────── */
+.omni-toolbar {
+  display:     flex;
+  align-items: center;
+  flex-wrap:   wrap;
+  gap:         0.5rem;
+  min-width:   0;
+  padding:     0.55rem 0.9rem;
+}
+
+.omni-toolbar-divider {
+  width:       1px;
+  height:      1.5rem;
+  background:  rgba(99, 102, 241, 0.15);
+  flex-shrink: 0;
+  margin:      0 0.15rem;
+}
+
+/* ── 装填弹药按钮 ────────────────────────────────────────────────────────── */
+.ammo-load-btn {
+  position:    relative;
+  display:     flex;
+  align-items: center;
+  gap:         0.4rem;
+  padding:     0.38rem 0.9rem;
+  border-radius: 8px;
+  border:      1px solid rgba(99, 102, 241, 0.45);
+  background:  linear-gradient(135deg, rgba(49, 46, 129, 0.5), rgba(30, 27, 75, 0.4));
+  color:       #a5b4fc;
+  font-size:   0.8rem;
+  font-weight: 600;
+  cursor:      pointer;
+  letter-spacing: 0.02em;
+  transition:  background 0.2s, border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+  flex-shrink: 0;
+  box-shadow:  0 0 12px rgba(99, 102, 241, 0.15);
+}
+.ammo-load-btn:hover {
+  background:   linear-gradient(135deg, rgba(79, 70, 229, 0.5), rgba(49, 46, 129, 0.5));
+  border-color: rgba(139, 92, 246, 0.7);
+  box-shadow:   0 0 20px rgba(99, 102, 241, 0.35);
+  transform:    translateY(-1px);
+}
+.ammo-load-btn:active { transform: translateY(0); }
+
+.ammo-icon  { font-size: 0.9rem; filter: drop-shadow(0 0 6px rgba(99, 102, 241, 0.8)); }
+.ammo-label { white-space: nowrap; }
+
+.ammo-badge {
+  position:    absolute;
+  top:         -6px;
+  right:       -6px;
+  min-width:   18px;
+  height:      18px;
+  padding:     0 4px;
+  border-radius: 9px;
+  background:  linear-gradient(135deg, #f43f5e, #e11d48);
+  color:       #fff;
+  font-size:   0.62rem;
+  font-weight: 700;
+  display:     flex;
+  align-items: center;
+  justify-content: center;
+  border:      2px solid rgba(9, 14, 30, 0.95);
+  box-shadow:  0 2px 6px rgba(244, 63, 94, 0.45);
+}
+
+.badge-pop-enter-active, .badge-pop-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.badge-pop-enter-from, .badge-pop-leave-to       { opacity: 0; transform: scale(0.5); }
+
+/* ── Tool selects ────────────────────────────────────────────────────────── */
+.tool-select-wrap {
+  display:     flex;
+  align-items: center;
+  gap:         0.25rem;
+  flex-shrink: 0;
+}
+
+.tool-select-icon {
+  font-size:   0.82rem;
+  flex-shrink: 0;
+  opacity:     0.75;
+}
+
+.tool-select {
+  background:  rgba(15, 23, 42, 0.9);
+  border:      1px solid rgba(99, 102, 241, 0.2);
+  color:       #94a3b8;
+  font-size:   0.72rem;
+  padding:     0.25rem 0.55rem;
+  border-radius: 5px;
+  cursor:      pointer;
+  outline:     none;
+  transition:  border-color 0.15s;
+}
+.tool-select:hover  { border-color: rgba(99, 102, 241, 0.45); }
+.tool-select--vibe  { max-width: 165px; }
+
+.tool-num-wrap {
+  display:     flex;
+  align-items: center;
+  gap:         0.25rem;
+}
+
+.tool-num {
+  width:        3.5rem;
+  background:   rgba(15, 23, 42, 0.9);
+  border:       1px solid rgba(99, 102, 241, 0.2);
+  color:        #94a3b8;
+  font-size:    0.72rem;
+  padding:      0.25rem 0.4rem;
+  border-radius: 5px;
+  outline:      none;
+  text-align:   center;
+}
+
+/* ── 购物车指示器 ────────────────────────────────────────────────────────── */
+.cart-indicator {
+  display:     flex;
+  align-items: center;
+  gap:         0.35rem;
+  padding:     0.28rem 0.7rem;
+  border-radius: 20px;
+  background:  rgba(167, 139, 250, 0.1);
+  border:      1px solid rgba(167, 139, 250, 0.32);
+  color:       #c4b5fd;
+  font-size:   0.72rem;
+  white-space: nowrap;
+}
+.cart-indicator strong { color: #a78bfa; }
+
+.cart-pop-enter-active, .cart-pop-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.cart-pop-enter-from, .cart-pop-leave-to       { opacity: 0; transform: scale(0.85); }
+
+/* ── Send button ─────────────────────────────────────────────────────────── */
+.send-btn-wrap {
+  display:        flex;
+  flex-direction: column;
+  align-items:    flex-end;
+  gap:            0.3rem;
+  flex-shrink:    0;
+  margin-left:    auto;
+}
+
+.send-btn {
+  background:    linear-gradient(135deg, #0ea5e9, #6366f1);
+  border:        none;
+  color:         #fff;
+  font-size:     0.82rem;
+  font-weight:   700;
+  padding:       0.45rem 1.4rem;
+  border-radius: 8px;
+  cursor:        pointer;
+  letter-spacing: 0.04em;
+  transition:    opacity 0.2s, box-shadow 0.2s, transform 0.15s;
+  box-shadow:    0 0 16px rgba(99, 102, 241, 0.3);
+  white-space:   nowrap;
+}
+.send-btn:hover:not(:disabled) {
+  box-shadow: 0 0 24px rgba(99, 102, 241, 0.5);
+  transform:  translateY(-1px);
+}
+.send-btn:disabled    { opacity: 0.4; cursor: not-allowed; transform: none; }
+.send-btn--locked     {
+  background: linear-gradient(135deg, #7c3aed, #6366f1) !important;
+  box-shadow: 0 0 14px rgba(167, 139, 250, 0.35) !important;
+}
+
+.auto-mode-hint {
+  font-size:    0.62rem;
+  color:        #7dd3fc;
+  background:   rgba(56, 189, 248, 0.07);
+  border:       1px solid rgba(56, 189, 248, 0.2);
+  border-radius: 4px;
+  padding:      0.18rem 0.55rem;
+  white-space:  nowrap;
+}
+
+.hint-fade-enter-active, .hint-fade-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.hint-fade-enter-from, .hint-fade-leave-to       { opacity: 0; transform: translateY(-4px); }
 </style>

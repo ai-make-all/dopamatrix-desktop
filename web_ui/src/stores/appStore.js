@@ -127,9 +127,24 @@ export const useAppStore = defineStore('app', () => {
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+  /**
+   * 动态流媒体网关 URL 构造器（Dynamic Media Streaming Gateway）
+   *
+   * 替代旧版 StaticFiles 挂载方案。
+   * 判断依据：路径含斜杠（/ 或 \）则视为本地绝对路径，通过网关透传；
+   * 否则原样透传（兼容已经是完整 HTTP URL 的历史数据）。
+   *
+   * 必须使用 encodeURIComponent：Windows 路径中的空格、#、& 等字符
+   * 若不编码会破坏 URL 的查询字符串结构，导致后端解析错误。
+   */
   function buildVideoUrl(filePath) {
     if (!filePath) return ''
-    return `${API_BASE}/api/v1/assets/stream?path=${encodeURIComponent(filePath)}`
+    // 含路径分隔符 → 本地绝对路径，走动态流媒体网关
+    if (filePath.includes('/') || filePath.includes('\\')) {
+      return `${API_BASE}/api/v1/media/preview?path=${encodeURIComponent(filePath)}`
+    }
+    // 无分隔符（如纯文件名或已是 HTTP URL），原样返回
+    return filePath
   }
 
   async function copyToClipboard(text) {

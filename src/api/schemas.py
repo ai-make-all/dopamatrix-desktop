@@ -178,6 +178,9 @@ class LocalAssetCreate(BaseModel):
 class AssetRoleUpdate(BaseModel):
     video_role: str = Field(..., description="枚举: 'hook', 'body', 'general'")
 
+class AssetTagsUpdate(BaseModel):
+    tags: List[str] = Field(..., description="全量覆盖的语义标签数组")
+
 class LocalAssetImportResponse(BaseModel):
     success_count: int
     skipped_count: int
@@ -198,8 +201,161 @@ class LocalAssetResponse(BaseModel):
     usage_count:     int
     tags:            Optional[List[str]] = None
     is_exhausted:    bool
+    is_deleted:      bool = False
     created_at:      datetime
     last_used_at:    Optional[datetime] = None
     business_scopes: Optional[List[str]] = None
     entity_id:       Optional[str] = None
     asset_name:      Optional[str] = None
+
+
+# ================================================================== #
+# Story DSL Schemas  (Phase 4.1 — DSLParserNode 契约)                #
+# ================================================================== #
+
+class DSLBeatNode(BaseModel):
+    """
+    Story DSL 时间轴上的一个 Beat 节点。
+
+    address_mode 决定寻址策略：
+      'locked' → 精确锁定，直接按 asset_hashes 查库；
+                 若同时携带 semantic_tags，则并发查 Y 轴叠加素材。
+      'smart'  → 智能抽卡，按 semantic_tags 匹配并打分，
+                 防疲劳优先选 usage_count 低且未耗尽的素材。
+    """
+    beat:          str            = Field(..., description="Beat 标识符，如 'hook_01'、'body_02'。")
+    role:          str            = Field(..., description="角色标签，如 'hook'、'body'、'cta'。")
+    address_mode:  str            = Field(..., description="寻址模式：'locked' | 'smart'。")
+    asset_hashes:  List[str]      = Field(default_factory=list, description="locked 模式下指定的素材 MD5 哈希列表。")
+    semantic_tags: List[str]      = Field(default_factory=list, description="语义标签列表，用于 smart 模式匹配与 Y 轴叠加查询。")
+
+
+class StoryDSLPayload(BaseModel):
+    """
+    前端提交的 Story DSL 完整载荷。
+    engine_type 区分内容型 ('content') 与 UA 投放型 ('ua') 两类渲染策略。
+    """
+    engine_type: str               = Field(..., description="引擎类型：'content' | 'ua'。")
+    timeline:    List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
+    prompt:      Optional[str]     = Field(None, description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。")
+
+
+# ── DSL 解析结果 Schema ─────────────────────────────────────────── #
+
+class ResolvedLayer(BaseModel):
+    """单个图层（X 轴 / Y 轴）的解析结果。"""
+    layer_index: int             = Field(..., description="图层层级：0 = X轴主视频，1+ = Y轴叠加层。")
+    asset_id:    int             = Field(..., description="LocalAsset 主键 ID。")
+    file_path:   str             = Field(..., description="素材本地绝对路径，直接用于 FFmpeg 指令。")
+    asset_type:  str             = Field(..., description="素材类型：'video' / 'logo' / 'sticker' 等。")
+    file_hash:   str             = Field(..., description="素材 MD5 哈希（溯源 & 防重契约）。")
+    asset_name:  Optional[str]   = Field(None, description="人类可读名称。")
+    matched_tags: List[str]      = Field(default_factory=list, description="实际命中的语义标签。")
+
+
+class BeatCompilationResult(BaseModel):
+    """单个 Beat 节点的编译结果。"""
+    beat:         str                  = Field(..., description="Beat 标识符（原样透传）。")
+    role:         str                  = Field(..., description="角色标签（原样透传）。")
+    address_mode: str                  = Field(..., description="实际使用的寻址模式。")
+    layers:       List[ResolvedLayer]  = Field(default_factory=list, description="已解析的图层列表（按 layer_index 升序）。")
+    resolved:     bool                 = Field(..., description="True = 至少找到一个主轴素材；False = 寻址失败。")
+    warnings:     List[str]            = Field(default_factory=list, description="寻址过程中产生的警告信息。")
+
+
+class CompilationPlanSummary(BaseModel):
+    total_beats:      int
+    resolved_beats:   int
+    unresolved_beats: int
+
+
+class CompilationPlan(BaseModel):
+    """
+    DSLParserNode 输出的渲染蓝图（Dry-run）。
+    前端可用此结构核对寻址结果，确认无误后再触发真实 FFmpeg 渲染流水线。
+    """
+    engine_type:      str                       = Field(..., description="原样透传的引擎类型。")
+    beats:            List[BeatCompilationResult]
+    unresolved_beats: List[str]                 = Field(default_factory=list, description="未能解析的 Beat 标识符列表。")
+    summary:          CompilationPlanSummary
+
+
+# ================================================================== #
+# Render DSL Schemas  (Phase 5.1 — DSL → Timeline → FFmpeg 全链路)   #
+# ================================================================== #
+
+class RenderDSLRequest(BaseModel):
+    """
+    POST /tasks/render-dsl 请求体。
+
+    在 StoryDSLPayload 基础上追加渲染配置字段，
+    供适配器计算节拍时长和 WorkflowContext 初始化使用。
+    """
+    engine_type:     str              = Field(..., description="引擎类型：'content' | 'ua'。")
+    timeline:        List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
+
+    # ── 渲染配置 ─────────────────────────────────────────────────── #
+    session_id:      Optional[str]   = Field(
+        default=None,
+        description="可选：指定 session_id；留空则由引擎自动生成 UUID。",
+    )
+    aspect_ratio:    str             = Field(
+        default="9:16",
+        description="输出画幅比例：'9:16' | '16:9' | '1:1'。",
+    )
+    target_duration: int             = Field(
+        default=15,
+        description="目标视频总时长（秒），用于计算每 Beat 均等时长切分。",
+    )
+    batch_size:      int             = Field(
+        default=1, ge=1, le=20,
+        description="批量裂变数量：同时 dispatch N 个独立渲染任务，每个任务拥有唯一 task_id。",
+    )
+    test_language:   str             = Field(
+        default="en",
+        description="输出语种：'en' | 'ar' | 'zh'，透传至 WorkflowContext.test_language。",
+    )
+    tenant_id:       str             = Field(
+        default="default",
+        description="多租户标识，用于 WS 定向推送隔离。",
+    )
+    prompt:          Optional[str]   = Field(
+        None,
+        description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。",
+    )
+
+
+class RenderDSLAck(BaseModel):
+    """
+    POST /tasks/render-dsl 的即时响应体（202 Accepted）。
+    渲染任务已下发至后台线程，前端通过 WS 事件总线接收进度推送。
+    """
+    status:     str = "processing"
+    session_id: str
+    message:    str = "渲染任务已下发，请通过 WebSocket 事件总线监听进度。"
+
+
+# ================================================================== #
+# Submit-DSL Response  (Phase 5.2 — submit-dsl 全链路升级)           #
+# ================================================================== #
+
+class DSLSubmitResponse(CompilationPlan):
+    """
+    POST /tasks/submit-dsl 升级后的响应体（202 Accepted）。
+
+    继承 CompilationPlan 的全部字段（前端可同时核对寻址蓝图），
+    并追加渲染任务元数据，使前端无需二次请求即可获得 task_id。
+
+    字段说明：
+      task_id       — UUID，与 WorkflowContext.session_id 保持一致，
+                      同时作为 WS 事件的 taskId 和输出文件名后缀。
+      render_status — 任务下发状态（固定为 "rendering"，区别于 HTTP status）。
+      message       — 人类可读的操作说明。
+    """
+    task_id:       str       = Field(..., description="首个任务的 UUID（向后兼容单任务场景）。")
+    task_ids:      List[str] = Field(default_factory=list, description="全部下发任务的 UUID 列表，长度 = batch_size。")
+    render_status: str       = Field(default="rendering", description="后台渲染下发状态。")
+    message:       str       = Field(
+        default="渲染任务已在后台下发，请在输出目录查看或通过 WebSocket 监听进度。",
+        description="人类可读的操作结果说明。",
+    )

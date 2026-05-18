@@ -473,7 +473,9 @@ class FFmpegCompositorNode(BaseNode):
         if not all_assets and os.path.exists(output_path):
             all_assets = [{"file_path": output_path, "file_hash": self._quick_hash(output_path)}]
 
-        if all_assets:
+        # 批量模式（ws_suppress_completed=True）由 render_batch_worker 统一发送最终 completed，
+        # 此处跳过，避免 4 个子任务各自推送 completed 导致卡片反复切换状态。
+        if all_assets and not context.config.get("ws_suppress_completed", False):
             self._ws_broadcast(task_id, user_id, {"status": "completed", "assets": all_assets})
             logger.info(
                 "[FFmpegCompositorNode] ✅ 渲染全部完成，已向事件总线推送 %d 个资产。",

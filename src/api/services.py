@@ -230,7 +230,11 @@ def run_matrix_job(
         if used_asset_ids:
             # 去重
             unique_ids = list(set(used_asset_ids))
-            local_assets = db.query(LocalAsset).filter(LocalAsset.id.in_(unique_ids)).all()
+            local_assets = (
+                db.query(LocalAsset)
+                .filter(LocalAsset.id.in_(unique_ids), LocalAsset.is_deleted.is_(False))
+                .all()
+            )
             for la in local_assets:
                 # 每个 ID 的实际使用次数（因为同一素材在多进程可能被使用多次）
                 usage_increment = used_asset_ids.count(la.id)

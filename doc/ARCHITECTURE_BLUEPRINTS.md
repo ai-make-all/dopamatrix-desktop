@@ -673,3 +673,71 @@ DopaMatrix 作为一款具备互动叙事引擎能力的桌面端 SaaS 软件，
 2. **硬件探测与 P2P 裂变**：后台静默探测硬件。若为高配设备（独显/大内存），提示用户开启“边缘算力网络”。
 3. **白嫖带宽 (WebTorrent)**：利用 P2P 技术，让校园网、局域网内的用户互相作为节点，极速下发 3GB 的 Gemma 4 E2B 权重文件。并以“多巴胺”虚拟积分作为挖矿激励。
 4. **音频扳机与回溯缓存**：彻底放弃极其耗费算力的全时段视觉抓取。利用本地 Gemma 4 监听麦克风高昂情绪（如欢呼、怒吼），触发 Tauri 底层 15 秒滚动缓存（Shadow Buffer）落盘，实现无感高光切片。
+
+## 💡 38. Story DSL 解析器：多态解析与无头 (Headless) 架构
+> **📅 记录时间**: 2026-05-04
+> **🚦 当前状态**: ✅ 架构决策确立
+
+### 【决策背景】
+随着 DopaMatrix 从单一业务（实体商家）向多业务线（游戏买量、短剧）扩张，固定的渲染逻辑已无法满足需求。系统需要一种能够识别商业意图并动态映射渲染算子的能力。
+
+### 【实施策略】
+1. **多态解析 (Polymorphic Parsing)**: 
+   - `DSLParserNode` 采用策略模式，根据 DSL 报文中的 `engine_type` 自动加载对应的指令映射表。
+   - 相同的业务指令（如 `HOOK`）在不同引擎下会映射为不同的 FFmpeg 滤镜链。
+2. **无头 (Headless) 生产模式**: 
+   - 前端 UI 仅作为人工干预入口。系统核心路径设计为支持 `Cloud Brain (GrowthOS) -> Story DSL API -> DSLParserNode` 的直接下发。
+
+## 💡 39. 元数据驱动的 DAM 2.0 与 Y 轴无限扩展
+> **📅 记录时间**: 2026-05-04
+> **🚦 当前状态**: ✅ 架构决策确立
+
+### 【核心原理】
+彻底废弃物理文件夹管理模式，全面转向元数据驱动。通过 `AssetRegistry` 动态注册资产维度（如 VFX、3D 环境、音轨），每一层资产通过标签 (Tags) 与 X 轴叙事节拍实现语义对齐。
+
+### 【自动对齐路径】
+1. **交叉查询 (Cross-Query)**: 解析器在处理特定 Beat（如 `Hook`）时，会并发检索 `asset_type=video` 以及所有 `asset_type=Y轴维度` 且具备相同 Tags 的素材。
+2. **动态拓扑**: 根据检索结果，解析器自动编译 FFmpeg 的 `complex_filter` 拓扑图，将 X 轴作为 Layer 0，Y 轴各维度按属性叠加。
+
+## 💡 40. 数据飞轮驱动的自动造模架构 (Auto-Templating & Code-as-Video)
+
+> **📅 记录时间**: 2026-05-04
+> **✍️ 记录人**: DopaMatrix 核心架构组
+> **🎯 预期版本**: V5.0 (图文 MVP 试水)
+> **🚧 实施门槛**: 【极高】需要确保大模型生成的 HTML/CSS 代码在 Playwright 无头浏览器中具备完美的抗压性与自适应性，并建立严格的沙盒防御机制。
+> **🚦 当前状态**: ✅ 架构决策确立
+
+**【决策背景】**
+依靠人工在编辑器中拖拽占位符制作底模，依然是劳动密集型工作。为了接住 C 端“嘴强鸭”海量的互动发疯需求，系统必须能够根据全网热点梗，实现零人工介入的“模板自生成”。
+
+**【实施策略】**
+1. **MVP 选型：拥抱纯 Web 栈**：
+   放弃首期用 AI 生成复杂的 FFmpeg Filtergraph（视频运镜极易翻车报错）。优先复用 ADR 34 的 Playwright 架构。大模型极其擅长生成 HTML+CSS 结构。
+2. **三步走自动闭环**：
+   - **Step 1 (Vision 拆解)**：大模型提取爆款梗图的 DOM 结构概念。
+   - **Step 2 (Code 生成)**：大模型输出包含 `<div id="slot_image">` 与 `<h1 id="slot_text">` 的纯静态 HTML 模板，并通过内联 CSS 定义视觉。
+   - **Step 3 (Playwright 渲染)**：底层引擎的 `GraphicExecutor` 接收到 C 端用户的填词后，向这个新 HTML 注入数据，截图出片。
+3. **沙盒安全隔离 (Sandbox Security)**：
+   由于底模由 AI 生成（本质是外部代码），系统在用 Playwright 渲染时，必须强制关闭 JavaScript 执行权限 (`javaScriptEnabled: false`)，或剥离任何 `<script>` 标签，彻底杜绝 XSS 注入或内网探测攻击。
+
+## 💡 42. 统一 DSL 解释器与多态渲染分流 (Unified Parser & Polymorphic Dispatch)
+
+> **📅 记录时间**: 2026-05-05
+> **🎯 预期版本**: V5.0 (Phase 16 启动)
+> **🚦 当前状态**: ✅ 架构决策确立
+
+**【决策内容】**
+系统将维持单一的 `DSLParserNode` 作为全局“意图解释中心”，但后端渲染执行层与物理存储层实现彻底解耦。
+
+**【实施细节】**
+1. **中枢解释器 (Unified Parser)**：
+   - `DSLParserNode` 负责解析 Story DSL 的业务语义。它不区分媒体格式，仅负责逻辑编排。
+2. **多态渲染分流 (Dispatching)**：
+   - 解释器解析完意图后，根据 `engine_type` 字段进行分流：
+     - `engine_type: "video"` -> 呼叫 **FFmpegCompositor** (处理视频帧合成)。
+     - `engine_type: "graphic"` -> 呼叫 **PlaywrightCompositor** (处理 HTML/CSS 代码渲染)。
+3. **物理存储隔离 (Folder Separation)**：
+   - 虽然在同一个 Tauri 客户端运行，但本地存储路径强制分离。
+   - 视频项目路径：`Root/@EntityID/video_tasks/{task_id}/`
+   - 图文项目路径：`Root/@EntityID/graphic_tasks/{task_id}/`
+   - 确保资产索引的高效性与 APL 状态机的逻辑纯净。
