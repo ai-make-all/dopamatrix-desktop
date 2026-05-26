@@ -37,10 +37,17 @@ export const useAppStore = defineStore('app', () => {
   // ── Toast ─────────────────────────────────────────────────────────────────
   const toastVisible = ref(false)
   const toastMsg     = ref('')
+  const toastType    = ref('info')   // 'info' | 'success' | 'warn' | 'error'
   let _toastTimer    = null
 
   function showToast(msg, duration = 5000) {
     if (_toastTimer) clearTimeout(_toastTimer)
+    // 自动从消息首字符推断类型，无需调用方手动传参
+    const m = msg.trim()
+    toastType.value =
+      /^[⚠️❌🚫]/.test(m)               ? 'error'   :
+      /^[✅🪄🏷️💎🎉🔥✨🎬]/.test(m) ? 'success' :
+      /^[💡ℹ️🔍]/.test(m)               ? 'info'    : 'warn'
     toastMsg.value     = msg
     toastVisible.value = true
     _toastTimer = setTimeout(() => { toastVisible.value = false }, duration)
@@ -168,7 +175,7 @@ export const useAppStore = defineStore('app', () => {
     isLoggedIn, loggedInUser,
     initAuth, handleLogin, handleLogout,
     // Toast
-    toastVisible, toastMsg, showToast,
+    toastVisible, toastMsg, toastType, showToast,
     // Feed
     feedItems,
     clearPollTimer, startGlobalPolling,

@@ -138,7 +138,8 @@ function onOpenDetail(hash: string) {
   emit('open-detail', hash)
 }
 
-// ── 压力测试（保留）──────────────────────────────────────────────────────────
+// ── 压力测试（调试时取消注释）────────────────────────────────────────────────
+/*
 const isStressTesting  = ref(false)
 const isRealWsFlooding = ref(false)
 
@@ -197,6 +198,7 @@ const triggerRealWsFlood = async () => {
     isRealWsFlooding.value = false
   }
 }
+*/
 </script>
 
 <template>
@@ -204,40 +206,37 @@ const triggerRealWsFlood = async () => {
 
     <!-- ══ StatsHeader ════════════════════════════════════════════════════════ -->
     <header class="stats-header">
-      <div class="stat-item">
-        <span class="stat-label">⏳ 预计剩余</span>
-        <span class="stat-value stat-eta">{{ etaDisplay }}</span>
-      </div>
-      <div class="stat-divider" />
-      <div class="stat-item">
-        <span class="stat-label">📋 排队</span>
-        <span class="stat-value">{{ queueStore.stats.totalPending }}</span>
-      </div>
-      <div class="stat-item">
-        <span class="stat-label">⚡ 生成中</span>
-        <span class="stat-value stat-running">{{ queueStore.stats.totalRunning }}</span>
-      </div>
-      <div class="stat-item">
-        <span class="stat-label">✓ 完成</span>
-        <span class="stat-value stat-done">{{ queueStore.stats.totalCompleted }}</span>
-      </div>
-      <div class="stat-item">
-        <span class="stat-label">✕ 失败</span>
-        <span class="stat-value stat-fail">{{ queueStore.stats.totalFailed }}</span>
+      <div class="stats-row">
+        <div class="stat-item">
+          <span class="stat-label">⏳ 预计剩余</span>
+          <span class="stat-value stat-eta">{{ etaDisplay }}</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">📋 排队</span>
+          <span class="stat-value">{{ queueStore.stats.totalPending }}</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">⚡ 生成中</span>
+          <span class="stat-value stat-running">{{ queueStore.stats.totalRunning }}</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">✓ 完成</span>
+          <span class="stat-value stat-done">{{ queueStore.stats.totalCompleted }}</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">✕ 失败</span>
+          <span class="stat-value stat-fail">{{ queueStore.stats.totalFailed }}</span>
+        </div>
       </div>
 
-      <button
-        @click="runStressTest"
-        :disabled="isStressTesting"
-        class="debug-btn debug-btn--red"
-      >{{ isStressTesting ? '🌋 压测中...' : '🚀 注入 500 任务' }}</button>
-
-      <button
-        @click="triggerRealWsFlood"
-        :disabled="isRealWsFlooding"
-        class="debug-btn debug-btn--blue"
-        :style="isRealWsFlooding ? { opacity: '0.6', cursor: 'not-allowed' } : {}"
-      >{{ isRealWsFlooding ? '🌊 WS 压测中...' : '🌊 WS 真实压测' }}</button>
+      <!-- 调试压测按钮（需要时取消注释，并恢复 script 中对应逻辑）
+      <button @click="runStressTest" :disabled="isStressTesting" class="debug-btn debug-btn--red">
+        {{ isStressTesting ? '🌋 压测中...' : '🚀 注入 500 任务' }}
+      </button>
+      <button @click="triggerRealWsFlood" :disabled="isRealWsFlooding" class="debug-btn debug-btn--blue">
+        {{ isRealWsFlooding ? '🌊 WS 压测中...' : '🌊 WS 真实压测' }}
+      </button>
+      -->
 
       <div class="progress-track">
         <div
@@ -387,7 +386,10 @@ const triggerRealWsFlood = async () => {
 
           <!-- ══ ROW 3: 资产轮播（1:1 强制比例横向轮播）══ -->
           <template v-if="item.assets?.length">
-            <div class="row-carousel">
+            <div
+              class="row-carousel"
+              :class="{ 'row-carousel--few': item.assets.length <= PAGE_SIZE }"
+            >
               <!-- 左翻页 -->
               <button
                 class="carousel-arrow carousel-arrow--left"
@@ -403,13 +405,17 @@ const triggerRealWsFlood = async () => {
               </button>
 
               <!-- 轮播视口 -->
-              <div class="carousel-viewport">
+              <div
+                class="carousel-viewport"
+                :class="{ 'carousel-viewport--few': item.assets.length <= PAGE_SIZE }"
+              >
                 <div
                   v-for="(asset, localIdx) in getVisibleAssets(item)"
                   :key="asset.file_hash || localIdx"
                   :class="[
                     'carousel-cell',
-                    { 'carousel-cell--active': getGlobalIdx(item, localIdx) === getCarousel(item.id).activeIdx }
+                    { 'carousel-cell--active': getGlobalIdx(item, localIdx) === getCarousel(item.id).activeIdx },
+                    { 'carousel-cell--fixed': item.assets.length <= PAGE_SIZE },
                   ]"
                   @click.stop="openModal(item, getGlobalIdx(item, localIdx))"
                 >
@@ -488,21 +494,29 @@ const triggerRealWsFlood = async () => {
   top:             0;
   z-index:         10;
   display:         flex;
-  align-items:     center;
-  gap:             1.1rem;
-  flex-wrap:       wrap;
+  flex-direction:  column;
+  align-items:     stretch;
+  gap:             0.45rem;
   padding:         0.65rem 1.25rem;
   background:      rgba(15, 23, 42, 0.94);
   backdrop-filter: blur(12px);
   border-bottom:   1px solid rgba(148, 163, 184, 0.1);
   flex-shrink:     0;
 }
+.stats-row {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  width:           100%;
+  gap:             0.5rem;
+}
 .stat-item {
   display:        flex;
   flex-direction: column;
   align-items:    center;
   gap:            0.1rem;
-  min-width:      3rem;
+  flex:           1 1 0;
+  min-width:      0;
 }
 .stat-label { font-size: 0.62rem; color: #64748b; white-space: nowrap; font-weight: 500; }
 .stat-value { font-size: 1.1rem; font-weight: 700; color: #e2e8f0; line-height: 1; }
@@ -510,10 +524,9 @@ const triggerRealWsFlood = async () => {
 .stat-running { color: #facc15; }
 .stat-done    { color: #4ade80; }
 .stat-fail    { color: #f87171; }
-.stat-divider { width: 1px; height: 2rem; background: rgba(148, 163, 184, 0.15); flex-shrink: 0; }
 .progress-track {
-  flex: 1 1 100%; height: 3px; background: rgba(148, 163, 184, 0.1);
-  border-radius: 2px; overflow: hidden; margin-top: 0.2rem;
+  width: 100%; height: 3px; background: rgba(148, 163, 184, 0.1);
+  border-radius: 2px; overflow: hidden;
 }
 .progress-fill {
   height: 100%; background: linear-gradient(90deg, #38bdf8, #818cf8);
@@ -898,6 +911,13 @@ const triggerRealWsFlood = async () => {
   height:   100%;
   overflow: hidden;
 }
+.carousel-viewport--few {
+  flex:            0 0 auto;
+  justify-content: flex-start;
+}
+.row-carousel--few {
+  justify-content: flex-start;
+}
 .carousel-cell {
   flex:     1 1 0;
   position: relative;
@@ -908,6 +928,12 @@ const triggerRealWsFlood = async () => {
   transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
   aspect-ratio: 1 / 1;
   background: #000;
+}
+.carousel-cell--fixed {
+  flex:       0 0 auto;
+  width:      120px;
+  height:     120px;
+  max-width:  120px;
 }
 .carousel-cell:hover { transform: scale(1.03); border-color: rgba(99, 102, 241, 0.5); }
 .carousel-cell--active {

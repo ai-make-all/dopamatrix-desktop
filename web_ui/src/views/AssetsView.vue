@@ -4,7 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import axios from 'axios'
 import AudioAssetCard from '../components/AudioAssetCard.vue'
 import { useAppStore } from '../stores/appStore'
-import { parseFacetedTags, getVisiblePills } from '../utils/tagParser.js'
+import { parseFacetedTags, getVisiblePills, getTagPillParts } from '../utils/tagParser.js'
 
 const store = useAppStore()
 
@@ -641,7 +641,7 @@ async function restoreAsset(item) {
                     <span v-if="selectedIds.includes(item.id)">✓</span>
                   </div>
                 </div>
-                <AudioAssetCard :item="item" :api-base="store.API_BASE" @emotion-change="updateAudioEmotion" />
+                <AudioAssetCard :item="item" :api-base="store.API_BASE" @open-tag-modal="openTagModal" />
               </div>
             </div>
 
@@ -1803,6 +1803,15 @@ async function restoreAsset(item) {
 }
 
 /* 分组标签样式见全局 style.css — .facet-label-* */
+
+/* ── Grid 卡片分面胶囊容器（Step 4: 统一标签展示区） ─────── */
+.asset-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+  overflow: hidden;
+  margin-top: 0.3rem;
+}
 
 /* ── 列表模式：折叠为单行紧凑流，隐藏分组标签 ─────────────── */
 .assets-list .facet-tag-matrix {

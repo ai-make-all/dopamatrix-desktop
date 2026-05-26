@@ -106,13 +106,20 @@ class BaseLLMProvider(ABC):
     """
 
     @abstractmethod
-    def generate_script(self, prompt: str, system_prompt: str) -> dict:
+    def generate_script(
+        self,
+        prompt: str,
+        system_prompt: str,
+        *,
+        temperature: float | None = None,
+    ) -> dict:
         """
         向 LLM 发送请求并返回结构化结果。
 
         Args:
             prompt:        用户指令（Human Turn）
             system_prompt: 系统提示词（角色 + 输出格式约束）
+            temperature:   采样温度；None 时由实现类使用默认值（通常为 0.7）。
 
         Returns:
             解析后的 Python dict（LLM 返回的 JSON 内容）
@@ -156,7 +163,13 @@ class OpenAIProvider(BaseLLMProvider):
         self._base_url = base_url or os.getenv("OPENAI_BASE_URL") or None
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
 
-    def generate_script(self, prompt: str, system_prompt: str) -> dict:
+    def generate_script(
+        self,
+        prompt: str,
+        system_prompt: str,
+        *,
+        temperature: float | None = None,
+    ) -> dict:
         """
         每次调用前从字典缓存（冷路径穿透 SQLite）读取 openai_api_key，
         构造临时客户端发起请求。
@@ -178,6 +191,7 @@ class OpenAIProvider(BaseLLMProvider):
         # 每次构造新客户端，确保使用数据库中的最新 Key
         client = openai.OpenAI(api_key=api_key, base_url=self._base_url)
 
+        temp = 0.7 if temperature is None else float(temperature)
         try:
             response = client.chat.completions.create(
                 model=self.model,
@@ -186,7 +200,7 @@ class OpenAIProvider(BaseLLMProvider):
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": prompt},
                 ],
-                temperature=0.7,
+                temperature=temp,
             )
         except openai.OpenAIError as e:
             raise RuntimeError(f"[OpenAIProvider] API call failed: {e}") from e

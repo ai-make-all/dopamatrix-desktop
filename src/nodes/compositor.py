@@ -522,6 +522,10 @@ class FFmpegCompositorNode(BaseNode):
         timeline: Timeline = context.get_asset("timeline")
         audio_tracks = timeline.audio_tracks if timeline else []
 
+        # 从 context.config 读取管线开关（render_worker 已注入，默认保守兜底为 True）
+        _enable_tts       = context.config.get("enable_tts", True)
+        _enable_subtitles = context.config.get("enable_subtitles", True)
+
         for lang, assets in context.variants.items():
             ass_path: str = assets.get("subtitle_ass", "")
             voice_path: str = assets.get("voice_audio", "")
@@ -531,6 +535,20 @@ class FFmpegCompositorNode(BaseNode):
 
             has_sub   = bool(ass_path   and os.path.exists(ass_path))
             has_voice = bool(voice_path and os.path.exists(voice_path))
+
+            # ── 管线开关硬截断：即使文件存在也强制旁路 ────────────────────
+            if not _enable_tts and has_voice:
+                self.log(
+                    f"[{lang}] enable_tts=False：强制旁路配音轨，"
+                    "从 FFmpeg 命令中裁剪 voice 输入与 amix 混音"
+                )
+                has_voice = False
+            if not _enable_subtitles and has_sub:
+                self.log(
+                    f"[{lang}] enable_subtitles=False：强制旁路字幕轨，"
+                    "跳过 subtitles=... 滤镜，防止 FFmpeg 找不到 .ass 文件崩溃"
+                )
+                has_sub = False
 
             if not has_sub:
                 self.log(f"[{lang}] No subtitle file — video track will be raw copy.")

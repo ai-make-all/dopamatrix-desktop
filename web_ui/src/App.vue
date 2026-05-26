@@ -29,14 +29,24 @@ function handleLogout() {
   <!-- ── APP SHELL ── -->
   <template v-if="store.isLoggedIn">
 
-    <!-- Global Toast -->
-    <Transition name="toast">
-      <div v-if="store.toastVisible" class="toast-wrap" role="alert">
-        <span style="font-size:1.1rem;flex-shrink:0">⚠️</span>
-        <p class="toast-msg">{{ store.toastMsg }}</p>
-        <button @click="store.toastVisible = false" class="toast-close">✕</button>
-      </div>
-    </Transition>
+    <!-- Global Toast — Teleported to body to guarantee it paints above ALL Drawer overlays -->
+    <Teleport to="body">
+      <Transition name="toast">
+        <div
+          v-if="store.toastVisible"
+          :class="['toast-wrap', `toast-wrap--${store.toastType}`]"
+          role="alert"
+        >
+          <span class="toast-icon" aria-hidden="true">{{
+            store.toastType === 'success' ? '✅' :
+            store.toastType === 'error'   ? '❌' :
+            store.toastType === 'info'    ? '💡' : '⚠️'
+          }}</span>
+          <p class="toast-msg">{{ store.toastMsg }}</p>
+          <button @click="store.toastVisible = false" class="toast-close" aria-label="关闭">✕</button>
+        </div>
+      </Transition>
+    </Teleport>
 
     <div class="app-shell">
 
@@ -586,29 +596,72 @@ function handleLogout() {
   to   { opacity:0; transform: translateX(-20px); }
 }
 
+/* ─── Global Toast ────────────────────────────────────────────────────────
+   position: fixed + Teleport to body → beats every Drawer / Modal overlay.
+   z-index: 99999 ensures it is above DslOrchestratorDrawer (z-index ≤ 3001)
+   and any future UI layer.
+──────────────────────────────────────────────────────────────────────────── */
 .toast-wrap {
-  position: fixed; top: 1.25rem; left: 50%; transform: translateX(-50%);
-  z-index: 9999; max-width: 480px; width: calc(100vw - 2rem);
-  display: flex; align-items: flex-start; gap: .75rem;
-  background: rgba(15,8,8,.92);
-  border: 1px solid rgba(239,68,68,.45);
-  box-shadow: 0 0 24px rgba(239,68,68,.18), 0 4px 20px rgba(0,0,0,.5);
-  backdrop-filter: blur(12px);
-  border-radius: .75rem; padding: .85rem 1rem;
+  position:        fixed;
+  top:             2rem;
+  left:            50%;
+  transform:       translateX(-50%);
+  z-index:         99999;          /* nuclear option — above everything */
+  max-width:       520px;
+  width:           calc(100vw - 2rem);
+  display:         flex;
+  align-items:     flex-start;
+  gap:             .75rem;
+  background:      rgba(10, 14, 30, 0.94);
+  border:          1px solid rgba(99, 102, 241, 0.4);
+  box-shadow:      0 0 0 1px rgba(99,102,241,.12),
+                   0 8px 32px rgba(0, 0, 0, 0.55),
+                   0 0 24px rgba(99,102,241,.12);
+  backdrop-filter: blur(14px);
+  border-radius:   .85rem;
+  padding:         .85rem 1rem;
+  pointer-events:  auto;
 }
-.toast-msg   { flex:1; font-size:.78rem; line-height:1.5; color:#fca5a5; word-break:break-all; margin:0; }
-.toast-close { flex-shrink:0; background:none; border:none; cursor:pointer; color:#f87171; font-size:1rem; padding:.1rem .2rem; }
 
-.toast-enter-active { animation: toastIn .28s cubic-bezier(.22,1,.36,1); }
+/* per-type border/glow theming */
+.toast-wrap--success {
+  border-color: rgba(16, 185, 129, 0.5);
+  box-shadow:   0 0 0 1px rgba(16,185,129,.1),
+                0 8px 32px rgba(0,0,0,.55),
+                0 0 20px rgba(16,185,129,.14);
+}
+.toast-wrap--error {
+  border-color: rgba(239, 68, 68, 0.5);
+  box-shadow:   0 0 0 1px rgba(239,68,68,.1),
+                0 8px 32px rgba(0,0,0,.55),
+                0 0 20px rgba(239,68,68,.14);
+}
+.toast-wrap--warn {
+  border-color: rgba(245, 158, 11, 0.5);
+  box-shadow:   0 0 0 1px rgba(245,158,11,.1),
+                0 8px 32px rgba(0,0,0,.55),
+                0 0 20px rgba(245,158,11,.12);
+}
+
+.toast-icon  { font-size:1.1rem; flex-shrink:0; line-height:1.4; }
+.toast-msg   { flex:1; font-size:.8rem; line-height:1.55; color:#e2e8f0; word-break:break-word; margin:0; }
+.toast-close {
+  flex-shrink: 0; background: none; border: none; cursor: pointer;
+  color: #475569; font-size: 1rem; padding: .1rem .25rem;
+  border-radius: 4px; transition: color .15s, background .15s;
+}
+.toast-close:hover { color: #94a3b8; background: rgba(255,255,255,0.06); }
+
+.toast-enter-active { animation: toastIn  .3s cubic-bezier(.22,1,.36,1); }
 .toast-leave-active { animation: toastOut .22s ease-in forwards; }
 
-@keyframes toastIn  {
-  from { opacity:0; transform: translateX(-50%) translateY(-14px) scale(.97); }
-  to   { opacity:1; transform: translateX(-50%) translateY(0) scale(1); }
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(-16px) scale(.96); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0)     scale(1);   }
 }
 @keyframes toastOut {
-  from { opacity:1; transform: translateX(-50%) translateY(0) scale(1); }
-  to   { opacity:0; transform: translateX(-50%) translateY(-8px) scale(.97); }
+  from { opacity: 1; transform: translateX(-50%) translateY(0)    scale(1);   }
+  to   { opacity: 0; transform: translateX(-50%) translateY(-10px) scale(.97); }
 }
 
 .spin { animation: spin .9s linear infinite; }

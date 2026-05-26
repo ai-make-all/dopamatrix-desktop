@@ -1,19 +1,25 @@
 <script setup>
-import { ref, computed, watch, reactive } from 'vue'
+import { ref, computed, watch, reactive, nextTick } from 'vue'
 import draggable from 'vuedraggable'
 import axios from 'axios'
 import { getTagPillParts, parseFacetedTags } from '../utils/tagParser.js'
 
 // ── Props & Emits ────────────────────────────────────────────────────────────
 const props = defineProps({
-  modelValue:      { type: Boolean,  default: false },
-  dbAssetList:     { type: Array,    default: () => [] },
-  dslTracks:       { type: Array,    default: () => [] },
-  templates:       { type: Object,   required: true },
-  currentTemplate: { type: String,   default: 'content' },
-  buildVideoUrl:   { type: Function, required: true },
-  apiBase:         { type: String,   required: true },
-  showToast:       { type: Function, default: () => {} },
+  modelValue:             { type: Boolean,  default: false },
+  dbAssetList:            { type: Array,    default: () => [] },
+  dslTracks:              { type: Array,    default: () => [] },
+  templates:              { type: Object,   required: true },
+  currentTemplate:        { type: String,   default: 'content' },
+  buildVideoUrl:          { type: Function, required: true },
+  apiBase:                { type: String,   required: true },
+  showToast:              { type: Function, default: () => {} },
+  scriptData:             { type: Object,   default: null },
+  defaultBatchSize:       { type: Number,   default: 1 },
+  defaultAspectRatio:     { type: String,   default: '9:16' },
+  defaultLanguage:        { type: String,   default: 'en' },
+  defaultEnableTts:       { type: Boolean,  default: true },
+  defaultEnableSubtitles: { type: Boolean,  default: true },
 })
 
 const emit = defineEmits(['update:modelValue', 'confirm'])
@@ -29,6 +35,9 @@ const ASSET_TYPE_REGISTRY = [
   { type: 'scene_master', label: '底模',  icon: '🏛️' },
 ]
 
+/** 结构化打标 Popover 的前缀分面枚举（与 DAM 标准分面对齐） */
+const FACET_PREFIXES = ['hook', 'context', 'build', 'vibe', 'entity', 'vfx', 'bgm', 'sfx']
+
 /** parseFacetedTags 的 theme → 抽屉既有 orch-* 色键（仅 UI，与 DAM 解析无关） */
 const FACET_THEME_COLOR = {
   hook: 'purple',
@@ -40,17 +49,40 @@ const FACET_THEME_COLOR = {
 }
 
 // ── Local editor state ───────────────────────────────────────────────────────
-const localTracks     = ref([])
-const localTemplate   = ref('content')
-const leftTab         = ref('assets')
+const localTracks       = ref([])
+const localTemplate     = ref('content')
+const localScriptData   = ref(null)
+const showScriptSidebar = ref(true)
+const leftTab           = ref('assets')
 const assetSearch     = ref('')
 const activeTag       = ref(null)
 const assetTypeFilter = ref('video')
+
+// ── 战术舱局部渲染参数（继承全局默认，抽屉内独立覆盖）────────────────────
+const localParams = reactive({
+  batchSize:       1,
+  aspectRatio:     '9:16',
+  language:        'en',
+  enableTts:       true,
+  enableSubtitles: true,
+})
 
 // Dry-run preview
 const isPreviewLoading = ref(false)
 const previewData      = ref(null)
 const showPreviewModal = ref(false)
+
+// ── 行内快捷打标 Popover ──────────────────────────────────────────────────────
+const tagPopover = reactive({
+  open:      false,
+  elementId: null,
+  prefix:    'hook',
+  value:     '',
+  top:       0,
+  left:      0,
+})
+const tagPopoverInputRef = ref(null)
+watch(() => tagPopover.open, v => { if (v) nextTick(() => tagPopoverInputRef.value?.focus()) })
 
 // ── Phase 8.7：底模母槽 (Master Track) 状态 ─────────────────────────────────
 // masterDropList: 母槽 draggable 数组，最多容纳 1 个 scene_master 克隆
@@ -74,15 +106,23 @@ function getSlotTheme(slotKey) {
 // ── Sync on open ─────────────────────────────────────────────────────────────
 watch(() => props.modelValue, (opened) => {
   if (!opened) return
-  localTracks.value     = JSON.parse(JSON.stringify(props.dslTracks))
-  localTemplate.value   = props.currentTemplate
-  leftTab.value         = 'assets'
+  localTracks.value       = JSON.parse(JSON.stringify(props.dslTracks))
+  localTemplate.value     = props.currentTemplate
+  localScriptData.value   = props.scriptData ? JSON.parse(JSON.stringify(props.scriptData)) : null
+  showScriptSidebar.value = true
+  leftTab.value           = 'assets'
   assetSearch.value     = ''
   activeTag.value       = null
   assetTypeFilter.value = 'video'
   // 重置底模母槽
   masterDropList.value = []
   for (const k in slotItemsMap) delete slotItemsMap[k]
+  // 继承最新全局渲染参数到局部状态
+  localParams.batchSize       = props.defaultBatchSize
+  localParams.aspectRatio     = props.defaultAspectRatio
+  localParams.language        = props.defaultLanguage
+  localParams.enableTts       = props.defaultEnableTts
+  localParams.enableSubtitles = props.defaultEnableSubtitles
 })
 
 // Re-init tracks when template switches inside the drawer
@@ -212,6 +252,110 @@ function unbindSlot(slotKey) {
   if (slotItemsMap[slotKey]) slotItemsMap[slotKey] = []
 }
 
+// ── 行内快捷打标 Popover 操作 ─────────────────────────────────────────────────
+function openTagPopover(track, element, evt) {
+  const rect  = evt.currentTarget.getBoundingClientRect()
+  const popH  = 108
+  const top   = rect.bottom + 6 + popH > window.innerHeight
+    ? rect.top - popH - 6
+    : rect.bottom + 6
+  tagPopover.open      = true
+  tagPopover.elementId = element.id
+  tagPopover.prefix    = track.role || FACET_PREFIXES[0]
+  tagPopover.value     = ''
+  tagPopover.top       = top
+  tagPopover.left      = Math.min(rect.left, window.innerWidth - 290)
+}
+
+async function submitTagPopover() {
+  const raw = tagPopover.value.trim()
+  if (!raw) return
+  const tag = `${tagPopover.prefix}:${raw}`
+  try {
+    const resp = await axios.patch(
+      `${props.apiBase}/api/v1/assets/${tagPopover.elementId}/append-tags`,
+      { tags: [tag] }
+    )
+    const updatedAsset = resp.data
+    const target = props.dbAssetList.find(a => a.id === tagPopover.elementId)
+    if (target) target.tags = updatedAsset.tags
+    props.showToast(`🏷️ 已打标：@${tag}`)
+    tagPopover.open = false
+  } catch (err) {
+    const detail = err.response?.data?.detail ?? err.message ?? '未知错误'
+    props.showToast(`⚠️ 打标失败：${detail}`)
+  }
+}
+
+function closeTagPopover() { tagPopover.open = false }
+
+// ── Drop-to-Tag：拖拽即继承轨道基因标签（含幂等性前置拦截）─────────────────
+async function onTrackChange(track, evt) {
+  console.log('🚀 [拖拽事件触发] track.id:', track.id, '| track.role:', track.role, '| event keys:', Object.keys(evt))
+
+  if (!evt.added) {
+    console.log('ℹ️ [非 added 事件，跳过] event:', evt)
+    return
+  }
+
+  const element = evt.added.element
+  console.log('📦 [素材放入] added.element:', element)
+  console.log('   track.items 当前快照:', track.items.map(i => ({ type: i.type, tag: i.tag, id: i.id })))
+
+  // 仅对物理素材触发基因注入（排除 semantic_tag 胶囊本身）
+  if (!element.id || element.type === 'semantic_tag') {
+    console.log('⏭️ [跳过] element 无 id 或本身是 semantic_tag，element.type:', element.type)
+    return
+  }
+
+  // 嗅探轨道基因：收集轨道内所有 semantic_tag 胶囊的 tag 字符串
+  const trackTags = track.items
+    .filter(i => i.type === 'semantic_tag')
+    .map(i => i.tag)
+    .filter(Boolean)
+
+  console.log('🧬 [轨道标签基因]', trackTags.length > 0 ? trackTags : '（空）— 轨道内无 semantic_tag 胶囊')
+
+  if (trackTags.length === 0) {
+    console.warn('⚠️ [智能继承中止] 轨道内未发现任何标签胶囊！请先将标签胶囊拖入此轨道。')
+    return
+  }
+
+  // 幂等性前置拦截：从 dbAssetList 读取素材最新标签，计算缺失集
+  const liveAsset   = props.dbAssetList.find(a => a.id === element.id)
+  const existingSet = new Set(liveAsset?.tags || [])
+  const missingTags = trackTags.filter(t => !existingSet.has(t))
+
+  console.log('🔍 [幂等性校验] 素材现有 tags:', [...existingSet], '| 缺失 tags:', missingTags)
+
+  if (missingTags.length === 0) {
+    console.log('✅ [基因共鸣] 素材已完全具备轨道标签，无需注入')
+    props.showToast('💡 基因共鸣：素材已具备该轨道标签属性，完美匹配！')
+    return
+  }
+
+  console.log('📡 [准备发送 API] 继承标签:', missingTags)
+
+  // 仅将缺失的 tags 投递给后端
+  try {
+    const resp = await axios.patch(
+      `${props.apiBase}/api/v1/assets/${element.id}/append-tags`,
+      { tags: missingTags }
+    )
+    const updatedAsset = resp.data
+    console.log('✅ [API 成功] 更新后的 tags:', updatedAsset.tags)
+
+    // 状态同步：原位更新 dbAssetList，触发左侧卡片重渲染
+    if (liveAsset) liveAsset.tags = updatedAsset.tags
+
+    props.showToast('🪄 智能继承：素材已自动补全轨道标签！')
+  } catch (err) {
+    console.error('❌ [API 失败]', err)
+    const detail = err.response?.data?.detail ?? err.message ?? '未知错误'
+    props.showToast(`⚠️ 标签继承失败：${detail}`)
+  }
+}
+
 // ── DSL Dry-run preview ───────────────────────────────────────────────────────
 async function runPreview() {
   const active = localTracks.value.filter(t => t.items.length > 0)
@@ -251,7 +395,7 @@ async function runPreview() {
 }
 
 // ── Confirm / Cancel ──────────────────────────────────────────────────────────
-function handleConfirm() {
+function handleConfirm(directRender = false) {
   const masterItem = masterDropList.value[0] ?? null
   // 精准指纹回传：底模 ID + 各插槽绑定的 File Hash
   const masterTrackPlan = masterItem ? {
@@ -272,6 +416,9 @@ function handleConfirm() {
     tracks:       JSON.parse(JSON.stringify(localTracks.value)),
     template:     localTemplate.value,
     master_track: masterTrackPlan,
+    script_data:  localScriptData.value,
+    directRender,
+    params: { ...localParams },
   })
   emit('update:modelValue', false)
 }
@@ -326,17 +473,77 @@ function handleCancel() {
               title="清空所有轨道"
             >✕ 清空</button>
 
+            <button
+              v-if="localScriptData"
+              class="orch-btn orch-btn--sidebar-toggle"
+              :title="showScriptSidebar ? '收起台词本' : '展开台词本'"
+              @click="showScriptSidebar = !showScriptSidebar"
+            >{{ showScriptSidebar ? '📝 收起台词本' : '📝 展开台词本' }}</button>
+
             <button class="orch-btn orch-btn--cancel" @click="handleCancel">取消</button>
 
-            <button class="orch-btn orch-btn--confirm" @click="handleConfirm">
-              ✓ 确认装填
-              <span v-if="totalStaged > 0" class="orch-confirm-count">{{ totalStaged }}</span>
+            <button class="orch-btn orch-btn--ghost" @click="handleConfirm(false)">✓ 仅装填</button>
+
+            <button v-if="localScriptData" class="orch-btn orch-btn--confirm" @click="handleConfirm(true)">
+              🚀 确认并直接渲染
             </button>
           </div>
         </div>
 
+        <!-- Cockpit Panel ──────────────────────────────────────────────────── -->
+        <div class="cockpit-panel">
+          <div class="cockpit-item">
+            <span class="cockpit-label">🔢 数量</span>
+            <input
+              v-model.number="localParams.batchSize"
+              type="number" min="1" max="20"
+              class="cockpit-input cockpit-num"
+              title="批量生成数量"
+            />
+          </div>
+          <div class="cockpit-sep" />
+          <div class="cockpit-item">
+            <span class="cockpit-label">📐 画幅</span>
+            <select v-model="localParams.aspectRatio" class="cockpit-select">
+              <option value="9:16">9:16 竖屏</option>
+              <option value="16:9">16:9 横屏</option>
+              <option value="1:1">1:1 方形</option>
+            </select>
+          </div>
+          <div class="cockpit-sep" />
+          <div class="cockpit-item">
+            <span class="cockpit-label">🌐 语种</span>
+            <select v-model="localParams.language" class="cockpit-select">
+              <option value="en">EN 英语</option>
+              <option value="ar">AR 阿语</option>
+              <option value="zh">ZH 中文</option>
+            </select>
+          </div>
+          <div class="cockpit-sep" />
+          <button
+            class="cockpit-toggle"
+            :class="{ 'cockpit-toggle--on': localParams.enableTts }"
+            :title="localParams.enableTts ? 'AI 语音已开启（点击关闭）' : 'AI 语音已关闭（点击开启）'"
+            @click="localParams.enableTts = !localParams.enableTts"
+          >
+            🎙️ <span class="cockpit-toggle-label">语音</span>
+            <span class="cockpit-dot" :class="localParams.enableTts ? 'cockpit-dot--on' : 'cockpit-dot--off'" />
+          </button>
+          <button
+            class="cockpit-toggle"
+            :class="{ 'cockpit-toggle--on': localParams.enableSubtitles }"
+            :title="localParams.enableSubtitles ? '字幕已开启（点击关闭）' : '字幕已关闭（点击开启）'"
+            @click="localParams.enableSubtitles = !localParams.enableSubtitles"
+          >
+            📝 <span class="cockpit-toggle-label">字幕</span>
+            <span class="cockpit-dot" :class="localParams.enableSubtitles ? 'cockpit-dot--on' : 'cockpit-dot--off'" />
+          </button>
+        </div>
+
         <!-- Body ────────────────────────────────────────────────────────────── -->
         <div class="orch-body">
+          <div class="orch-layout">
+          <div class="orch-main">
 
           <!-- ════ 上半部分：弹药仓库 ════════════════════════════════════════ -->
           <div class="orch-warehouse">
@@ -652,6 +859,7 @@ function handleCancel() {
                       :force-fallback="true"
                       class="orch-track-drop"
                       :class="{ 'orch-track-drop--filled': track.items.length > 0 }"
+                      @change="evt => onTrackChange(track, evt)"
                     >
                       <template #item="{ element }">
                         <div
@@ -687,6 +895,12 @@ function handleCancel() {
                           </template>
                           <span v-else class="orch-block-name">{{ element.name }}</span>
                           <button
+                            v-if="element.type !== 'semantic_tag'"
+                            class="orch-block-tag-btn"
+                            @click.stop="openTagPopover(track, element, $event)"
+                            title="快捷打标"
+                          >🏷️</button>
+                          <button
                             class="orch-block-remove"
                             @click.stop="removeBlock(track, element.uuid)"
                             title="移除"
@@ -706,6 +920,24 @@ function handleCancel() {
             </div>
           </div>
 
+          </div><!-- /.orch-main -->
+
+          <!-- ════ 右侧 AI 台词本边栏 ════════════════════════════════════════ -->
+          <div v-if="localScriptData && showScriptSidebar" class="orch-script-sidebar">
+            <div class="script-header">📝 AI 智能台词本</div>
+            <div class="script-scroll">
+              <div v-for="(scene, idx) in localScriptData.scenes" :key="idx" class="script-scene-card">
+                <div class="scene-meta">镜头 {{ idx + 1 }} · {{ scene.duration }}s</div>
+                <div class="scene-vp" :title="scene.visual_prompt">{{ scene.visual_prompt }}</div>
+                <div v-for="(text, lang) in scene.narrations" :key="lang" class="scene-lang-group">
+                  <span class="lang-badge">{{ lang }}</span>
+                  <textarea v-model="scene.narrations[lang]" rows="3" class="scene-textarea" title="可直接修改配音文案"></textarea>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          </div><!-- /.orch-layout -->
         </div>
 
         <!-- ── DSL 蓝图调试弹窗 ──────────────────────────────────────────────── -->
@@ -743,6 +975,43 @@ function handleCancel() {
     </Transition>
 
   </Teleport>
+
+  <!-- ── 行内快捷打标 Popover ─────────────────────────────────────────────── -->
+  <Teleport to="body">
+    <div
+      v-if="tagPopover.open"
+      class="tag-popover-backdrop"
+      @click.self="closeTagPopover"
+    >
+      <div
+        class="tag-popover"
+        :style="{ top: tagPopover.top + 'px', left: tagPopover.left + 'px' }"
+      >
+        <div class="tag-popover-header">🏷️ 结构化打标</div>
+        <div class="tag-popover-row">
+          <select v-model="tagPopover.prefix" class="tag-popover-prefix">
+            <option v-for="p in FACET_PREFIXES" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <span class="tag-popover-sep">:</span>
+          <input
+            ref="tagPopoverInputRef"
+            v-model="tagPopover.value"
+            class="tag-popover-input"
+            placeholder="标签值，如：泥泞"
+            @keydown.enter.prevent="submitTagPopover"
+            @keydown.esc="closeTagPopover"
+          />
+          <button class="tag-popover-submit" @click="submitTagPopover">✓</button>
+          <button class="tag-popover-cancel" @click="closeTagPopover">✕</button>
+        </div>
+        <div v-if="tagPopover.value.trim()" class="tag-popover-preview">
+          预览胶囊：
+          <span class="tag-pill-preview">@{{ tagPopover.prefix }}:{{ tagPopover.value.trim() }}</span>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
 </template>
 
 <style scoped>
@@ -908,6 +1177,17 @@ function handleCancel() {
   font-weight:   700;
 }
 
+.orch-btn--sidebar-toggle {
+  background:   rgba(99, 102, 241, 0.08);
+  border-color: rgba(99, 102, 241, 0.3);
+  color:        #a5b4fc;
+}
+.orch-btn--sidebar-toggle:hover {
+  background:   rgba(99, 102, 241, 0.18);
+  border-color: rgba(99, 102, 241, 0.55);
+  color:        #c7d2fe;
+}
+
 /* ── Template select ──────────────────────────────────────────────────────────── */
 .orch-template-select {
   background:       linear-gradient(135deg, rgba(10, 18, 40, 0.95), rgba(30, 27, 75, 0.9));
@@ -935,12 +1215,105 @@ function handleCancel() {
   min-height:     0;
   display:        flex;
   flex-direction: column;
+}
+.orch-layout {
+  display:    flex;
+  flex:       1;
+  min-height: 0;
+}
+.orch-main {
+  flex:           1;
+  display:        flex;
+  flex-direction: column;
+  min-width:      0;
   overflow:       hidden;
 }
+.orch-script-sidebar {
+  width:       280px;
+  flex-shrink: 0;
+  border-left: 1px solid rgba(99, 102, 241, 0.2);
+  background:  rgba(5, 10, 25, 0.5);
+  display:     flex;
+  flex-direction: column;
+}
+.script-header {
+  padding:       0.8rem 1.25rem;
+  font-size:     0.85rem;
+  font-weight:   700;
+  color:         #a5b4fc;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.15);
+  background:    rgba(99, 102, 241, 0.05);
+  flex-shrink:   0;
+}
+.script-scroll {
+  flex:       1;
+  overflow-y: auto;
+  padding:    1rem;
+  display:    flex;
+  flex-direction: column;
+  gap:        1rem;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
+}
+.script-scroll::-webkit-scrollbar { width: 4px; }
+.script-scroll::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.22); border-radius: 2px; }
+.script-scene-card {
+  background:    rgba(30, 41, 59, 0.4);
+  border:        1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 8px;
+  padding:       0.75rem;
+}
+.scene-meta {
+  font-size:   0.65rem;
+  font-weight: 700;
+  color:       #38bdf8;
+  margin-bottom: 0.3rem;
+}
+.scene-vp {
+  font-size:   0.6rem;
+  color:       #64748b;
+  margin-bottom: 0.6rem;
+  font-style:  italic;
+  overflow:    hidden;
+  text-overflow: ellipsis;
+  display:     -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.scene-lang-group {
+  display:        flex;
+  flex-direction: column;
+  gap:            0.2rem;
+  margin-top:     0.4rem;
+}
+.lang-badge {
+  align-self:    flex-start;
+  font-size:     0.55rem;
+  background:    rgba(99, 102, 241, 0.15);
+  color:         #818cf8;
+  padding:       0.1rem 0.3rem;
+  border-radius: 4px;
+}
+.scene-textarea {
+  background:    rgba(15, 23, 42, 0.8);
+  border:        1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 4px;
+  color:         #e2e8f0;
+  font-size:     0.75rem;
+  padding:       0.4rem;
+  resize:        vertical;
+  line-height:   1.4;
+  transition:    border-color 0.2s;
+  font-family:   inherit;
+  width:         100%;
+  box-sizing:    border-box;
+}
+.scene-textarea:focus { border-color: rgba(167, 139, 250, 0.6); outline: none; }
 
 /* ── Warehouse (top section) ────────────────────────────────────────────────── */
 .orch-warehouse {
   flex:           0 0 46%;
+  min-width:      0;        /* 防止子元素撑破 orch-main */
   display:        flex;
   flex-direction: column;
   overflow:       hidden;
@@ -949,12 +1322,14 @@ function handleCancel() {
 
 /* ── Toolbar Row ─────────────────────────────────────────────────────────────── */
 .orch-toolbar-row {
-  display:     flex;
+  display:    flex;
   align-items: center;
   gap:         0.75rem;
   padding:     0.55rem 1.25rem;
   border-bottom: 1px solid rgba(99, 102, 241, 0.1);
   flex-shrink: 0;
+  min-width:   0;           /* 允许被父容器约束宽度 */
+  overflow:    hidden;      /* 裁剪任何意外溢出 */
   background:  rgba(10, 15, 30, 0.6);
 }
 
@@ -1249,11 +1624,12 @@ function handleCancel() {
 }
 
 .orch-tracks-scroll {
-  flex:       1;
-  min-height: 0;
-  overflow-x: auto;
-  overflow-y: auto;
-  padding:    0.85rem 1.25rem;
+  flex:          1;
+  min-height:    0;
+  overflow-x:    auto;
+  overflow-y:    auto;
+  /* padding-right 给最后一个轨道留"截断感"，暗示右侧可以横向滑动 */
+  padding:       0.85rem 4rem 0.85rem 1.25rem;
   scrollbar-width: thin;
   scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
 }
@@ -1261,11 +1637,13 @@ function handleCancel() {
 .orch-tracks-scroll::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.22); border-radius: 2px; }
 
 .orch-tracks-row {
-  display:    flex;
+  display:   flex;
   flex-direction: row;
-  gap:        0.75rem;
+  gap:       0.75rem;
   min-height: 100%;
-  height:     100%;
+  /* 禁止行收缩，保证轨道溢出时横向滚动条正常触发 */
+  width:     max-content;
+  min-width: 100%;
 }
 
 /* ── Individual Track ────────────────────────────────────────────────────────── */
@@ -1273,6 +1651,7 @@ function handleCancel() {
   flex:           1;
   min-width:      180px;
   max-width:      280px;
+  flex-shrink:    0;
   display:        flex;
   flex-direction: column;
   border-radius:  10px;
@@ -2007,4 +2386,247 @@ function handleCancel() {
 
 /* ── orch-asset-icon-thumb scene_master 专属底色 ─────────────── */
 .orch-asset-icon-thumb--scene_master { background: rgba(236, 72, 153, 0.1); }
+
+/* ── 行内快捷打标按钮 ────────────────────────────────────────────────────── */
+.orch-block-tag-btn {
+  background:    transparent;
+  border:        none;
+  font-size:     0.65rem;
+  cursor:        pointer;
+  padding:       0.1rem 0.15rem;
+  border-radius: 3px;
+  flex-shrink:   0;
+  line-height:   1;
+  opacity:       0;
+  transition:    opacity 0.15s, background 0.12s;
+}
+.orch-block:hover .orch-block-tag-btn { opacity: 1; }
+.orch-block-tag-btn:hover { background: rgba(139, 92, 246, 0.2); }
+
+/* ── 快捷打标 Popover ────────────────────────────────────────────────────── */
+.tag-popover-backdrop {
+  position: fixed;
+  inset:    0;
+  z-index:  3000;
+}
+
+.tag-popover {
+  position:      fixed;
+  z-index:       3001;
+  min-width:     272px;
+  background:    #0f172a;
+  border:        1px solid rgba(139, 92, 246, 0.5);
+  border-radius: 10px;
+  box-shadow:    0 0 24px rgba(139, 92, 246, 0.18), 0 8px 32px rgba(0, 0, 0, 0.6);
+  padding:       0.6rem 0.75rem;
+  display:       flex;
+  flex-direction: column;
+  gap:           0.45rem;
+}
+
+.tag-popover-header {
+  font-size:      0.7rem;
+  font-weight:    700;
+  color:          #c4b5fd;
+  letter-spacing: 0.04em;
+}
+
+.tag-popover-row {
+  display:     flex;
+  align-items: center;
+  gap:         0.3rem;
+}
+
+.tag-popover-prefix {
+  background:    rgba(139, 92, 246, 0.12);
+  border:        1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 5px;
+  color:         #a78bfa;
+  font-size:     0.68rem;
+  font-weight:   600;
+  padding:       0.22rem 0.3rem;
+  cursor:        pointer;
+  outline:       none;
+  flex-shrink:   0;
+}
+.tag-popover-prefix:focus { border-color: rgba(139, 92, 246, 0.7); }
+
+.tag-popover-sep {
+  color:       #64748b;
+  font-size:   0.75rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.tag-popover-input {
+  flex:          1;
+  min-width:     0;
+  background:    rgba(15, 23, 42, 0.8);
+  border:        1px solid rgba(99, 102, 241, 0.3);
+  border-radius: 5px;
+  color:         #e2e8f0;
+  font-size:     0.7rem;
+  padding:       0.22rem 0.4rem;
+  outline:       none;
+  transition:    border-color 0.15s;
+}
+.tag-popover-input:focus { border-color: rgba(139, 92, 246, 0.7); }
+.tag-popover-input::placeholder { color: #475569; }
+
+.tag-popover-submit,
+.tag-popover-cancel {
+  background:    transparent;
+  border:        none;
+  border-radius: 4px;
+  font-size:     0.7rem;
+  cursor:        pointer;
+  padding:       0.2rem 0.35rem;
+  flex-shrink:   0;
+  transition:    background 0.12s, color 0.12s;
+}
+.tag-popover-submit { color: #6ee7b7; }
+.tag-popover-submit:hover { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+.tag-popover-cancel { color: #64748b; }
+.tag-popover-cancel:hover { background: rgba(239, 68, 68, 0.1); color: #f87171; }
+
+.tag-popover-preview {
+  font-size:   0.62rem;
+  color:       #64748b;
+  display:     flex;
+  align-items: center;
+  gap:         0.35rem;
+}
+
+/* 紫蓝光晕预览胶囊 */
+.tag-pill-preview {
+  display:       inline-flex;
+  align-items:   center;
+  padding:       0.1rem 0.45rem;
+  border-radius: 20px;
+  font-size:     0.62rem;
+  font-weight:   600;
+  background:    rgba(139, 92, 246, 0.18);
+  color:         #c4b5fd;
+  border:        1px solid rgba(139, 92, 246, 0.45);
+  box-shadow:    0 0 8px rgba(139, 92, 246, 0.35), 0 0 2px rgba(99, 102, 241, 0.2);
+  letter-spacing: 0.02em;
+}
+
+/* ════════════════════════════════════════════════════════════
+   战术舱独立控制面板 (Cockpit Panel)
+   ════════════════════════════════════════════════════════════ */
+.cockpit-panel {
+  display:         flex;
+  align-items:     center;
+  gap:             0.5rem;
+  flex-wrap:       wrap;
+  padding:         0.42rem 1.5rem;
+  background:      rgba(6, 10, 22, 0.85);
+  border-bottom:   1px solid rgba(99, 102, 241, 0.14);
+  flex-shrink:     0;
+}
+
+.cockpit-item {
+  display:     flex;
+  align-items: center;
+  gap:         0.32rem;
+}
+
+.cockpit-label {
+  font-size:      0.65rem;
+  font-weight:    600;
+  color:          #475569;
+  letter-spacing: 0.03em;
+  white-space:    nowrap;
+  flex-shrink:    0;
+}
+
+.cockpit-select {
+  background:    rgba(15, 23, 42, 0.75);
+  border:        1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 6px;
+  color:         #94a3b8;
+  font-size:     0.7rem;
+  font-weight:   500;
+  padding:       0.2rem 1.4rem 0.2rem 0.4rem;
+  cursor:        pointer;
+  outline:       none;
+  appearance:    none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%236366f1'/%3E%3C/svg%3E");
+  background-repeat:   no-repeat;
+  background-position: right 0.38rem center;
+  transition:    border-color 0.18s, color 0.18s;
+}
+.cockpit-select:hover { border-color: rgba(99, 102, 241, 0.55); color: #e2e8f0; }
+.cockpit-select option { background: #0f172a; color: #e2e8f0; }
+
+.cockpit-input {
+  background:    rgba(15, 23, 42, 0.75);
+  border:        1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 6px;
+  color:         #94a3b8;
+  font-size:     0.7rem;
+  font-weight:   600;
+  padding:       0.2rem 0.3rem;
+  outline:       none;
+  text-align:    center;
+  transition:    border-color 0.18s, color 0.18s;
+}
+.cockpit-input:hover, .cockpit-input:focus {
+  border-color: rgba(99, 102, 241, 0.55);
+  color:        #e2e8f0;
+}
+
+.cockpit-num {
+  width: 2.6rem;
+}
+
+.cockpit-sep {
+  width:       1px;
+  height:      1.1rem;
+  background:  rgba(99, 102, 241, 0.22);
+  flex-shrink: 0;
+  margin:      0 0.1rem;
+}
+
+.cockpit-toggle {
+  display:       flex;
+  align-items:   center;
+  gap:           0.25rem;
+  padding:       0.2rem 0.55rem;
+  border-radius: 999px;
+  border:        1px solid rgba(99, 102, 241, 0.2);
+  background:    rgba(30, 41, 59, 0.55);
+  color:         #475569;
+  font-size:     0.68rem;
+  font-weight:   500;
+  cursor:        pointer;
+  transition:    all 0.18s ease;
+  white-space:   nowrap;
+  user-select:   none;
+}
+.cockpit-toggle:hover {
+  border-color: rgba(99, 102, 241, 0.45);
+  color:        #94a3b8;
+}
+.cockpit-toggle--on {
+  border-color: rgba(99, 102, 241, 0.5);
+  background:   rgba(99, 102, 241, 0.12);
+  color:        #a78bfa;
+}
+
+.cockpit-toggle-label {
+  letter-spacing: 0.01em;
+}
+
+.cockpit-dot {
+  width:         6px;
+  height:        6px;
+  border-radius: 50%;
+  flex-shrink:   0;
+  transition:    background 0.18s ease;
+}
+.cockpit-dot--on  { background: #818cf8; }
+.cockpit-dot--off { background: #334155; }
 </style>

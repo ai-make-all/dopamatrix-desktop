@@ -91,9 +91,9 @@ class VideoTaskResponse(BaseModel):
     finished_at:  Optional[datetime] = None
 
     # ---- 成本预估字段（Response 强制契约）------------------------- #
-    llm_tokens_used:      Optional[int]   = Field(None, description="LLM Token 总用量。")
-    tts_duration_seconds: Optional[float] = Field(None, description="TTS 合成总时长（秒）。")
-    estimated_cost_usd:   Optional[float] = Field(None, description="综合成本预估（USD）。")
+    llm_tokens_used:      Optional[int]   = Field(default=None, description="LLM Token 总用量。")
+    tts_duration_seconds: Optional[float] = Field(default=None, description="TTS 合成总时长（秒）。")
+    estimated_cost_usd:   Optional[float] = Field(default=None, description="综合成本预估（USD）。")
 
     # ---- 关联的视频资产 ------------------------------------------- #
     assets: List[VideoAssetResponse] = []
@@ -181,6 +181,9 @@ class AssetRoleUpdate(BaseModel):
 class AssetTagsUpdate(BaseModel):
     tags: List[str] = Field(..., description="全量覆盖的语义标签数组")
 
+class AssetAppendTags(BaseModel):
+    tags: List[str] = Field(..., description="追加合并的语义标签数组（Set 去重，不覆盖已有标签）")
+
 class LocalAssetImportResponse(BaseModel):
     success_count: int
     skipped_count: int
@@ -235,9 +238,10 @@ class StoryDSLPayload(BaseModel):
     前端提交的 Story DSL 完整载荷。
     engine_type 区分内容型 ('content') 与 UA 投放型 ('ua') 两类渲染策略。
     """
-    engine_type: str               = Field(..., description="引擎类型：'content' | 'ua'。")
-    timeline:    List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
-    prompt:      Optional[str]     = Field(None, description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。")
+    engine_type:    str               = Field(..., description="引擎类型：'content' | 'ua'。")
+    timeline:       List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
+    prompt:         Optional[str]     = Field(default=None, description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。")
+    user_hard_tags: List[str]         = Field(default_factory=list, description="前端剥离的硬约束标签列表，DSLParserNode 寻址时执行一票否决过滤。")
 
 
 # ── DSL 解析结果 Schema ─────────────────────────────────────────── #
@@ -249,7 +253,7 @@ class ResolvedLayer(BaseModel):
     file_path:   str             = Field(..., description="素材本地绝对路径，直接用于 FFmpeg 指令。")
     asset_type:  str             = Field(..., description="素材类型：'video' / 'logo' / 'sticker' 等。")
     file_hash:   str             = Field(..., description="素材 MD5 哈希（溯源 & 防重契约）。")
-    asset_name:  Optional[str]   = Field(None, description="人类可读名称。")
+    asset_name:  Optional[str]   = Field(default=None, description="人类可读名称。")
     matched_tags: List[str]      = Field(default_factory=list, description="实际命中的语义标签。")
 
 
@@ -320,8 +324,62 @@ class RenderDSLRequest(BaseModel):
         description="多租户标识，用于 WS 定向推送隔离。",
     )
     prompt:          Optional[str]   = Field(
-        None,
+        default=None,
         description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。",
+    )
+    script_data:     Optional[dict]   = Field(
+        default=None,
+        description=(
+            "战术板预览并微调后的分镜台词 JSON（含 scenes）。"
+            "若存在，Worker 离合器 A 直接透传至 TTS，不再由大模型重写文案。"
+        ),
+    )
+    mode:            str              = Field(
+        default="auto",
+        description="导演节点模式：'auto' | 'rewrite'，透传 DirectorNode / draft-blueprint。",
+    )
+    user_hard_tags:  List[str]        = Field(
+        default_factory=list,
+        description="前端剥离的硬约束标签，透传至 DSLParserNode 寻址引擎做一票否决过滤。",
+    )
+    enable_tts:       bool             = Field(
+        default=True,
+        description="是否生成并混合 AI 语音。False = 跳过 TTSNode，仅保留 BGM 音轨。",
+    )
+    enable_subtitles: bool             = Field(
+        default=True,
+        description="是否在视频上渲染字幕。False = 跳过 SubtitleNode，不烧录 .ass 字幕轨。",
+    )
+
+
+class DraftBlueprintRequest(BaseModel):
+    """POST /tasks/draft-blueprint — 战术板同步起草蓝图。"""
+
+    prompt:         str       = Field(..., min_length=1, description="用户创意或主题描述。")
+    mode:           str       = Field(default="auto", description="'auto' | 'rewrite'。")
+    duration:       int       = Field(default=15, ge=5, le=120, description="目标总时长（秒）。")
+    langs:          List[str] = Field(
+        default_factory=lambda: ["en"],
+        min_length=1,
+        description="目标语种列表，如 ['en','ar']。",
+    )
+    available_tags: List[str] = Field(
+        default_factory=list,
+        description="素材库去重标签列表，LLM 生成 semantic_tags 时必须从中挑选，禁止自由捏造。",
+    )
+    user_hard_tags: List[str] = Field(
+        default_factory=list,
+        description="前端剥离的硬约束标签，注入 Jinja 模板后作为 LLM 绝对军令强制写入 timeline。",
+    )
+
+
+class EnhancePromptRequest(BaseModel):
+    """POST /tasks/enhance-prompt — 魔法扩写与自动打标。"""
+
+    prompt:         str       = Field(..., min_length=1, description="用户极简短句。")
+    available_tags: List[str] = Field(
+        default_factory=list,
+        description="素材库去重标签列表，供 LLM 挑选 @ 标签。",
     )
 
 

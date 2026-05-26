@@ -23,7 +23,8 @@ DSLParserNode — Story DSL 意图解析引擎  (Phase 4.1)
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+import random
+from typing import List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
@@ -83,6 +84,9 @@ class DSLParserNode:
         """
         遍历 payload.timeline，对每个 Beat 执行寻址，返回 CompilationPlan。
         """
+        # 缓存全局硬约束标签（规范化），供 _resolve_smart 内 _score_candidates 消费
+        self._user_hard_tags: List[str] = list(getattr(payload, "user_hard_tags", None) or [])
+
         beat_results: List[BeatCompilationResult] = []
         unresolved: List[str] = []
 
@@ -144,6 +148,10 @@ class DSLParserNode:
         """
         按 asset_hashes 列表精确锁定 X 轴主视频。
         若同时携带 semantic_tags，则并发查询 Y 轴叠加素材（由 ASSET_REGISTRY 动态界定）。
+
+        多候选随机抽取：当 asset_hashes 携带多个 X 轴候选（备选池）时，
+        使用 random.choice() 随机抽取一个作为本次变体的唯一主轴，
+        避免并发变体因确定性排序而克隆到同一素材。
         """
         warnings: List[str] = []
         layers: List[ResolvedLayer] = []
@@ -188,6 +196,16 @@ class DSLParserNode:
                             "未在 ASSET_REGISTRY 中定义 axis_type，已跳过。"
                         )
 
+                # 多候选备选池：随机抽取一个 X 轴主素材，打破并发克隆
+                if len(x_track) > 1:
+                    chosen_x = random.choice(x_track)
+                    logger.info(
+                        "[DSLParser] locked X轴备选池 %d 个候选，随机抽取 asset_id=%d",
+                        len(x_track),
+                        chosen_x[0].id,
+                    )
+                    x_track = [chosen_x]
+
                 for asset, matched in x_track:
                     x_axis = _axis_type_for_asset(asset)
                     layers.append(
@@ -206,6 +224,50 @@ class DSLParserNode:
                         (str(getattr(asset, "file_hash", "") or ""))[:8],
                     )
                     next_layer_idx += 1
+
+                # ── X 轴兜底：hash 列表里无视频素材时，用 semantic_tags 查 video ──
+                # 场景：用户在战术板只把 BGM/SFX 锁定到 beat，导致 asset_hashes
+                # 全部解析为 Y_LAYER；此时若携带 semantic_tags，则尝试以"智能模式"
+                # 补全 X 轴视频，避免主视频轨为空。
+                if next_layer_idx == 0 and node.semantic_tags:
+                    x_video_types = [
+                        t for t, v in ASSET_REGISTRY.items()
+                        if v.get("axis_type") in ("X_BASE", "X_STRUCTURE")
+                    ]
+                    x_fallback = self._query_by_tags(
+                        tags=node.semantic_tags,
+                        asset_types=x_video_types,
+                        limit=5,
+                    )
+                    if x_fallback:
+                        scored_fb = _score_candidates(
+                            x_fallback,
+                            user_hard_tags=self._user_hard_tags,
+                            request_tags=node.semantic_tags,
+                        )
+                        fb_asset, fb_matched = scored_fb[0]
+                        layers.insert(
+                            0,
+                            _make_layer(
+                                layer_index=0,
+                                asset=fb_asset,
+                                matched_tags=fb_matched,
+                            ),
+                        )
+                        next_layer_idx = 1
+                        logger.info(
+                            "[DSLParser] locked X轴兜底命中 layer=0 asset_id=%d "
+                            "axis_type=%s tags=%s（hashes 中无 X 轴视频）",
+                            fb_asset.id,
+                            _axis_type_for_asset(fb_asset),
+                            fb_matched,
+                        )
+                    else:
+                        warnings.append(
+                            f"locked 模式：asset_hashes 中无视频素材，"
+                            f"且 semantic_tags={node.semantic_tags} "
+                            "也未在素材库命中可用视频，主视频轨将为空。"
+                        )
 
                 if next_layer_idx == 0:
                     next_layer_idx = 1
@@ -311,8 +373,12 @@ class DSLParserNode:
                 warnings=warnings,
             )
 
-        # ── 打分排序：未耗尽优先，usage_count 升序 ────────────────── #
-        scored = _score_candidates(all_candidates)
+        # ── Smart 2.0：硬约束一票否决 + 4维打分排序 ──────────────── #
+        scored = _score_candidates(
+            all_candidates,
+            user_hard_tags=self._user_hard_tags,
+            request_tags=node.semantic_tags,
+        )
 
         # ── 分拨 X 轴 / Y 轴（axis_type 来自 ASSET_REGISTRY）────────── #
         x_assigned = False
@@ -425,11 +491,11 @@ def _make_layer(
     """将 ORM 实体转换为 ResolvedLayer Schema。"""
     return ResolvedLayer(
         layer_index=layer_index,
-        asset_id=asset.id,
-        file_path=asset.file_path,
-        asset_type=asset.asset_type,
-        file_hash=asset.file_hash,
-        asset_name=asset.asset_name,
+        asset_id=cast(int, asset.id),
+        file_path=str(asset.file_path),
+        asset_type=str(asset.asset_type),
+        file_hash=str(asset.file_hash),
+        asset_name=str(asset.asset_name) if asset.asset_name is not None else None,
         matched_tags=matched_tags,
     )
 
@@ -443,19 +509,49 @@ def _intersect_tags(asset: LocalAsset, request_tags: List[str]) -> List[str]:
 
 def _score_candidates(
     candidates: List[Tuple[LocalAsset, List[str]]],
+    *,
+    user_hard_tags: Optional[List[str]] = None,
+    request_tags: Optional[List[str]] = None,
 ) -> List[Tuple[LocalAsset, List[str]]]:
     """
-    防疲劳打分排序：
-      score = usage_count  （越低优先级越高）
-      is_exhausted=True 的素材得分强制升至 9999（排到末尾）。
+    Smart 2.0 高维抽卡打分引擎（硬约束一票否决 + 4维权重洗牌）：
 
-    同分时保持原查询顺序（已按 usage_count ASC 预排，stable sort 保证稳定）。
+    Recall Phase — 硬约束一票否决：
+      计算当前 Beat 的硬约束交集
+        hard_veto_tags = set(request_tags) ∩ set(user_hard_tags)
+      素材的 tags 必须完整包含 hard_veto_tags，否则直接从候选池剔除。
+      若无硬约束（交集为空），所有候选照常进入 Ranking Phase。
+
+    Ranking Phase — 4维排序 key（升序，越小越优先）：
+      (-soft_match_count,          # 软标签命中越多越优先（负号反转）
+       1 if is_exhausted else 0,   # 惩罚已耗尽素材
+       int(usage_count),           # 使用越少越优先（防疲劳）
+       random.random())            # 随机熵：打破并发克隆，保证矩阵多样性
     """
+    # ── Recall Phase ─────────────────────────────────────────────────────── #
+    hard_veto_tags: set[str] = set()
+    if user_hard_tags and request_tags:
+        normalized_hard = {t.lstrip("#").lower() for t in user_hard_tags}
+        normalized_req  = {t.lstrip("#").lower() for t in request_tags}
+        hard_veto_tags  = normalized_hard & normalized_req
 
-    def _score(pair: Tuple[LocalAsset, List[str]]) -> int:
-        asset, _ = pair
-        if asset.is_exhausted:
-            return 9999
-        return asset.usage_count
+    if hard_veto_tags:
+        survivors: List[Tuple[LocalAsset, List[str]]] = []
+        for asset, matched in candidates:
+            asset_tag_set = {t.lstrip("#").lower() for t in (asset.tags or [])}
+            if hard_veto_tags.issubset(asset_tag_set):
+                survivors.append((asset, matched))
+        candidates = survivors
+
+    # ── Ranking Phase ─────────────────────────────────────────────────────── #
+    def _score(pair: Tuple[LocalAsset, List[str]]) -> Tuple[int, int, int, float]:
+        asset, matched = pair
+        soft_match_count = len(matched)
+        return (
+            -soft_match_count,
+            1 if bool(asset.is_exhausted) else 0,
+            cast(int, asset.usage_count) if asset.usage_count is not None else 0,
+            random.random(),
+        )
 
     return sorted(candidates, key=_score)

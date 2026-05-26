@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from .database import get_db
 from .models import LocalAsset
-from .schemas import LocalAssetCreate, LocalAssetResponse, LocalAssetImportResponse, AssetRoleUpdate, AssetTagsUpdate
+from .schemas import LocalAssetCreate, LocalAssetResponse, LocalAssetImportResponse, AssetRoleUpdate, AssetTagsUpdate, AssetAppendTags
 
 router = APIRouter(prefix="/assets", tags=["DAM Assets"])
 
@@ -178,6 +178,24 @@ def update_asset_tags(asset_id: int, payload: AssetTagsUpdate, db: Session = Dep
         raise HTTPException(status_code=404, detail="未找到对应素材")
 
     asset.tags = payload.tags
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+@router.patch("/{asset_id}/append-tags", response_model=LocalAssetResponse, summary="追加合并语义标签（Drop-to-Tag 基因注入）")
+def append_asset_tags(asset_id: int, payload: AssetAppendTags, db: Session = Depends(get_db)):
+    """
+    将传入的标签列表与素材现有标签合并（Set 去重），不覆盖已有标签。
+    用于 Drop-to-Tag 拖拽继承场景：素材被拖入带标签的轨道时，自动继承轨道基因。
+    """
+    asset = db.get(LocalAsset, asset_id)
+    if not asset or asset.is_deleted:
+        raise HTTPException(status_code=404, detail="未找到对应素材")
+
+    existing = list(asset.tags or [])
+    merged   = list(dict.fromkeys(existing + payload.tags))  # 保序去重
+    asset.tags = merged
     db.commit()
     db.refresh(asset)
     return asset

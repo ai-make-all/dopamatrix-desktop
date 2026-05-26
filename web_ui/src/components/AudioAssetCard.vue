@@ -1,12 +1,13 @@
 <script setup>
 import { ref, computed, onUnmounted } from 'vue'
+import { getTagPillParts } from '../utils/tagParser.js'
 
 const props = defineProps({
   item:    { type: Object, required: true },
   apiBase: { type: String, required: true },
 })
 
-const emit = defineEmits(['emotion-change'])
+const emit = defineEmits(['open-tag-modal'])
 
 // ── Playback ───────────────────────────────────────────────────────────────
 const isPlaying = ref(false)
@@ -129,30 +130,29 @@ const vibeAccent = computed(() => emotionColorMap[props.item.emotion_tag] ?? '#a
         ></div>
       </div>
 
-      <!-- Emotion tag dropdown -->
-      <div class="asset-role-wrap" style="margin-top: 0.4rem; margin-bottom: 0.2rem;">
-        <select
-          v-model="item.emotion_tag"
-          @change="emit('emotion-change', item)"
-          class="role-select role-audio-emotion"
-          :style="{ borderColor: `color-mix(in srgb, var(--vibe) 50%, transparent)` }"
-        >
-          <option value="asmr">🎧 ASMR / 沉浸解压</option>
-          <option value="epic">💥 史诗震撼 / 强节奏</option>
-          <option value="funny">🤪 荒诞鬼畜 / 模因音效</option>
-          <option value="general">🎵 通用音乐 (General)</option>
-        </select>
-      </div>
+      <!-- 标签注入按钮 -->
+      <button
+        class="audio-inject-tag-btn"
+        @click.stop="emit('open-tag-modal', item)"
+        title="注入分面标签"
+      >🏷️ 注入标签</button>
 
-      <!-- Tags -->
-      <div class="asset-tags">
-        <span
-          v-if="item.is_exhausted"
-          class="tag"
-          style="background:rgba(239,68,68,0.15);color:#fca5a5;border-color:rgba(239,68,68,0.3);"
-        >疲劳警告</span>
-        <span v-else-if="item.usage_count === 0" class="tag">全新</span>
-        <span v-if="item.emotion_tag" class="tag audio-vibe-tag">{{ item.emotion_tag }}</span>
+      <!-- 分面标签胶囊 -->
+      <div class="asset-card-tags">
+        <span v-if="item.is_exhausted" class="tag-pill tag-pill-danger tag-pill--mini">疲劳警告</span>
+        <span v-else-if="item.usage_count === 0" class="tag-pill tag-pill-fresh tag-pill--mini">全新</span>
+        <template v-if="item.tags && item.tags.length">
+          <span
+            v-for="pill in item.tags.map(getTagPillParts)"
+            :key="pill.val"
+            :class="['tag-pill', pill.facetClass, 'tag-pill--mini']"
+          >
+            <span v-if="pill.showHead" class="tag-pill-head">{{ pill.head }}</span>
+            <span v-if="pill.showHead" class="tag-pill-sep"> | </span>
+            <span class="tag-pill-val">{{ pill.val }}</span>
+          </span>
+        </template>
+        <span v-if="!item.tags?.length && !item.is_exhausted && item.usage_count > 0" class="audio-no-tags">— 未打标</span>
       </div>
     </div>
 
@@ -308,42 +308,44 @@ const vibeAccent = computed(() => emotionColorMap[props.item.emotion_tag] ?? '#a
   border-radius: 99px;
   transition: width .3s ease;
 }
-.asset-role-wrap {}
-.role-select {
-  background: rgba(10, 8, 28, 0.9);
-  border: 1px solid rgba(255,255,255,0.1);
-  color: #94a3b8;
-  font-size: 0.72rem;
-  padding: 0.22rem 0.4rem;
-  border-radius: 6px;
+/* ── 标签注入按钮 ─────────────────────────────────────────── */
+.audio-inject-tag-btn {
   width: 100%;
-  outline: none;
+  padding: 0.32rem 0.55rem;
+  border-radius: 7px;
+  border: 1px dashed rgba(139, 92, 246, 0.4);
+  background: rgba(139, 92, 246, 0.06);
+  color: rgba(196, 181, 253, 0.7);
+  font-size: 0.7rem;
+  font-weight: 600;
+  font-family: 'Inter', sans-serif;
   cursor: pointer;
-  transition: border-color .18s;
+  letter-spacing: 0.02em;
+  transition: border-color 0.15s, color 0.15s, background 0.15s, box-shadow 0.15s;
+  text-align: center;
+  margin-top: 0.3rem;
 }
-.role-select:focus { border-color: rgba(167,139,250,0.5); }
-.role-select option { background: #0a0820; color: #e2e8f0; }
-.role-audio-emotion { color: #c4b5fd; }
+.audio-inject-tag-btn:hover {
+  border-color: rgba(167, 139, 250, 0.75);
+  color: #c4b5fd;
+  background: rgba(139, 92, 246, 0.13);
+  box-shadow: 0 0 12px rgba(139, 92, 246, 0.2);
+  border-style: solid;
+}
 
-.asset-tags {
+/* ── 分面标签胶囊容器 ─────────────────────────────────────── */
+.asset-card-tags {
   display: flex;
-  gap: 0.4rem;
   flex-wrap: wrap;
+  gap: 0.2rem;
+  overflow: hidden;
+  margin-top: 0.25rem;
+  min-height: 1rem;
 }
-.tag {
-  background: rgba(56,189,248,0.1);
-  color: #38bdf8;
-  border: 1px solid rgba(56,189,248,0.25);
-  font-size: 0.63rem;
-  padding: 0.12rem 0.4rem;
-  border-radius: 4px;
-}
-.audio-vibe-tag {
-  background: color-mix(in srgb, var(--vibe) 12%, transparent);
-  color: var(--vibe);
-  border-color: color-mix(in srgb, var(--vibe) 35%, transparent);
-  font-family: 'JetBrains Mono', monospace;
-  text-transform: uppercase;
-  letter-spacing: .04em;
+.audio-no-tags {
+  font-size: 0.6rem;
+  color: #1e293b;
+  font-style: italic;
+  align-self: center;
 }
 </style>
