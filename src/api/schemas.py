@@ -190,6 +190,11 @@ class LocalAssetImportResponse(BaseModel):
     message: str
 
 
+class TextAssetCreate(BaseModel):
+    asset_name:     str = Field(..., description="文本资产的人类可读名称")
+    content_matrix: dict = Field(..., description="多语种内容字典，如 {'zh': '...', 'en': '...', 'ar': '...'}")
+
+
 class LocalAssetResponse(BaseModel):
     """
     前端查询素材库接口的响应模型
@@ -210,27 +215,51 @@ class LocalAssetResponse(BaseModel):
     business_scopes: Optional[List[str]] = None
     entity_id:       Optional[str] = None
     asset_name:      Optional[str] = None
+    manifest:        Optional[dict] = None
 
 
 # ================================================================== #
 # Story DSL Schemas  (Phase 4.1 — DSLParserNode 契约)                #
 # ================================================================== #
 
+class BlueprintMeta(BaseModel):
+    """
+    导演蓝图全局社交媒体投放文案（Phase 9.12 CF 边缘归因管线）。
+    由 LLM 在 draft_blueprint 时一同生成，存入 TaskHistory.prompt_details["meta"]。
+    导出 ZIP 时，social_caption 中的 {TRACKING_LINK} 将被替换为 CF KV 短链。
+    """
+    social_title:    Optional[str] = Field(default=None, description="极具网感、带 Emoji 的短标题（≤20字）。")
+    social_caption:  Optional[str] = Field(default=None, description="情绪化描述文案，结尾必须含 {TRACKING_LINK} 占位符。")
+    social_hashtags: Optional[str] = Field(default=None, description="3–5 个高流量话题标签，空格分隔。")
+    emotional_tag:   Optional[str] = Field(default=None, description="情绪微标，纯英文驼峰或纯中文，2–4字/≤15字母，无空格标点。")
+
+
 class DSLBeatNode(BaseModel):
     """
-    Story DSL 时间轴上的一个 Beat 节点。
+    Story DSL 时间轴上的一个 Beat 节点（单轨线性一体化架构，Phase 9.11.2）。
 
     address_mode 决定寻址策略：
       'locked' → 精确锁定，直接按 asset_hashes 查库；
                  若同时携带 semantic_tags，则并发查 Y 轴叠加素材。
       'smart'  → 智能抽卡，按 semantic_tags 匹配并打分，
                  防疲劳优先选 usage_count 低且未耗尽的素材。
+
+    script_text 与资产图层生死同寿，台词（灵魂）直接内聚于本节拍物理时空舱中；
+    duration 为 LLM 生成时的时长预估，供字幕时间轴计算使用。
     """
     beat:          str            = Field(..., description="Beat 标识符，如 'hook_01'、'body_02'。")
     role:          str            = Field(..., description="角色标签，如 'hook'、'body'、'cta'。")
     address_mode:  str            = Field(..., description="寻址模式：'locked' | 'smart'。")
     asset_hashes:  List[str]      = Field(default_factory=list, description="locked 模式下指定的素材 MD5 哈希列表。")
     semantic_tags: List[str]      = Field(default_factory=list, description="语义标签列表，用于 smart 模式匹配与 Y 轴叠加查询。")
+    script_text:   Optional[str]  = Field(default=None, description="内聚于该节拍的高光口播台词；TTS 管线直接原位消费，无需旁路 script_data 字典。")
+    duration:      Optional[float] = Field(default=None, description="该节拍预估时长（秒），LLM 生成时填写，字幕时间轴兜底计算依据。")
+
+    # ── Phase 9.12 社交媒体归因字段（Beat 级可选，全局 meta 优先）─────────── #
+    social_title:    Optional[str] = Field(default=None, description="该节拍对应的社交媒体短标题（可选，全局 meta.social_title 优先）。")
+    social_caption:  Optional[str] = Field(default=None, description="该节拍对应的社交文案，含 {TRACKING_LINK} 占位符（可选）。")
+    social_hashtags: Optional[str] = Field(default=None, description="该节拍对应的话题标签，空格分隔（可选）。")
+    emotional_tag:   Optional[str] = Field(default=None, description="该节拍对应的情绪微标（可选，全局 meta.emotional_tag 优先）。")
 
 
 class StoryDSLPayload(BaseModel):
@@ -242,6 +271,7 @@ class StoryDSLPayload(BaseModel):
     timeline:       List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
     prompt:         Optional[str]     = Field(default=None, description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。")
     user_hard_tags: List[str]         = Field(default_factory=list, description="前端剥离的硬约束标签列表，DSLParserNode 寻址时执行一票否决过滤。")
+    language:       Optional[str]     = Field(default=None, description="目标渲染语种，如 'zh'、'en'、'ar'；供 FFmpeg 渲染阶段从 text_template content_matrix 提取对应文本。")
 
 
 # ── DSL 解析结果 Schema ─────────────────────────────────────────── #
@@ -250,11 +280,20 @@ class ResolvedLayer(BaseModel):
     """单个图层（X 轴 / Y 轴）的解析结果。"""
     layer_index: int             = Field(..., description="图层层级：0 = X轴主视频，1+ = Y轴叠加层。")
     asset_id:    int             = Field(..., description="LocalAsset 主键 ID。")
-    file_path:   str             = Field(..., description="素材本地绝对路径，直接用于 FFmpeg 指令。")
-    asset_type:  str             = Field(..., description="素材类型：'video' / 'logo' / 'sticker' 等。")
+    file_path:   str             = Field(..., description="素材本地绝对路径，直接用于 FFmpeg 指令；text_template 以 virtual:// 为前缀。")
+    asset_type:  str             = Field(..., description="素材类型：'video' / 'logo' / 'sticker' / 'text_template' 等。")
     file_hash:   str             = Field(..., description="素材 MD5 哈希（溯源 & 防重契约）。")
     asset_name:  Optional[str]   = Field(default=None, description="人类可读名称。")
     matched_tags: List[str]      = Field(default_factory=list, description="实际命中的语义标签。")
+    manifest:    Optional[dict]  = Field(default=None, description="虚拟资产多态载荷；text_template 携带 content_matrix 多语种文本字典。")
+    layout:      Optional[str]   = Field(
+        default=None,
+        description=(
+            "DSL 最高级空间排版意图（Phase 9.7.2 三级控制体系 Level-1）。"
+            "取值：'center' | 'bottom_center' | 'top_center' | 'top_left' | 'top_right' | 'bottom_left'。"
+            "留空则由渲染引擎按 Manifest default_position → 系统默认 'center' 顺序降级处理。"
+        ),
+    )
 
 
 class BeatCompilationResult(BaseModel):
@@ -265,6 +304,7 @@ class BeatCompilationResult(BaseModel):
     layers:       List[ResolvedLayer]  = Field(default_factory=list, description="已解析的图层列表（按 layer_index 升序）。")
     resolved:     bool                 = Field(..., description="True = 至少找到一个主轴素材；False = 寻址失败。")
     warnings:     List[str]            = Field(default_factory=list, description="寻址过程中产生的警告信息。")
+    script_text:  Optional[str]        = Field(default=None, description="原样透传的节拍台词内容（单轨线性架构，Phase 9.11.2）。")
 
 
 class CompilationPlanSummary(BaseModel):
@@ -326,13 +366,6 @@ class RenderDSLRequest(BaseModel):
     prompt:          Optional[str]   = Field(
         default=None,
         description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。",
-    )
-    script_data:     Optional[dict]   = Field(
-        default=None,
-        description=(
-            "战术板预览并微调后的分镜台词 JSON（含 scenes）。"
-            "若存在，Worker 离合器 A 直接透传至 TTS，不再由大模型重写文案。"
-        ),
     )
     mode:            str              = Field(
         default="auto",

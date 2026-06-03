@@ -3,6 +3,7 @@ import { ref, computed, watch, reactive, nextTick } from 'vue'
 import draggable from 'vuedraggable'
 import axios from 'axios'
 import { getTagPillParts, parseFacetedTags } from '../utils/tagParser.js'
+import { ASSET_FILTER_OPTIONS, FACET_NAMESPACES } from '../utils/assetConfig.js'
 
 // ── Props & Emits ────────────────────────────────────────────────────────────
 const props = defineProps({
@@ -14,7 +15,6 @@ const props = defineProps({
   buildVideoUrl:          { type: Function, required: true },
   apiBase:                { type: String,   required: true },
   showToast:              { type: Function, default: () => {} },
-  scriptData:             { type: Object,   default: null },
   defaultBatchSize:       { type: Number,   default: 1 },
   defaultAspectRatio:     { type: String,   default: '9:16' },
   defaultLanguage:        { type: String,   default: 'en' },
@@ -24,36 +24,32 @@ const props = defineProps({
 
 const emit = defineEmits(['update:modelValue', 'confirm'])
 
-// ── Asset registry & facet namespace config ───────────────────────────────────
-const ASSET_TYPE_REGISTRY = [
-  { type: 'all',          label: '全部',  icon: '📦' },
-  { type: 'video',        label: '视频',  icon: '🎬' },
-  { type: 'image',        label: '图片',  icon: '🖼️' },
-  { type: 'audio_bgm',    label: 'BGM',   icon: '🎵' },
-  { type: 'vfx',          label: 'VFX',   icon: '✨' },
-  { type: 'sfx',          label: 'SFX',   icon: '🔊' },
-  { type: 'scene_master', label: '底模',  icon: '🏛️' },
+// ── Asset registry & facet namespace config (均从 assetConfig.js SSOT 读取) ──
+
+// ── Phase 9.7.3 — 九宫格排版选项字典 ─────────────────────────────────────────
+const LAYOUT_OPTIONS = [
+  { value: 'center',        label: '⛶ 画面正中 (默认)' },
+  { value: 'bottom_center', label: '⬇️ 底部安全区' },
+  { value: 'top_center',    label: '⬆️ 顶部居中' },
+  { value: 'top_left',      label: '↖️ 左上角' },
+  { value: 'top_right',     label: '↗️ 右上角' },
+  { value: 'bottom_left',   label: '↙️ 左下角' },
 ]
 
-/** 结构化打标 Popover 的前缀分面枚举（与 DAM 标准分面对齐） */
-const FACET_PREFIXES = ['hook', 'context', 'build', 'vibe', 'entity', 'vfx', 'bgm', 'sfx']
+// 需要画面显示的 Y 轴素材类型集合（音频类型不需排版控制）
+const _VISUAL_Y_AXIS_TYPES = new Set(['logo', 'sticker', 'image', 'vfx', 'text_template'])
 
-/** parseFacetedTags 的 theme → 抽屉既有 orch-* 色键（仅 UI，与 DAM 解析无关） */
-const FACET_THEME_COLOR = {
-  hook: 'purple',
-  entity: 'green',
-  vibe: 'sky',
-  vfx: 'amber',
-  sfx: 'orange',
-  generic: 'indigo',
+/** 判断胶囊是否为需要画面排版的 Y 轴视觉素材 */
+function isVisualYAxis(pill) {
+  if (!pill || pill.type === 'semantic_tag') return false
+  return _VISUAL_Y_AXIS_TYPES.has(pill.asset_type)
 }
 
 // ── Local editor state ───────────────────────────────────────────────────────
-const localTracks       = ref([])
-const localTemplate     = ref('content')
-const localScriptData   = ref(null)
-const showScriptSidebar = ref(true)
-const leftTab           = ref('assets')
+const localTracks   = ref([])
+const localTemplate = ref('content')
+const initialTracksCache = ref([])
+const leftTab       = ref('assets')
 const assetSearch     = ref('')
 const activeTag       = ref(null)
 const assetTypeFilter = ref('video')
@@ -71,6 +67,60 @@ const localParams = reactive({
 const isPreviewLoading = ref(false)
 const previewData      = ref(null)
 const showPreviewModal = ref(false)
+
+// ── Phase 9.7.3 — 属性检查器 Popover (Inspector) ─────────────────────────────
+const inspectorPopover = reactive({
+  open:  false,
+  pill:  null,   // 当前被检查的 block 对象引用（reactive，直接写入 .layout）
+  top:   0,
+  left:  0,
+})
+
+function openInspectorPopover(pill, evt) {
+  const rect   = evt.currentTarget.getBoundingClientRect()
+  const popH   = 96
+  const popW   = 260
+  const top    = rect.bottom + 6 + popH > window.innerHeight
+    ? rect.top - popH - 6
+    : rect.bottom + 6
+  const left   = Math.min(rect.left, window.innerWidth - popW - 8)
+  inspectorPopover.pill = pill
+  inspectorPopover.top  = top
+  inspectorPopover.left = left
+  inspectorPopover.open = true
+}
+
+function closeInspectorPopover() { inspectorPopover.open = false }
+
+// ── Phase 9.11.1 — Beat 局部配置状态机 ───────────────────────────────────────
+const activeConfigBeatIndex = ref(null)
+const beatConfigTab         = ref('script')
+const beatConfigPos         = reactive({ top: 0, left: 0 })
+const configForm            = ref({
+  script_text: '',
+  transition:  '',
+  vfx:         '',
+})
+
+function openConfigPanel(index, track, evt) {
+  const rect = evt.currentTarget.getBoundingClientRect()
+  beatConfigPos.top  = Math.min(rect.bottom + 6, window.innerHeight - 280)
+  beatConfigPos.left = Math.min(rect.left, window.innerWidth - 320 - 8)
+  activeConfigBeatIndex.value = index
+  beatConfigTab.value         = 'script'
+  configForm.value = {
+    script_text: track.script_text || '',
+    transition:  track.transition  || '',
+    vfx:         track.vfx         || '',
+  }
+}
+
+function saveConfigChanges(track) {
+  track.script_text = configForm.value.script_text
+  // track.transition = configForm.value.transition  (未来扩展)
+  // track.vfx        = configForm.value.vfx         (未来扩展)
+  activeConfigBeatIndex.value = null
+}
 
 // ── 行内快捷打标 Popover ──────────────────────────────────────────────────────
 const tagPopover = reactive({
@@ -106,11 +156,10 @@ function getSlotTheme(slotKey) {
 // ── Sync on open ─────────────────────────────────────────────────────────────
 watch(() => props.modelValue, (opened) => {
   if (!opened) return
-  localTracks.value       = JSON.parse(JSON.stringify(props.dslTracks))
-  localTemplate.value     = props.currentTemplate
-  localScriptData.value   = props.scriptData ? JSON.parse(JSON.stringify(props.scriptData)) : null
-  showScriptSidebar.value = true
-  leftTab.value           = 'assets'
+  localTracks.value   = JSON.parse(JSON.stringify(props.dslTracks))
+  initialTracksCache.value = JSON.parse(JSON.stringify(props.dslTracks))
+  localTemplate.value = props.currentTemplate
+  leftTab.value       = 'assets'
   assetSearch.value     = ''
   activeTag.value       = null
   assetTypeFilter.value = 'video'
@@ -148,7 +197,7 @@ const facetedTags = computed(() => {
   return parseFacetedTags(pool.tags).map(facet => ({
     ...facet,
     tags: facet.values.map(v => v.raw),
-    color: FACET_THEME_COLOR[facet.theme] || 'indigo',
+    color: FACET_NAMESPACES.find(n => n.value === facet.theme)?.color || 'indigo',
   }))
 })
 
@@ -180,6 +229,10 @@ const totalStaged = computed(() =>
   localTracks.value.reduce((s, t) => s + t.items.length, 0)
 )
 
+const isAiDraftMode = computed(() =>
+  initialTracksCache.value.some(t => t.items.length > 0)
+)
+
 // ── Clone factories ───────────────────────────────────────────────────────────
 function cloneAsset(asset) {
   return {
@@ -206,8 +259,16 @@ function removeBlock(track, uuid) {
   track.items = track.items.filter(b => b.uuid !== uuid)
 }
 
-function clearAll() {
-  localTracks.value.forEach(t => { t.items = [] })
+function handleClearWithConfirm() {
+  if (window.confirm('确认要清空底部节拍槽的所有装填结果吗？')) {
+    localTracks.value.forEach(t => { t.items = [] })
+  }
+}
+
+function handleResetWithConfirm() {
+  if (window.confirm('确认要恢复到底部节拍槽刚加载的初始填充状态吗？')) {
+    localTracks.value = JSON.parse(JSON.stringify(initialTracksCache.value))
+  }
 }
 
 // ── 底模母槽事件处理 ──────────────────────────────────────────────────────────
@@ -261,7 +322,7 @@ function openTagPopover(track, element, evt) {
     : rect.bottom + 6
   tagPopover.open      = true
   tagPopover.elementId = element.id
-  tagPopover.prefix    = track.role || FACET_PREFIXES[0]
+  tagPopover.prefix    = track.role || FACET_NAMESPACES[0].value
   tagPopover.value     = ''
   tagPopover.top       = top
   tagPopover.left      = Math.min(rect.left, window.innerWidth - 290)
@@ -358,6 +419,8 @@ async function onTrackChange(track, evt) {
 
 // ── DSL Dry-run preview ───────────────────────────────────────────────────────
 async function runPreview() {
+  // TODO: 1.0 时代测试代码，暂屏蔽
+  /*
   const active = localTracks.value.filter(t => t.items.length > 0)
   if (active.length === 0) {
     props.showToast('⚠️ 请至少装填一个节拍后再预览')
@@ -370,13 +433,19 @@ async function runPreview() {
       timeline: localTracks.value.map(track => {
         const physicals = track.items.filter(i => i.type === 'physical_asset')
         const semantics  = track.items.filter(i => i.type === 'semantic_tag')
-        return {
+        // Phase 9.7.3 — 空间排版意图：hash → position_key 映射（仅含已设置的素材）
+        const layoutHints = {}
+        physicals.forEach(pill => { if (pill.layout) layoutHints[pill.hash] = pill.layout })
+        const beatNode = {
           beat:          track.id,
           role:          track.role,
+          script_text:   track.script_text || '',
           address_mode:  physicals.length > 0 ? 'locked' : 'smart',
           asset_hashes:  physicals.map(i => i.hash),
           semantic_tags: semantics.map(i => i.tag),
         }
+        if (Object.keys(layoutHints).length > 0) beatNode.layout_hints = layoutHints
+        return beatNode
       }).filter(b => b.asset_hashes.length > 0 || b.semantic_tags.length > 0),
     }
     const resp = await axios.post(`${props.apiBase}/api/v1/tasks/submit-dsl`, payload)
@@ -392,6 +461,7 @@ async function runPreview() {
   } finally {
     isPreviewLoading.value = false
   }
+  */
 }
 
 // ── Confirm / Cancel ──────────────────────────────────────────────────────────
@@ -416,7 +486,6 @@ function handleConfirm(directRender = false) {
     tracks:       JSON.parse(JSON.stringify(localTracks.value)),
     template:     localTemplate.value,
     master_track: masterTrackPlan,
-    script_data:  localScriptData.value,
     directRender,
     params: { ...localParams },
   })
@@ -424,7 +493,9 @@ function handleConfirm(directRender = false) {
 }
 
 function handleCancel() {
-  emit('update:modelValue', false)
+  if (window.confirm('确认要放弃编排战术板的装填结果吗？')) {
+    emit('update:modelValue', false)
+  }
 }
 </script>
 
@@ -453,11 +524,7 @@ function handleCancel() {
           </div>
 
           <div class="orch-header-right">
-            <select v-model="localTemplate" class="orch-template-select">
-              <option value="content">📝 Content</option>
-              <option value="ua">🎯 UA / 用户获取</option>
-            </select>
-
+            <!-- 蓝图预览
             <button
               class="orch-btn orch-btn--preview"
               :class="{ 'orch-btn--loading': isPreviewLoading }"
@@ -465,43 +532,14 @@ function handleCancel() {
               @click="runPreview"
               title="Dry-run 解析，验证素材寻址"
             >{{ isPreviewLoading ? '⏳ 解析中…' : '🔬 蓝图预览' }}</button>
-
-            <button
-              v-if="totalStaged > 0"
-              class="orch-btn orch-btn--ghost"
-              @click="clearAll"
-              title="清空所有轨道"
-            >✕ 清空</button>
-
-            <button
-              v-if="localScriptData"
-              class="orch-btn orch-btn--sidebar-toggle"
-              :title="showScriptSidebar ? '收起台词本' : '展开台词本'"
-              @click="showScriptSidebar = !showScriptSidebar"
-            >{{ showScriptSidebar ? '📝 收起台词本' : '📝 展开台词本' }}</button>
-
-            <button class="orch-btn orch-btn--cancel" @click="handleCancel">取消</button>
+            -->
 
             <button class="orch-btn orch-btn--ghost" @click="handleConfirm(false)">✓ 仅装填</button>
-
-            <button v-if="localScriptData" class="orch-btn orch-btn--confirm" @click="handleConfirm(true)">
-              🚀 确认并直接渲染
-            </button>
           </div>
         </div>
 
         <!-- Cockpit Panel ──────────────────────────────────────────────────── -->
         <div class="cockpit-panel">
-          <div class="cockpit-item">
-            <span class="cockpit-label">🔢 数量</span>
-            <input
-              v-model.number="localParams.batchSize"
-              type="number" min="1" max="20"
-              class="cockpit-input cockpit-num"
-              title="批量生成数量"
-            />
-          </div>
-          <div class="cockpit-sep" />
           <div class="cockpit-item">
             <span class="cockpit-label">📐 画幅</span>
             <select v-model="localParams.aspectRatio" class="cockpit-select">
@@ -537,6 +575,21 @@ function handleCancel() {
           >
             📝 <span class="cockpit-toggle-label">字幕</span>
             <span class="cockpit-dot" :class="localParams.enableSubtitles ? 'cockpit-dot--on' : 'cockpit-dot--off'" />
+          </button>
+          <div class="cockpit-sep" />
+          <div class="cockpit-item">
+            <span class="cockpit-label">🔢 数量</span>
+            <input
+              v-model.number="localParams.batchSize"
+              type="number" min="1" max="20"
+              class="cockpit-input cockpit-num"
+              title="批量生成数量"
+            />
+          </div>
+          <div style="margin-left: auto;"></div>
+          <button class="orch-btn orch-btn--cancel" @click="handleCancel">取消</button>
+          <button class="orch-btn orch-btn--confirm" @click="handleConfirm(true)">
+            🚀 确认并直接渲染
           </button>
         </div>
 
@@ -582,7 +635,7 @@ function handleCancel() {
             <!-- 资产类型筛选胶囊（素材库模式下显示）-->
             <div v-if="leftTab === 'assets'" class="orch-type-filter-row">
               <button
-                v-for="item in ASSET_TYPE_REGISTRY"
+                v-for="item in ASSET_FILTER_OPTIONS"
                 :key="item.type"
                 :class="['orch-type-pill', assetTypeFilter === item.type ? 'orch-type-pill--active' : '']"
                 @click="assetTypeFilter = item.type; activeTag = null"
@@ -648,6 +701,12 @@ function handleCancel() {
                         :src="buildVideoUrl(asset.file_path)"
                         class="orch-asset-image"
                       />
+                      <div
+                        v-else-if="asset.asset_type === 'text_template'"
+                        class="orch-text-preview"
+                      >
+                        {{ asset.manifest?.content_matrix?.zh || asset.asset_name || '📝 文本资产' }}
+                      </div>
                       <div
                         v-else
                         class="orch-asset-icon-thumb"
@@ -715,8 +774,28 @@ function handleCancel() {
           </div>
 
           <!-- ════ 分割线 ════════════════════════════════════════════════════ -->
-          <div class="orch-divider">
-            <span class="orch-divider-label">🎞️ 装填线 · 拖拽素材到节拍槽</span>
+          <div class="orch-divider" style="justify-content: space-between; padding: 0 1.25rem;">
+            <div style="display: flex; align-items: center; gap: 1rem;">
+              <select v-model="localTemplate" class="orch-template-select">
+                <option value="content">📝 Content</option>
+                <option value="ua">🎯 UA / 用户获取</option>
+              </select>
+              <span class="orch-divider-label">🎞️ 装填线 · 拖拽素材到节拍槽</span>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <button
+                class="orch-btn orch-btn--ghost"
+                @click="handleClearWithConfirm"
+                title="清空所有轨道"
+              >✕ 清空</button>
+              <button
+                v-if="isAiDraftMode"
+                class="orch-btn orch-btn--cancel"
+                @click="handleResetWithConfirm"
+                title="恢复初始 AI 起草状态"
+              >↺ 重置</button>
+            </div>
           </div>
 
           <!-- ════ 下半部分：DSL 装填线（横向轨道）════════════════════════════ -->
@@ -839,7 +918,7 @@ function handleCancel() {
               <Transition name="tracks-fade" mode="out-in">
                 <div :key="localTemplate" class="orch-tracks-row">
                   <div
-                    v-for="track in localTracks"
+                    v-for="(track, index) in localTracks"
                     :key="track.id"
                     class="orch-track"
                     :class="`orch-track--${track.role}`"
@@ -850,6 +929,12 @@ function handleCancel() {
                         v-if="track.items.length > 0"
                         class="orch-track-count"
                       >{{ track.items.length }}</span>
+                      <button
+                        class="beat-cfg-icon-btn"
+                        :class="{ 'beat-cfg-icon-btn--set': track.script_text }"
+                        @click.stop="openConfigPanel(index, track, $event)"
+                        :title="`配置 ${track.name} 属性`"
+                      >⚙️</button>
                     </div>
 
                     <draggable
@@ -878,6 +963,13 @@ function handleCancel() {
                             :src="buildVideoUrl(element.file_path)"
                             class="orch-block-thumb orch-block-thumb--img"
                           />
+                          <div
+                            v-else-if="element.type !== 'semantic_tag' && element.asset_type === 'text_template'"
+                            class="orch-block-text-thumb"
+                          >
+                            <span class="text-icon">📝</span>
+                            <span class="text-snippet">{{ element.manifest?.content_matrix?.zh || element.name }}</span>
+                          </div>
                           <span
                             v-else-if="element.type !== 'semantic_tag'"
                             class="orch-block-icon-thumb"
@@ -901,6 +993,13 @@ function handleCancel() {
                             title="快捷打标"
                           >🏷️</button>
                           <button
+                            v-if="isVisualYAxis(element)"
+                            class="orch-block-inspect-btn"
+                            :class="{ 'orch-block-inspect-btn--set': element.layout }"
+                            @click.stop="openInspectorPopover(element, $event)"
+                            :title="element.layout ? `排版: ${element.layout}` : '设置排版位置'"
+                          >⚙️</button>
+                          <button
                             class="orch-block-remove"
                             @click.stop="removeBlock(track, element.uuid)"
                             title="移除"
@@ -921,21 +1020,6 @@ function handleCancel() {
           </div>
 
           </div><!-- /.orch-main -->
-
-          <!-- ════ 右侧 AI 台词本边栏 ════════════════════════════════════════ -->
-          <div v-if="localScriptData && showScriptSidebar" class="orch-script-sidebar">
-            <div class="script-header">📝 AI 智能台词本</div>
-            <div class="script-scroll">
-              <div v-for="(scene, idx) in localScriptData.scenes" :key="idx" class="script-scene-card">
-                <div class="scene-meta">镜头 {{ idx + 1 }} · {{ scene.duration }}s</div>
-                <div class="scene-vp" :title="scene.visual_prompt">{{ scene.visual_prompt }}</div>
-                <div v-for="(text, lang) in scene.narrations" :key="lang" class="scene-lang-group">
-                  <span class="lang-badge">{{ lang }}</span>
-                  <textarea v-model="scene.narrations[lang]" rows="3" class="scene-textarea" title="可直接修改配音文案"></textarea>
-                </div>
-              </div>
-            </div>
-          </div>
 
           </div><!-- /.orch-layout -->
         </div>
@@ -990,7 +1074,7 @@ function handleCancel() {
         <div class="tag-popover-header">🏷️ 结构化打标</div>
         <div class="tag-popover-row">
           <select v-model="tagPopover.prefix" class="tag-popover-prefix">
-            <option v-for="p in FACET_PREFIXES" :key="p" :value="p">{{ p }}</option>
+            <option v-for="ns in FACET_NAMESPACES" :key="ns.value" :value="ns.value">{{ ns.label }}</option>
           </select>
           <span class="tag-popover-sep">:</span>
           <input
@@ -1007,6 +1091,116 @@ function handleCancel() {
         <div v-if="tagPopover.value.trim()" class="tag-popover-preview">
           预览胶囊：
           <span class="tag-pill-preview">@{{ tagPopover.prefix }}:{{ tagPopover.value.trim() }}</span>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- ── 属性检查器 Popover (Inspector) — Phase 9.7.3 ─────────────────────── -->
+  <Teleport to="body">
+    <div
+      v-if="inspectorPopover.open"
+      class="insp-backdrop"
+      @click.self="closeInspectorPopover"
+    >
+      <div
+        class="insp-popover"
+        :style="{ top: inspectorPopover.top + 'px', left: inspectorPopover.left + 'px' }"
+      >
+        <div class="insp-header">
+          <span class="insp-header-icon">⚙️</span>
+          <span class="insp-header-title">属性检查器</span>
+          <span v-if="inspectorPopover.pill" class="insp-asset-chip">
+            {{ inspectorPopover.pill.asset_type }}
+          </span>
+          <button class="insp-close" @click="closeInspectorPopover">✕</button>
+        </div>
+
+        <!-- 九宫格排版行（仅视觉 Y 轴素材显示）-->
+        <div v-if="isVisualYAxis(inspectorPopover.pill)" class="cpm-inspector-row">
+          <span class="cpm-label">排版位置</span>
+          <select v-model="inspectorPopover.pill.layout" class="cpm-select-sm">
+            <option value="">(继承资产默认)</option>
+            <option
+              v-for="opt in LAYOUT_OPTIONS"
+              :key="opt.value"
+              :value="opt.value"
+            >{{ opt.label }}</option>
+          </select>
+        </div>
+
+        <!-- 非视觉素材兜底提示 -->
+        <div v-else class="insp-no-visual">
+          <span>{{ inspectorPopover.pill?.asset_type }} 类型素材无视觉排版属性</span>
+        </div>
+
+        <!-- 当前值预览 -->
+        <div v-if="inspectorPopover.pill?.layout" class="insp-value-preview">
+          <span class="insp-value-label">已设置：</span>
+          <span class="insp-value-badge">{{ inspectorPopover.pill.layout }}</span>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+  <!-- ── Beat 属性配置面板 Popover — Phase 9.11.1 ────────────────────────── -->
+  <Teleport to="body">
+    <div
+      v-if="activeConfigBeatIndex !== null"
+      class="beat-cfg-backdrop"
+      @click.self="activeConfigBeatIndex = null"
+    >
+      <div
+        class="beat-cfg-popover"
+        :style="{ top: beatConfigPos.top + 'px', left: beatConfigPos.left + 'px' }"
+      >
+        <!-- 面板头部 -->
+        <div class="beat-cfg-header">
+          <span class="beat-cfg-header-icon">⚙️</span>
+          <span class="beat-cfg-header-title">
+            配置 {{ localTracks[activeConfigBeatIndex]?.name }} 属性
+          </span>
+          <button class="beat-cfg-close" @click="activeConfigBeatIndex = null">✕</button>
+        </div>
+
+        <!-- Tab 导航 -->
+        <div class="beat-cfg-tabs">
+          <button
+            :class="['beat-cfg-tab', beatConfigTab === 'script' ? 'beat-cfg-tab--active' : '']"
+            @click="beatConfigTab = 'script'"
+          >📝 台词</button>
+          <button class="beat-cfg-tab beat-cfg-tab--disabled" disabled title="开发中">
+            🎬 转场
+          </button>
+          <button class="beat-cfg-tab beat-cfg-tab--disabled" disabled title="开发中">
+            ✨ 特效
+          </button>
+        </div>
+
+        <!-- Tab 内容区 -->
+        <div class="beat-cfg-body">
+          <div v-if="beatConfigTab === 'script'">
+            <textarea
+              v-model="configForm.script_text"
+              placeholder="输入该分镜的高光口播台词..."
+              class="cpm-textarea-sm"
+              rows="3"
+            />
+          </div>
+          <div v-else-if="beatConfigTab === 'transition'" class="beat-cfg-placeholder">
+            转场联动管线开发中...
+          </div>
+          <div v-else-if="beatConfigTab === 'vfx'" class="beat-cfg-placeholder">
+            特效智能叠加层开发中...
+          </div>
+        </div>
+
+        <!-- 操作 Footer -->
+        <div class="beat-cfg-footer">
+          <button class="beat-cfg-btn beat-cfg-btn--cancel" @click="activeConfigBeatIndex = null">取消</button>
+          <button
+            class="beat-cfg-btn beat-cfg-btn--confirm"
+            @click="saveConfigChanges(localTracks[activeConfigBeatIndex])"
+          >确定</button>
         </div>
       </div>
     </div>
@@ -1177,18 +1371,6 @@ function handleCancel() {
   font-weight:   700;
 }
 
-.orch-btn--sidebar-toggle {
-  background:   rgba(99, 102, 241, 0.08);
-  border-color: rgba(99, 102, 241, 0.3);
-  color:        #a5b4fc;
-}
-.orch-btn--sidebar-toggle:hover {
-  background:   rgba(99, 102, 241, 0.18);
-  border-color: rgba(99, 102, 241, 0.55);
-  color:        #c7d2fe;
-}
-
-/* ── Template select ──────────────────────────────────────────────────────────── */
 .orch-template-select {
   background:       linear-gradient(135deg, rgba(10, 18, 40, 0.95), rgba(30, 27, 75, 0.9));
   border:           1px solid rgba(99, 102, 241, 0.35);
@@ -1228,87 +1410,6 @@ function handleCancel() {
   min-width:      0;
   overflow:       hidden;
 }
-.orch-script-sidebar {
-  width:       280px;
-  flex-shrink: 0;
-  border-left: 1px solid rgba(99, 102, 241, 0.2);
-  background:  rgba(5, 10, 25, 0.5);
-  display:     flex;
-  flex-direction: column;
-}
-.script-header {
-  padding:       0.8rem 1.25rem;
-  font-size:     0.85rem;
-  font-weight:   700;
-  color:         #a5b4fc;
-  border-bottom: 1px solid rgba(99, 102, 241, 0.15);
-  background:    rgba(99, 102, 241, 0.05);
-  flex-shrink:   0;
-}
-.script-scroll {
-  flex:       1;
-  overflow-y: auto;
-  padding:    1rem;
-  display:    flex;
-  flex-direction: column;
-  gap:        1rem;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
-}
-.script-scroll::-webkit-scrollbar { width: 4px; }
-.script-scroll::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.22); border-radius: 2px; }
-.script-scene-card {
-  background:    rgba(30, 41, 59, 0.4);
-  border:        1px solid rgba(99, 102, 241, 0.2);
-  border-radius: 8px;
-  padding:       0.75rem;
-}
-.scene-meta {
-  font-size:   0.65rem;
-  font-weight: 700;
-  color:       #38bdf8;
-  margin-bottom: 0.3rem;
-}
-.scene-vp {
-  font-size:   0.6rem;
-  color:       #64748b;
-  margin-bottom: 0.6rem;
-  font-style:  italic;
-  overflow:    hidden;
-  text-overflow: ellipsis;
-  display:     -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-.scene-lang-group {
-  display:        flex;
-  flex-direction: column;
-  gap:            0.2rem;
-  margin-top:     0.4rem;
-}
-.lang-badge {
-  align-self:    flex-start;
-  font-size:     0.55rem;
-  background:    rgba(99, 102, 241, 0.15);
-  color:         #818cf8;
-  padding:       0.1rem 0.3rem;
-  border-radius: 4px;
-}
-.scene-textarea {
-  background:    rgba(15, 23, 42, 0.8);
-  border:        1px solid rgba(99, 102, 241, 0.2);
-  border-radius: 4px;
-  color:         #e2e8f0;
-  font-size:     0.75rem;
-  padding:       0.4rem;
-  resize:        vertical;
-  line-height:   1.4;
-  transition:    border-color 0.2s;
-  font-family:   inherit;
-  width:         100%;
-  box-sizing:    border-box;
-}
-.scene-textarea:focus { border-color: rgba(167, 139, 250, 0.6); outline: none; }
 
 /* ── Warehouse (top section) ────────────────────────────────────────────────── */
 .orch-warehouse {
@@ -1970,6 +2071,29 @@ function handleCancel() {
 .orch-asset-icon-thumb--sfx       { background: rgba(56,  189, 248, 0.08); }
 .orch-asset-icon-thumb--vfx       { background: rgba(139,  92, 246, 0.08); }
 
+/* ── text_template 待选卡片预览块 ───────────────────────────────────────────── */
+.orch-text-preview {
+  width:            100%;
+  height:           100%;
+  display:          flex;
+  align-items:      center;
+  justify-content:  center;
+  padding:          0.55rem 0.6rem;
+  box-sizing:       border-box;
+  background:       linear-gradient(135deg, #3b0764 0%, #4c1d95 45%, #1e1b4b 100%);
+  color:            #e9d5ff;
+  font-size:        0.72rem;
+  font-weight:      700;
+  line-height:      1.35;
+  text-align:       center;
+  word-break:       break-all;
+  overflow:         hidden;
+  display:          -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  border-radius:    inherit;
+}
+
 /* ── Block track: image / icon thumbs ───────────────────────────────────────── */
 .orch-block-thumb--img {
   object-fit:        cover;
@@ -1987,6 +2111,33 @@ function handleCancel() {
   align-items:     center;
   justify-content: center;
   font-size:       0.95rem;
+}
+
+/* ── text_template 轨道胶囊微型标识 ─────────────────────────────────────────── */
+.orch-block-text-thumb {
+  display:         flex;
+  align-items:     center;
+  gap:             0.25rem;
+  flex-shrink:     0;
+  max-width:       120px;
+  height:          32px;
+  padding:         0 0.4rem;
+  border-radius:   4px;
+  background:      rgba(109, 40, 217, 0.25);
+  border:          1px solid rgba(139, 92, 246, 0.4);
+  overflow:        hidden;
+}
+.orch-block-text-thumb .text-icon {
+  font-size:       0.8rem;
+  flex-shrink:     0;
+}
+.orch-block-text-thumb .text-snippet {
+  font-size:       0.65rem;
+  font-weight:     600;
+  color:           #c4b5fd;
+  white-space:     nowrap;
+  overflow:        hidden;
+  text-overflow:   ellipsis;
 }
 
 /* ── Faceted Tag Sections ────────────────────────────────────────────────────── */
@@ -2629,4 +2780,357 @@ function handleCancel() {
 }
 .cockpit-dot--on  { background: #818cf8; }
 .cockpit-dot--off { background: #334155; }
+
+/* ════════════════════════════════════════════════════════════
+   Phase 9.7.3 — 属性检查器按钮 & Inspector Popover
+   ════════════════════════════════════════════════════════════ */
+
+/* ── 块卡上的属性检查器按钮 ──────────────────────────────── */
+.orch-block-inspect-btn {
+  background:    transparent;
+  border:        none;
+  font-size:     0.65rem;
+  cursor:        pointer;
+  padding:       0.1rem 0.15rem;
+  border-radius: 3px;
+  flex-shrink:   0;
+  line-height:   1;
+  opacity:       0;
+  transition:    opacity 0.15s, background 0.12s, box-shadow 0.15s;
+}
+.orch-block:hover .orch-block-inspect-btn { opacity: 1; }
+.orch-block-inspect-btn:hover { background: rgba(56, 189, 248, 0.18); }
+
+/* 已设置排版位置时，始终显示高亮点缀 */
+.orch-block-inspect-btn--set {
+  opacity:    1 !important;
+  filter:     drop-shadow(0 0 4px rgba(56, 189, 248, 0.7));
+}
+
+/* ── Inspector Popover 遮罩层 ────────────────────────────── */
+.insp-backdrop {
+  position: fixed;
+  inset:    0;
+  z-index:  3000;
+}
+
+/* ── Inspector Popover 气泡 ──────────────────────────────── */
+.insp-popover {
+  position:       fixed;
+  z-index:        3001;
+  min-width:      248px;
+  background:     #0a1020;
+  border:         1px solid rgba(56, 189, 248, 0.45);
+  border-radius:  10px;
+  box-shadow:     0 0 24px rgba(56, 189, 248, 0.14), 0 8px 32px rgba(0, 0, 0, 0.65);
+  padding:        0.6rem 0.8rem;
+  display:        flex;
+  flex-direction: column;
+  gap:            0.5rem;
+}
+
+/* ── 头部 ────────────────────────────────────────────────── */
+.insp-header {
+  display:     flex;
+  align-items: center;
+  gap:         0.4rem;
+}
+.insp-header-icon { font-size: 0.8rem; flex-shrink: 0; }
+.insp-header-title {
+  font-size:      0.72rem;
+  font-weight:    700;
+  color:          #7dd3fc;
+  letter-spacing: 0.04em;
+  flex:           1;
+}
+.insp-asset-chip {
+  font-size:     0.58rem;
+  font-family:   'JetBrains Mono', monospace;
+  font-weight:   600;
+  color:         #38bdf8;
+  background:    rgba(56, 189, 248, 0.1);
+  border:        1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 4px;
+  padding:       0.04rem 0.32rem;
+  flex-shrink:   0;
+  letter-spacing: 0.03em;
+}
+.insp-close {
+  background:    transparent;
+  border:        none;
+  color:         #475569;
+  font-size:     0.65rem;
+  cursor:        pointer;
+  padding:       0.1rem 0.18rem;
+  border-radius: 3px;
+  flex-shrink:   0;
+  line-height:   1;
+  transition:    color 0.12s, background 0.12s;
+}
+.insp-close:hover { color: #f87171; background: rgba(239, 68, 68, 0.1); }
+
+/* ── 检查器属性行 (cpm-inspector-row) ───────────────────── */
+.cpm-inspector-row {
+  display:     flex;
+  align-items: center;
+  gap:         0.5rem;
+}
+.cpm-label {
+  font-size:      0.65rem;
+  font-weight:    600;
+  color:          #64748b;
+  white-space:    nowrap;
+  flex-shrink:    0;
+  letter-spacing: 0.02em;
+}
+.cpm-select-sm {
+  flex:          1;
+  min-width:     0;
+  background:    rgba(15, 23, 42, 0.85);
+  border:        1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 6px;
+  color:         #94a3b8;
+  font-size:     0.68rem;
+  font-weight:   500;
+  padding:       0.22rem 1.4rem 0.22rem 0.4rem;
+  cursor:        pointer;
+  outline:       none;
+  appearance:    none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%2338bdf8'/%3E%3C/svg%3E");
+  background-repeat:   no-repeat;
+  background-position: right 0.38rem center;
+  transition:    border-color 0.18s, color 0.18s;
+}
+.cpm-select-sm:hover { border-color: rgba(56, 189, 248, 0.65); color: #e2e8f0; }
+.cpm-select-sm option { background: #0f172a; color: #e2e8f0; }
+
+/* ── 非视觉素材提示 ──────────────────────────────────────── */
+.insp-no-visual {
+  font-size:  0.65rem;
+  color:      #475569;
+  font-style: italic;
+  padding:    0.1rem 0;
+}
+
+/* ── 已设置值预览行 ──────────────────────────────────────── */
+.insp-value-preview {
+  display:     flex;
+  align-items: center;
+  gap:         0.35rem;
+  padding-top: 0.1rem;
+}
+.insp-value-label {
+  font-size:  0.6rem;
+  color:      #475569;
+  flex-shrink: 0;
+}
+.insp-value-badge {
+  display:       inline-flex;
+  align-items:   center;
+  padding:       0.08rem 0.4rem;
+  border-radius: 20px;
+  font-size:     0.62rem;
+  font-weight:   600;
+  background:    rgba(56, 189, 248, 0.14);
+  color:         #7dd3fc;
+  border:        1px solid rgba(56, 189, 248, 0.38);
+  box-shadow:    0 0 6px rgba(56, 189, 248, 0.2);
+  letter-spacing: 0.03em;
+  font-family:   'JetBrains Mono', monospace;
+}
+
+/* ════════════════════════════════════════════════════════════
+   Phase 9.11.1 — Beat 属性配置面板 (Beat Config Popover)
+   ════════════════════════════════════════════════════════════ */
+
+/* ── Beat 标题行：配置图标按钮 ───────────────────────────── */
+.beat-cfg-icon-btn {
+  background:    transparent;
+  border:        none;
+  font-size:     0.65rem;
+  cursor:        pointer;
+  padding:       0.1rem 0.15rem;
+  border-radius: 3px;
+  flex-shrink:   0;
+  line-height:   1;
+  opacity:       0;
+  transition:    opacity 0.15s, background 0.12s, filter 0.15s;
+}
+.orch-track:hover .beat-cfg-icon-btn { opacity: 1; }
+.beat-cfg-icon-btn:hover { background: rgba(99, 102, 241, 0.2); }
+
+/* 已配置台词时常驻高亮 */
+.beat-cfg-icon-btn--set {
+  opacity:  1 !important;
+  filter:   drop-shadow(0 0 4px rgba(99, 102, 241, 0.75));
+}
+
+/* ── 遮罩层 ──────────────────────────────────────────────── */
+.beat-cfg-backdrop {
+  position: fixed;
+  inset:    0;
+  z-index:  3100;
+}
+
+/* ── 浮动配置卡片 ─────────────────────────────────────────── */
+.beat-cfg-popover {
+  position:       fixed;
+  z-index:        3101;
+  width:          300px;
+  background:     #090e1d;
+  border:         1px solid rgba(99, 102, 241, 0.5);
+  border-radius:  12px;
+  box-shadow:     0 0 28px rgba(99, 102, 241, 0.18), 0 12px 40px rgba(0, 0, 0, 0.7);
+  display:        flex;
+  flex-direction: column;
+  overflow:       hidden;
+}
+
+/* ── 面板头部 ────────────────────────────────────────────── */
+.beat-cfg-header {
+  display:       flex;
+  align-items:   center;
+  gap:           0.4rem;
+  padding:       0.6rem 0.8rem 0.55rem;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.18);
+  background:    rgba(99, 102, 241, 0.06);
+  flex-shrink:   0;
+}
+.beat-cfg-header-icon { font-size: 0.78rem; flex-shrink: 0; }
+.beat-cfg-header-title {
+  flex:           1;
+  min-width:      0;
+  font-size:      0.72rem;
+  font-weight:    700;
+  color:          #a5b4fc;
+  letter-spacing: 0.03em;
+  white-space:    nowrap;
+  overflow:       hidden;
+  text-overflow:  ellipsis;
+}
+.beat-cfg-close {
+  background:    transparent;
+  border:        none;
+  color:         #475569;
+  font-size:     0.65rem;
+  cursor:        pointer;
+  padding:       0.1rem 0.18rem;
+  border-radius: 3px;
+  flex-shrink:   0;
+  line-height:   1;
+  transition:    color 0.12s, background 0.12s;
+}
+.beat-cfg-close:hover { color: #f87171; background: rgba(239, 68, 68, 0.1); }
+
+/* ── Tab 导航行 ──────────────────────────────────────────── */
+.beat-cfg-tabs {
+  display:       flex;
+  gap:           0.2rem;
+  padding:       0.4rem 0.7rem 0;
+  flex-shrink:   0;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.1);
+}
+.beat-cfg-tab {
+  background:    transparent;
+  border:        1px solid transparent;
+  border-bottom: none;
+  color:         #475569;
+  font-size:     0.7rem;
+  font-weight:   500;
+  padding:       0.3rem 0.7rem;
+  border-radius: 6px 6px 0 0;
+  cursor:        pointer;
+  transition:    color 0.14s, background 0.14s, border-color 0.14s;
+  white-space:   nowrap;
+}
+.beat-cfg-tab:hover:not(:disabled) { color: #94a3b8; background: rgba(99, 102, 241, 0.07); }
+.beat-cfg-tab--active {
+  color:        #a5b4fc !important;
+  background:   rgba(99, 102, 241, 0.14) !important;
+  border-color: rgba(99, 102, 241, 0.35) !important;
+}
+.beat-cfg-tab--disabled {
+  color:   #2d3748 !important;
+  cursor:  not-allowed !important;
+  opacity: 0.55;
+}
+
+/* ── Tab 内容区 ──────────────────────────────────────────── */
+.beat-cfg-body {
+  padding:    0.65rem 0.75rem 0.5rem;
+  flex-shrink: 0;
+}
+
+/* textarea 样式（台词输入区） */
+.cpm-textarea-sm {
+  width:         100%;
+  box-sizing:    border-box;
+  background:    rgba(15, 23, 42, 0.85);
+  border:        1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 7px;
+  color:         #e2e8f0;
+  font-size:     0.75rem;
+  font-family:   inherit;
+  line-height:   1.55;
+  padding:       0.45rem 0.55rem;
+  resize:        vertical;
+  outline:       none;
+  transition:    border-color 0.18s, box-shadow 0.18s;
+}
+.cpm-textarea-sm::placeholder { color: #3b4a63; }
+.cpm-textarea-sm:focus {
+  border-color: rgba(99, 102, 241, 0.6);
+  box-shadow:   0 0 0 2px rgba(99, 102, 241, 0.12);
+}
+
+/* 未来扩展占位提示 */
+.beat-cfg-placeholder {
+  font-size:   0.7rem;
+  color:       #334155;
+  font-style:  italic;
+  padding:     0.8rem 0.2rem;
+  text-align:  center;
+}
+
+/* ── 操作 Footer ─────────────────────────────────────────── */
+.beat-cfg-footer {
+  display:         flex;
+  justify-content: flex-end;
+  align-items:     center;
+  gap:             0.5rem;
+  padding:         0.5rem 0.75rem 0.6rem;
+  border-top:      1px solid rgba(99, 102, 241, 0.12);
+  flex-shrink:     0;
+}
+.beat-cfg-btn {
+  font-size:     0.72rem;
+  font-weight:   600;
+  padding:       0.3rem 0.9rem;
+  border-radius: 6px;
+  cursor:        pointer;
+  border:        1px solid transparent;
+  transition:    background 0.15s, border-color 0.15s, box-shadow 0.15s;
+  letter-spacing: 0.02em;
+}
+.beat-cfg-btn--cancel {
+  background:   rgba(100, 116, 139, 0.1);
+  border-color: rgba(100, 116, 139, 0.28);
+  color:        #64748b;
+}
+.beat-cfg-btn--cancel:hover {
+  background:   rgba(100, 116, 139, 0.2);
+  border-color: rgba(100, 116, 139, 0.45);
+  color:        #94a3b8;
+}
+.beat-cfg-btn--confirm {
+  background:   linear-gradient(135deg, #4f46e5, #6366f1);
+  border-color: rgba(139, 92, 246, 0.45);
+  color:        #ffffff;
+  box-shadow:   0 0 12px rgba(99, 102, 241, 0.25);
+}
+.beat-cfg-btn--confirm:hover {
+  background:  linear-gradient(135deg, #4338ca, #4f46e5);
+  box-shadow:  0 0 18px rgba(99, 102, 241, 0.45);
+}
 </style>

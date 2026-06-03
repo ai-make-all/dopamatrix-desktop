@@ -110,8 +110,188 @@ class FFmpegCompositorNode(BaseNode):
     # ------------------------------------------------------------------
     # 核心编译器：Timeline → (input_args, video_filtergraph, audio_filtergraph)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _probe_duration(file_path: str) -> float:
+        """
+        使用 ffprobe 探测媒体文件的真实时长（秒）。
+        任何异常均静默返回 0.0，由上层按名义时长兜底。
+        """
+        ffprobe_bin = get_ffmpeg_path("ffprobe.exe")
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_bin,
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=_WIN_NO_WINDOW,
+            )
+            val = result.stdout.strip()
+            return float(val) if val else 0.0
+        except Exception:
+            return 0.0
+
+    def _compute_beat_timeline(
+        self, main_video_clips: "List[Clip]"
+    ) -> "Tuple[List[float], float]":
+        """
+        【全局时间线计算 — Phase 9.7.1 Late-Binding 核心】
+
+        在寻址引擎已为各 Beat 确定真实物理素材、ffprobe 采集到 duration 之后，
+        但在拼接 FFmpeg filter_complex 字符串之前执行：
+
+        1. 以 X 轴主视频轨道的 Clip 列表为输入（顺序即 Beat 顺序）。
+        2. 对每个 Clip 运行 ffprobe 获取真实时长；失败时退回 Clip.duration 名义值。
+        3. 累加得出每个 Beat 的绝对起始时间 beat_actual_starts[i]。
+
+        Args:
+            main_video_clips: 主视频轨道（layer_index==0 / track_type="video"）
+                              中的所有 Clip，按 Beat 顺序排列。
+
+        Returns:
+            (beat_actual_starts, total_actual_duration)
+            beat_actual_starts[i] = Beat i 在最终视频中的绝对起始时间（秒）
+        """
+        beat_actual_starts: List[float] = []
+        current_time = 0.0
+
+        for clip in main_video_clips:
+            beat_actual_starts.append(current_time)
+            actual_dur = 0.0
+            if os.path.isfile(clip.file_path):
+                actual_dur = self._probe_duration(clip.file_path)
+            if actual_dur <= 0:
+                # ffprobe 失败时退回名义时长，再退回保守值 5s
+                actual_dur = (clip.duration or 0.0) if (clip.duration or 0.0) > 0 else 5.0
+                self.log(
+                    f"[GlobalTimeline] ffprobe 失败 '{clip.file_path}'，"
+                    f"使用名义时长 {actual_dur:.3f}s 作为兜底。"
+                )
+            current_time += actual_dur
+
+        self.log(
+            f"[GlobalTimeline] {len(main_video_clips)} 个主视频 Clip → "
+            f"beat_actual_starts={[round(s, 3) for s in beat_actual_starts]} "
+            f"total={current_time:.3f}s"
+        )
+        return beat_actual_starts, current_time
+
+    @staticmethod
+    def _resolve_clip_timing(
+        clip: "Clip",
+        beat_actual_starts: "List[float]",
+        total_actual_dur: float,
+    ) -> "Tuple[float, float]":
+        """
+        计算叠加层 Clip（overlay / text_overlay）的绝对显示窗口 (t_start, t_end)。
+
+        • DSL 路径：Clip.beat_index 已由 dsl_adapter 标注，
+          直接查 beat_actual_starts 映射到真实物理时间域。
+        • Assembler 路径：beat_index=None，退回 Clip 自身的 start_time / duration
+          （assembler 已经设置了正确的绝对时间，无需重新计算）。
+        """
+        if clip.beat_index is not None and beat_actual_starts:
+            idx = clip.beat_index
+            if 0 <= idx < len(beat_actual_starts):
+                t_start = beat_actual_starts[idx]
+                t_end = (
+                    beat_actual_starts[idx + 1]
+                    if idx + 1 < len(beat_actual_starts)
+                    else total_actual_dur
+                )
+                return t_start, t_end
+        # Assembler / 未知路径：使用 Clip 自身时间戳
+        t_start = clip.start_time
+        t_end = t_start + (clip.duration if clip.duration is not None else 0.0)
+        return t_start, t_end
+
+    @staticmethod
+    def get_ffmpeg_coordinates(
+        position_key: str, is_text: bool = False
+    ) -> tuple[str, str]:
+        """
+        九宫格空间排版坐标解析引擎（Phase 9.7.2）。
+
+        将抽象的布局意图键转换为 FFmpeg 滤镜表达式 (x, y)。
+
+        变量体系差异（FFmpeg 内部约定）：
+          drawtext（is_text=True）：
+            tw / th  — 渲染后文字的像素宽高
+            w  / h   — 主画布（视频帧）宽高
+          overlay（is_text=False）：
+            w  / h   — 叠加物（贴纸/图片）宽高
+            W  / H   — 主画布（视频帧）宽高
+
+        Args:
+            position_key: 九宫格位置键，支持的取值：
+                'center'        — 正中心
+                'bottom_center' — 底部居中（TikTok/Shorts 安全区）
+                'top_center'    — 顶部居中
+                'top_left'      — 左上角（固定边距）
+                'top_right'     — 右上角（固定边距）
+                'bottom_left'   — 左下角（TikTok/Shorts 安全区）
+                其他未知值      — 回退到 'center'
+            is_text: True 表示 drawtext 变量体系；False 表示 overlay 变量体系。
+
+        Returns:
+            (x_expr, y_expr) — 可直接拼入 FFmpeg 滤镜的表达式字符串元组。
+        """
+        if is_text:
+            ow, oh = "tw", "th"   # drawtext: text_w / text_h
+            mw, mh = "w",  "h"   # drawtext: main canvas w / h
+        else:
+            ow, oh = "w",  "h"   # overlay: overlay item w / h
+            mw, mh = "W",  "H"   # overlay: main canvas W / H
+
+        _MAP: dict[str, tuple[str, str]] = {
+            "center": (
+                f"({mw}-{ow})/2",
+                f"({mh}-{oh})/2",
+            ),
+            "bottom_center": (
+                f"({mw}-{ow})/2",
+                f"{mh}-{oh}-({mh}*0.15)",
+            ),
+            "top_center": (
+                f"({mw}-{ow})/2",
+                f"{mh}*0.1",
+            ),
+            "top_left": (
+                "50",
+                "100",
+            ),
+            "top_right": (
+                f"{mw}-{ow}-50",
+                "100",
+            ),
+            "bottom_left": (
+                "50",
+                f"{mh}-{oh}-({mh}*0.15)",
+            ),
+        }
+        return _MAP.get(position_key, _MAP["center"])
+
+    @staticmethod
+    def _escape_drawtext(text: str) -> str:
+        """
+        对 FFmpeg drawtext 滤镜的 text 参数执行特殊字符转义。
+
+        FFmpeg drawtext 的 text 值中，以下字符需要反斜杠转义：
+          \\  '  :  [  ]  ,  ;
+        此外还需转义百分号（%），避免被解释为 FFmpeg 格式化占位符。
+        """
+        for ch in ("\\", "'", ":", "[", "]", ",", ";", "%"):
+            text = text.replace(ch, "\\" + ch)
+        return text
+
     def _build_filtergraph(
-        self, timeline: Timeline
+        self, timeline: Timeline, language: str = "en"
     ) -> Tuple[List[str], str, str]:
         """
         将 Timeline 的多轨数据编译为 FFmpeg 复杂滤镜图字符串。
@@ -122,6 +302,8 @@ class FFmpegCompositorNode(BaseNode):
             → 级联 overlay 滤镜（由低 z_index 向高 z_index 逐层叠加）
             → enable='between(t,{t_start},{t_end})' 精确控制每层时间窗口
             → overlay_x / overlay_y 控制每层定位（来自 Clip 元数据）
+          文本叠加：track_type="text_overlay" 的轨道 → 从 manifest.content_matrix
+            按 language 提取文本 → 注入 drawtext 滤镜（无物理输入文件）
 
         PNG 透明通道保留：
           overlay 轨道的 PNG 素材必须先经过 format=rgba 转换（保留 alpha），
@@ -132,6 +314,11 @@ class FFmpegCompositorNode(BaseNode):
           若仅有一个音频输入则直接 anull 透传 [outa]，
           若有多个则用 amix 混合为 [outa]。
 
+        Args:
+            timeline: 已组装的 Timeline 对象。
+            language: 目标渲染语种（如 'zh'、'en'、'ar'），
+                      text_overlay 轨道从 content_matrix 中按此键提取文本。
+
         Returns:
             input_args:        FFmpeg 的所有 -i 输入参数列表（视频+音频统一编号）
             video_filtergraph: 视频部分的 filter_complex 子串（以 [outv] 结尾）
@@ -140,6 +327,19 @@ class FFmpegCompositorNode(BaseNode):
         """
         self.log("正在将 X/Y 轴时间线编译为 FFmpeg 槽位滤镜图...")
 
+        # ── Step 0: 全局真实时间轴计算（Late-Binding，Phase 9.7.1）──────────
+        # 在 ffprobe 确定主视频 Clip 真实时长之后、拼接 filter_complex 之前执行。
+        # 结果供后续 overlay / text_overlay 注入 enable='between(t,start,end)'。
+        _main_video_clips: List[Clip] = []
+        for _track in timeline.tracks:
+            if getattr(_track, "track_type", "video") == "video" and _track.clips:
+                _main_video_clips = list(_track.clips)
+                break  # 主视频轨唯一，找到即止
+
+        beat_actual_starts: List[float]
+        total_actual_dur: float
+        beat_actual_starts, total_actual_dur = self._compute_beat_timeline(_main_video_clips)
+
         input_args: List[str] = []    # [-i file1, -i file2, ...]
         video_parts: List[str] = []   # 视频 filtergraph 语句
         audio_parts: List[str] = []   # 音频 filtergraph 语句
@@ -147,24 +347,61 @@ class FFmpegCompositorNode(BaseNode):
 
         # 基础视频轨（track_type="video"）的拼接输出标签
         base_video_out_labels: List[str] = []
-        # Y 轴叠加轨（track_type="overlay"）的槽位 + clip 元数据
-        overlay_slots: List[Tuple[str, Clip]] = []   # [(rgba_label, clip_obj), ...]
+        # Y 轴叠加轨（track_type="overlay"）的槽位 + clip 元数据 + 是否静态图片
+        overlay_slots: List[Tuple[str, Clip, bool]] = []  # (rgba_label, clip, is_image)
+        # 文本叠加轨（track_type="text_overlay"）：(display_text, clip_obj)
+        text_overlay_slots: List[Tuple[str, Clip]] = []
 
-        # ── Step 1: 遍历 Track，区分 video / overlay ───────────────────
+        # ── Step 1: 遍历 Track，区分 video / overlay / text_overlay ────
         for t_idx, track in enumerate(timeline.tracks):
             if not track.clips:
                 continue
 
+            track_type = getattr(track, "track_type", "video")
+
+            # ── text_overlay 轨道（text_template 虚拟资产）──────────────
+            # 无物理文件，不添加 -i 输入；直接从 manifest.content_matrix
+            # 按目标语种提取文本，延迟到 overlay 级联阶段注入 drawtext 滤镜。
+            if track_type == "text_overlay":
+                clip = track.clips[0]
+                content_matrix: dict = {}
+                if clip.manifest:
+                    content_matrix = clip.manifest.get("content_matrix", {})
+                # 优先目标语种 → 降级 zh → 降级第一个可用语种 → 素材路径兜底
+                display_text = (
+                    content_matrix.get(language)
+                    or content_matrix.get("zh")
+                    or (next(iter(content_matrix.values()), None) if content_matrix else None)
+                    or clip.file_path  # 最终兜底：显示虚拟路径（便于调试）
+                )
+                text_overlay_slots.append((str(display_text), clip))
+                self.log(
+                    f"[TextOverlay] track={track.name} lang={language} "
+                    f"text={str(display_text)[:40]!r}"
+                )
+                continue
+
             # ── overlay 轨道（PNG 图层）：只注册输入槽位，不走 concat ──────
-            if getattr(track, "track_type", "video") == "overlay":
+            if track_type == "overlay":
                 # overlay 轨道通常只有 1 个 Clip（logo 或 sticker）
                 clip = track.clips[0]
-                input_args.extend(["-i", clip.file_path])
+                # 静态图片检测（png/jpg/webp/bmp）：
+                #   -loop 1 让图片流无限循环，避免单帧闪退；
+                #   overlay 滤镜侧追加 shortest=1 安全截断，防止输出视频被无限拉长。
+                _ext = clip.file_path.rsplit(".", 1)[-1].lower() if "." in clip.file_path else ""
+                _is_static_image = _ext in {"png", "jpg", "jpeg", "webp", "bmp"}
+                if _is_static_image:
+                    input_args.extend(["-loop", "1", "-i", clip.file_path])
+                    self.log(
+                        f"[Overlay] 静态图片输入: {clip.file_path!r} → 追加 -loop 1"
+                    )
+                else:
+                    input_args.extend(["-i", clip.file_path])
                 raw_label = f"[{clip_index}:v]"
                 rgba_label = f"[rgba{clip_index}]"
                 # format=rgba：保留 PNG 透明通道，避免 alpha 被黑色填充
                 video_parts.append(f"{raw_label}format=rgba{rgba_label}")
-                overlay_slots.append((rgba_label, clip))
+                overlay_slots.append((rgba_label, clip, _is_static_image))
                 clip_index += 1
                 continue
 
@@ -240,31 +477,98 @@ class FFmpegCompositorNode(BaseNode):
 
         # Y 轴级联 PNG overlay（按 overlay_slots 顺序，z_index 由低到高）
         total_overlay_count = len(overlay_slots)
-        for ov_idx, (rgba_label, clip) in enumerate(overlay_slots):
-            is_last = (ov_idx == total_overlay_count - 1)
-            out_label = "[outv]" if is_last else f"[comp_ov{ov_idx}]"
+        total_text_count = len(text_overlay_slots)
+        # 若后续还有 text_overlay 要串联，PNG overlay 的最后一级不能直接输出 [outv]，
+        # 而应输出一个中间过渡标签，由 drawtext 链终结为 [outv]。
+        _has_text_after_overlay = total_text_count > 0
 
-            # 定位坐标：从 Clip.overlay_x / overlay_y 读取（默认左上角 0:0）
-            ov_x = getattr(clip, "overlay_x", None) or "0"
-            ov_y = getattr(clip, "overlay_y", None) or "0"
+        for ov_idx, (rgba_label, clip, is_image) in enumerate(overlay_slots):
+            is_last_ov = (ov_idx == total_overlay_count - 1)
+            # 若 PNG overlay 是最后一层且后续无文本叠加，直接终结为 [outv]
+            if is_last_ov and not _has_text_after_overlay:
+                out_label = "[outv]"
+            else:
+                out_label = f"[comp_ov{ov_idx}]"
 
-            # 时间窗口：enable='between(t,start,end)' 精确控制显示区间
-            t_start = clip.start_time
-            t_end = t_start + (clip.duration if clip.duration is not None else 0.0)
-            enable = f"'between(t,{t_start},{t_end})'"
+            # 定位坐标：三级优先级 — layout 九宫格 > overlay_x/y 传统字段 > 左上角 0:0
+            _clip_layout = getattr(clip, "layout", None)
+            if _clip_layout:
+                ov_x, ov_y = self.get_ffmpeg_coordinates(_clip_layout, is_text=False)
+            else:
+                ov_x = getattr(clip, "overlay_x", None) or "0"
+                ov_y = getattr(clip, "overlay_y", None) or "0"
+
+            # 时间窗口：使用全局真实时间轴（Late-Binding），精确控制显示区间。
+            # DSL 路径：beat_index 已标注 → 使用 ffprobe 采集的累积真实时间。
+            # Assembler 路径：beat_index=None → 退回 Clip 自身 start_time/duration。
+            t_start, t_end = self._resolve_clip_timing(
+                clip, beat_actual_starts, total_actual_dur
+            )
+            enable = f"'between(t,{t_start:.6f},{t_end:.6f})'"
+
+            # 静态图片安全兜底：shortest=1 确保 -loop 1 图片流不会拉长输出视频。
+            # 当主视频流结束时，overlay 滤镜随之终止，完全防止无限延伸。
+            overlay_extra = ":shortest=1" if is_image else ""
 
             video_parts.append(
-                f"{base}{rgba_label}overlay={ov_x}:{ov_y}:enable={enable}{out_label}"
+                f"{base}{rgba_label}overlay={ov_x}:{ov_y}:enable={enable}{overlay_extra}{out_label}"
             )
             base = out_label
             self.log(
                 f"[Overlay] slot {ov_idx}: {rgba_label} @ ({ov_x},{ov_y}) "
-                f"enable=between(t,{t_start},{t_end}) -> {out_label}"
+                f"layout={_clip_layout or 'legacy'} "
+                f"enable=between(t,{t_start:.3f},{t_end:.3f}) "
+                f"{'[image/shortest=1]' if is_image else '[video]'} → {out_label}"
             )
 
-        # 无 overlay 轨道时：基础视频直接命名为 [outv]
-        if total_overlay_count == 0:
+        # 无任何叠加层：基础视频直接 copy → [outv]
+        # 仅有文本叠加（无 PNG overlay）：先 copy 到过渡标签，再由 drawtext 链终结
+        if total_overlay_count == 0 and total_text_count == 0:
             video_parts.append(f"{base}copy[outv]")
+        elif total_overlay_count == 0 and total_text_count > 0:
+            pre_text_label = "[pre_text]"
+            video_parts.append(f"{base}copy{pre_text_label}")
+            base = pre_text_label
+
+        # ── Step 2b: 级联 text_overlay（drawtext 滤镜链）──────────────
+        # text_template 无物理输入文件，直接在视频流上叠加 drawtext 滤镜。
+        # 每个文本槽位依次串联，最终输出 [outv]。
+        # 建议字体参数：fontsize 根据画幅动态计算，居中显示 + 半透明底框。
+        for txt_idx, (display_text, clip) in enumerate(text_overlay_slots):
+            is_last_txt = (txt_idx == total_text_count - 1)
+            out_label = "[outv]" if is_last_txt else f"[comp_txt{txt_idx}]"
+
+            escaped = self._escape_drawtext(display_text)
+            # 时间窗口：使用全局真实时间轴（Late-Binding），与 Beat 的物理素材时长完美同寿。
+            t_start, t_end = self._resolve_clip_timing(
+                clip, beat_actual_starts, total_actual_dur
+            )
+
+            # fontsize 按画幅高度 1/18 自适应（竖屏 1280 → ~71px；横屏 720 → ~40px）
+            font_size = max(int(self.target_h / 18), 28)
+
+            # 九宫格坐标解析：读取 clip.layout（三级优先级已由 DSLAdapter 注入）
+            _txt_layout = getattr(clip, "layout", None) or "center"
+            txt_x, txt_y = self.get_ffmpeg_coordinates(_txt_layout, is_text=True)
+
+            drawtext_filter = (
+                f"drawtext="
+                f"text='{escaped}':"
+                f"fontsize={font_size}:"
+                f"fontcolor=white:"
+                f"x={txt_x}:"
+                f"y={txt_y}:"
+                f"box=1:boxcolor=black@0.5:boxborderw=10:"
+                f"enable='between(t\\,{t_start:.6f}\\,{t_end:.6f})'"
+            )
+            video_parts.append(f"{base}{drawtext_filter}{out_label}")
+            base = out_label
+            self.log(
+                f"[TextOverlay] drawtext slot {txt_idx}: "
+                f"text={display_text[:30]!r} layout={_txt_layout} "
+                f"x={txt_x} y={txt_y} "
+                f"enable=between({t_start:.3f},{t_end:.3f}) → {out_label}"
+            )
 
         video_filtergraph = ";".join(video_parts)
 
@@ -324,8 +628,9 @@ class FFmpegCompositorNode(BaseNode):
             f"{len(timeline.audio_tracks)} audio tracks)..."
         )
 
-        # 2. 调用编译器
-        input_args, video_fg, audio_fg = self._build_filtergraph(timeline)
+        # 2. 调用编译器（传入目标语种，供 text_overlay 轨道提取 content_matrix 文本）
+        render_lang: str = getattr(context, "test_language", None) or "en"
+        input_args, video_fg, audio_fg = self._build_filtergraph(timeline, language=render_lang)
 
         if not video_fg:
             self.log("Warning: empty filtergraph — nothing to render.")
@@ -413,7 +718,7 @@ class FFmpegCompositorNode(BaseNode):
                 except ValueError:
                     continue
 
-                pct = min(int(elapsed_us * 100 / total_us), 99)  # 保留 100 给 completed 推送
+                pct = min(int(elapsed_us * 100 / total_us), 99)  # 99 封顶；completed 由 render_worker 推送
                 now = time.monotonic()
                 # 限速规则：两次广播间隔 ≥ 1s，或进度跳变 ≥ 5%（防止高频刷屏）
                 if now - _last_ws_time >= 1.0 or pct - _last_pct >= 5:
@@ -459,29 +764,8 @@ class FFmpegCompositorNode(BaseNode):
             self._ws_broadcast(task_id, user_id, {"status": "failed"})
             raise
 
-        # 9. 全部变体完成 → 推送最终 completed 事件（含所有资产路径）
-        #    优先取 context.variants 中的 final_video（含配音+字幕的完整变体），
-        #    若无变体则回退到母带路径（纯静音画面，至少保证前端能看到产出）
-        all_assets = [
-            {
-                "file_path": v.get("final_video", ""),
-                "file_hash": self._quick_hash(v["final_video"]),
-            }
-            for v in context.variants.values()
-            if v.get("final_video") and os.path.exists(v["final_video"])
-        ]
-        if not all_assets and os.path.exists(output_path):
-            all_assets = [{"file_path": output_path, "file_hash": self._quick_hash(output_path)}]
-
-        # 批量模式（ws_suppress_completed=True）由 render_batch_worker 统一发送最终 completed，
-        # 此处跳过，避免 4 个子任务各自推送 completed 导致卡片反复切换状态。
-        if all_assets and not context.config.get("ws_suppress_completed", False):
-            self._ws_broadcast(task_id, user_id, {"status": "completed", "assets": all_assets})
-            logger.info(
-                "[FFmpegCompositorNode] ✅ 渲染全部完成，已向事件总线推送 %d 个资产。",
-                len(all_assets),
-            )
-
+        # WS completed 推送职责已移交给 render_worker（routes_dsl.py），
+        # 确保在 CoverNode 抽帧完成后才推送，cover_path 才能包含在 payload 中。
         return context
 
     # ------------------------------------------------------------------

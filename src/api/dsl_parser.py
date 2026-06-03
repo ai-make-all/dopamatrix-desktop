@@ -26,6 +26,7 @@ import logging
 import random
 from typing import List, Optional, Tuple, cast
 
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .models import LocalAsset
@@ -48,6 +49,9 @@ ASSET_REGISTRY = {
     "audio_sfx": {"axis_type": "Y_LAYER"},
     "sticker": {"axis_type": "Y_LAYER"},
     "logo": {"axis_type": "Y_LAYER"},
+    # text_template 为虚拟资产（无物理文件），归属 Y 轴叠加层；
+    # 渲染阶段由 compositor 从 manifest.content_matrix 提取文本并注入 drawtext 滤镜
+    "text_template": {"axis_type": "Y_LAYER"},
 }
 
 
@@ -138,6 +142,7 @@ class DSLParserNode:
                     f"未知的 address_mode='{node.address_mode}'，"
                     "合法值为 'locked' | 'smart'。"
                 ],
+                script_text=node.script_text,
             )
 
     # ================================================================ #
@@ -326,6 +331,7 @@ class DSLParserNode:
             layers=layers,
             resolved=resolved,
             warnings=warnings,
+            script_text=node.script_text,
         )
 
     # ================================================================ #
@@ -350,6 +356,7 @@ class DSLParserNode:
                 layers=[],
                 resolved=False,
                 warnings=warnings,
+                script_text=node.script_text,
             )
 
         # ── 查询所有类型素材，Python 侧统一打分 ──────────────────── #
@@ -362,7 +369,61 @@ class DSLParserNode:
         if not all_candidates:
             warnings.append(
                 f"smart 模式：semantic_tags={node.semantic_tags} 未命中任何素材，"
-                "请检查素材库标签或放宽搜索条件。"
+                "尝试安全空镜兜底..."
+            )
+            # ── 二级防御：安全空镜兜底（受控降级，避免全局盲目随机）────────────── #
+            fallback_asset = (
+                self._db.query(LocalAsset)
+                .filter(
+                    LocalAsset.asset_type.in_(["video", "scene_master_video"]),
+                    or_(
+                        LocalAsset.tags.like("%通用空镜%"),
+                        LocalAsset.tags.like("%B-Roll%"),
+                    ),
+                    LocalAsset.is_deleted.is_(False),
+                    LocalAsset.is_exhausted.is_(False),
+                )
+                .order_by(func.random())
+                .first()
+            )
+
+            if fallback_asset:
+                logger.warning(
+                    "[DSLParser] Beat=%s 标签 %s 脱靶，已兜底安全空镜 asset_id=%d",
+                    node.beat,
+                    node.semantic_tags,
+                    fallback_asset.id,
+                )
+                warnings.append(
+                    f"已兜底安全空镜（asset_id={fallback_asset.id}），"
+                    "建议补充素材库或校正 semantic_tags。"
+                )
+                return BeatCompilationResult(
+                    beat=node.beat,
+                    role=node.role,
+                    address_mode="smart",
+                    layers=[
+                        _make_layer(
+                            layer_index=0,
+                            asset=fallback_asset,
+                            matched_tags=[],
+                        )
+                    ],
+                    resolved=True,
+                    warnings=warnings,
+                    script_text=node.script_text,
+                )
+
+            # ── 三级防御：认怂，让熔断器接管，绝对不随机乱猜 ─────────────────── #
+            logger.error(
+                "[DSLParser] Beat=%s 标签 %s 脱靶，且素材库无通用空镜/B-Roll，"
+                "显式返回 resolved=False。",
+                node.beat,
+                node.semantic_tags,
+            )
+            warnings.append(
+                "严重异常：素材库标签未命中，且不存在可用安全空镜（通用空镜/B-Roll）。"
+                "请向素材库添加兜底素材后重试。"
             )
             return BeatCompilationResult(
                 beat=node.beat,
@@ -371,6 +432,7 @@ class DSLParserNode:
                 layers=[],
                 resolved=False,
                 warnings=warnings,
+                script_text=node.script_text,
             )
 
         # ── Smart 2.0：硬约束一票否决 + 4维打分排序 ──────────────── #
@@ -433,6 +495,7 @@ class DSLParserNode:
             layers=layers,
             resolved=bool(layers),
             warnings=warnings,
+            script_text=node.script_text,
         )
 
     # ================================================================ #
@@ -488,7 +551,11 @@ def _make_layer(
     asset: LocalAsset,
     matched_tags: List[str],
 ) -> ResolvedLayer:
-    """将 ORM 实体转换为 ResolvedLayer Schema。"""
+    """将 ORM 实体转换为 ResolvedLayer Schema。
+
+    text_template 类型资产携带 manifest（含 content_matrix），
+    供下游适配器和 FFmpeg 渲染器提取多语种文本。
+    """
     return ResolvedLayer(
         layer_index=layer_index,
         asset_id=cast(int, asset.id),
@@ -497,6 +564,7 @@ def _make_layer(
         file_hash=str(asset.file_hash),
         asset_name=str(asset.asset_name) if asset.asset_name is not None else None,
         matched_tags=matched_tags,
+        manifest=dict(asset.manifest) if getattr(asset, "manifest", None) else None,
     )
 
 

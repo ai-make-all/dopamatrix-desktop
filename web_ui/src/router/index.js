@@ -21,8 +21,9 @@ const routes = [
     component: () => import('../views/AssetsView.vue'),
   },
   {
-    path: '/history',
-    component: () => import('../views/HistoryView.vue'),
+    path: '/approval',
+    name: 'Approval',
+    component: () => import('../views/ApprovalView.vue'),
   },
   {
     path: '/settings',

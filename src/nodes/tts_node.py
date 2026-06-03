@@ -1,13 +1,13 @@
 """
-TTSNode — 多语言文字转语音节点
+TTSNode — 多语言文字转语音节点（单轨线性架构，Phase 9.11.2）
 
 设计原则：
   使用 edge_tts Python 原生异步 API 驱动 TTS，通过 asyncio.run() 在同步
   WorkflowEngine 中执行，彻底消除对 edge-tts CLI 可执行文件的依赖，
   从根本上解决生产环境 PATH 缺失导致的 [WinError 2] 崩溃。
 
-数据流：
-  读取  → context.assets["script_data"]   (ScriptGenNode 输出的分镜 JSON)
+数据流（Phase 9.11.2 单轨线性架构）：
+  读取  → context.assets["tts_script"]    {lang: "聚合全文"}
   写入  → context.variants[lang]["voice_audio"]  (各语言 MP3 路径)
           context.variants[lang]["vtt_path"]     (各语言 WebVTT 字幕路径)
 
@@ -41,26 +41,17 @@ VOICE_MAP: Dict[str, str] = {
 
 class TTSNode(BaseNode):
     """
-    多语言文字转语音节点。
+    多语言文字转语音节点（单轨线性架构，Phase 9.11.2）。
 
     期望 Context 中存在：
-        context.assets["script_data"]: dict
-            ScriptGenNode 生成的分镜 JSON，格式：
-            {
-              "scenes": [
-                {
-                  "duration": 5,
-                  "visual_prompt": "...",
-                  "narrations": {"en": "...", "ar": "..."}
-                },
-                ...
-              ]
-            }
+        context.assets["tts_script"]: dict
+            单轨架构的聚合台词字典，格式：
+            { "en": "beat1 text\nbeat2 text\n...", "ar": "..." }
 
     执行后写入 Context：
         context.variants["en"]["voice_audio"] → "output/voice_en.mp3"
         context.variants["ar"]["voice_audio"] → "output/voice_ar.mp3"
-        （每种 script_data 中出现的语言均会生成对应 MP3 + VTT）
+        （每种 tts_script 中出现的语言均会生成对应 MP3 + VTT）
 
     参数：
         output_dir: MP3/VTT 文件输出目录，默认 "output"
@@ -83,21 +74,6 @@ class TTSNode(BaseNode):
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
-
-    def _collect_narrations(self, script_data: dict) -> Dict[str, str]:
-        """
-        从 script_data 中，按语言代码聚合所有 scene 的旁白文本。
-
-        每个 scene 的旁白用换行符拼接，形成完整的、连贯的 TTS 输入文本。
-        返回格式：{"en": "scene1 en...\nscene2 en...", "ar": "scene1 ar...\n..."}
-        """
-        narrations: Dict[str, list] = {}
-        for scene in script_data.get("scenes", []):
-            for lang, text in scene.get("narrations", {}).items():
-                if text and text.strip():
-                    narrations.setdefault(lang, []).append(text.strip())
-
-        return {lang: "\n".join(lines) for lang, lines in narrations.items()}
 
     async def _run_tts_async(
         self, voice: str, text: str, output_path: Path, vtt_path: Path
@@ -164,14 +140,15 @@ class TTSNode(BaseNode):
         """
         执行 TTS — 测试语言优先（Test-First）模式：
 
+        读取 context.assets["tts_script"]（单轨线性架构，Phase 9.11.2），
         仅为 context.test_language 生成 1 个 MP3 + VTT。
         砍掉多语言循环，消除无意义算力浪费；
         正式上线时只需切换 test_language，无需改代码。
         """
-        script_data: dict = context.get_asset("script_data") or {}
+        tts_script: dict = context.get_asset("tts_script") or {}
 
-        if not script_data:
-            self.log("Warning: context.assets['script_data'] is empty, skipping.")
+        if not tts_script:
+            self.log("Warning: context.assets['tts_script'] is empty, skipping.")
             return context
 
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -180,27 +157,27 @@ class TTSNode(BaseNode):
         target_lang = getattr(context, "test_language", "en") or "en"
         self.log(f"[Test-First] 目标语言 = '{target_lang}'（单语种模式，跳过其他语种）")
 
-        # 聚合所有语言旁白，但只取目标语言
-        narrations = self._collect_narrations(script_data)
-
-        if target_lang not in narrations:
-            # 尝试 fallback：取 narrations 中第一个有 voice 映射的语言
+        if target_lang not in tts_script:
+            # 尝试 fallback：取 tts_script 中第一个有 voice 映射的语言
             fallback = next(
-                (lang for lang in narrations if lang in self._voice_map), None
+                (lang for lang in tts_script if lang in self._voice_map), None
             )
             if fallback:
                 self.log(
-                    f"[Test-First] '{target_lang}' 在 script_data 中无旁白，"
+                    f"[Test-First] '{target_lang}' 在 tts_script 中无文本，"
                     f"回退到 '{fallback}'。"
                 )
                 target_lang = fallback
             else:
                 self.log(
-                    f"Warning: '{target_lang}' 无旁白且无可用 fallback，跳过 TTS。"
+                    f"Warning: '{target_lang}' 无文本且无可用 fallback，跳过 TTS。"
                 )
                 return context
 
-        text = narrations[target_lang]
+        text = str(tts_script[target_lang]).strip()
+        if not text:
+            self.log(f"Warning: tts_script['{target_lang}'] 为空字符串，跳过 TTS。")
+            return context
         voice = self._voice_map.get(target_lang)
         if not voice:
             self.log(

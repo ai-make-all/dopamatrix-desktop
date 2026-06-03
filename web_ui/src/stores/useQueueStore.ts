@@ -14,7 +14,7 @@ import { defineStore } from 'pinia'
 import { ref }         from 'vue'
 
 // ── 从 Worker 侧复用类型（避免重复定义） ──────────────────────────────────────
-export type { QueueTask, QueueStats, TaskStatus, WsUpdatePayload } from '../workers/queueWorker'
+export type { QueueTask, QueueTaskAsset, QueueStats, TaskStatus, WsUpdatePayload } from '../workers/queueWorker'
 import type { QueueTask, QueueStats, WsUpdatePayload } from '../workers/queueWorker'
 
 // ── 默认初始统计值 ────────────────────────────────────────────────────────────

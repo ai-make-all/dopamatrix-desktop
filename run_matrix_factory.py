@@ -181,6 +181,7 @@ def _run_single_matrix(session_id: str, user_prompt: str,
         from src.nodes.assembler import AssemblyNode
         from src.nodes.anti_dup_node import AntiDupNode
         from src.nodes.compositor import FFmpegCompositorNode
+        from src.nodes.cover_node import CoverNode
 
         # ── 内联 TranslationBridgeNode ────────────────────────────────────────
         class TranslationBridgeNode(BaseNode):
@@ -226,8 +227,9 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             TranslationBridgeNode(),                                   # 4. 字幕文本桥接
             SubtitleNode(),                                            # 5. 生成 .ass 字幕
             AssemblyNode(),                                            # 6. 拼装 Timeline
-            AntiDupNode(),                                             # 7. 防查重注入 ← NEW
+            AntiDupNode(),                                             # 7. 防查重注入
             FFmpegCompositorNode(),                                    # 8. FFmpeg 渲染
+            CoverNode(),                                               # 9. 封面抽帧 ← NEW
         ]
 
         context = WorkflowContext(
@@ -272,6 +274,7 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             "error"         : None,
             "used_asset_ids": final_context.assets.get("used_asset_ids", []),
             "video_manifest": video_manifest,   # ← 基因配方，供 services.py 持久化
+            "cover_path"    : final_context.get_asset("cover_path") or "",  # ← 封面帧
             "assets": {
                 "video_master": final_context.get_asset("video_master") or "",
                 "variants": {

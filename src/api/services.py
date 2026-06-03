@@ -188,6 +188,7 @@ def run_matrix_job(
             used_asset_ids.extend(result.get("used_asset_ids", []))
 
             variants: dict[str, str] = result.get("assets", {}).get("variants", {})
+            cover_path: str = result.get("cover_path", "") or ""
 
             # 每个 worker 的所有语言变体共用同一份 manifest（脚本/BGM 相同，只有语音不同）
             manifest_json: str = json.dumps(
@@ -209,6 +210,8 @@ def run_matrix_job(
                     manifest_data   = manifest_json,
                     created_at      = _now(),
                 )
+                # 将 cover_path 附加到 VideoAsset 的可扩展属性中（供入库后查询）
+                asset._cover_path = cover_path
                 asset_rows.append(asset)
                 logger.info(f"[services] [{lang}] {file_path}  MD5={fh[:8]}…")
 
@@ -220,9 +223,15 @@ def run_matrix_job(
             db.add_all(asset_rows)
             db.flush()  # 推入 DB 生成 asset.id，暂不提交事务
             for asset in asset_rows:
+                cover_p = getattr(asset, "_cover_path", "") or ""
                 history_assets.append({
                     "path": asset.file_path,
                     "hash": asset.file_hash,
+                    "cover_path": cover_p,
+                    "cover_url": (
+                        f"{base_url}/api/v1/media/preview?path={cover_p}"
+                        if cover_p else ""
+                    ),
                     "download_url": f"{base_url}/api/v1/tasks/assets/{asset.id}/download",
                 })
 

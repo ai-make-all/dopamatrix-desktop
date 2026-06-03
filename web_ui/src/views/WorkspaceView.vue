@@ -3,6 +3,7 @@ import { ref, computed, nextTick, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import axios from 'axios'
 import { useAppStore }         from '../stores/appStore'
+import { ASSET_REGISTRY as ASSET_REGISTRY_MAP } from '../utils/assetConfig.js'
 import { useQueueStore }       from '../stores/useQueueStore'
 import QueueView               from './QueueView.vue'
 import DslOrchestratorDrawer   from './DslOrchestratorDrawer.vue'
@@ -119,14 +120,11 @@ const targetDuration = ref(15)
 const enableTts      = ref(true)
 const enableSubtitles = ref(true)
 
-/** 智能起草返回的 script_data，战术板验收后随 submit-dsl 一并提交 */
-const stagedScriptData = ref(null)
-
 // ── DB 素材列表（真相源：后端 API）──────────────────────────────────────────
 const dbAssetList = ref([])
 
-// 全域资产注册表：所有维度并发拉取，扁平合并
-const ASSET_REGISTRY = ['video', 'image', 'audio_bgm', 'vfx', 'sfx']
+// 全域资产注册表：从 assetConfig.js SSOT 动态读取，确保新增类型自动被纳入
+const ASSET_REGISTRY = Object.keys(ASSET_REGISTRY_MAP)
 
 async function fetchDbAssets() {
   try {
@@ -170,10 +168,9 @@ const dslTracks = ref(dslTemplates.content.map(t => ({ ...t, items: [] })))
 // ── 抽屉控制 ────────────────────────────────────────────────────────────────
 const showOrchestrator = ref(false)
 
-function onOrchestratorConfirm({ tracks, template, script_data, directRender, params }) {
+function onOrchestratorConfirm({ tracks, template, directRender, params }) {
   dslTracks.value = tracks
   currentTemplate.value = template
-  if (script_data) stagedScriptData.value = script_data
 
   // 将战术舱局部参数回写全局状态，override 工具栏中的值
   if (params) {
@@ -216,17 +213,13 @@ const canFission = computed(() => {
   return !isSubmitting.value && !isDrafting.value && (hasPrompt || hasBlocks)
 })
 
-function scriptDataHasScenes(data) {
-  return !!(data && typeof data === 'object' && Array.isArray(data.scenes) && data.scenes.length > 0)
-}
-
 /** 将 draft-blueprint 返回的 timeline 行映射到当前模板轨道的 items（战术板 semantic_tag） */
 function applyBlueprintTimelineToTracks(apiTimeline) {
   const rows = Array.isArray(apiTimeline) ? apiTimeline : []
   dslTracks.value = dslTracks.value.map((track, index) => {
     // 用索引直接对位：LLM 的 beat 字段是自由文本，不做字符串匹配
     const row = rows[index]
-    if (!row || !Array.isArray(row.semantic_tags)) return { ...track, items: [] }
+    if (!row || !Array.isArray(row.semantic_tags)) return { ...track, items: [], script_text: '' }
 
     const base = Date.now()
     const items = row.semantic_tags
@@ -237,7 +230,7 @@ function applyBlueprintTimelineToTracks(apiTimeline) {
         type: 'semantic_tag',
         tag,
       }))
-    return { ...track, items }
+    return { ...track, items, script_text: row.script_text || '' }
   })
 }
 
@@ -295,12 +288,8 @@ async function draftBlueprint() {
       },
       { timeout: 15000 },
     )
-    // 将开关暂存，战术板确认后随 submit-dsl 一并提交
     const data = resp.data || {}
     applyBlueprintTimelineToTracks(data.timeline)
-    stagedScriptData.value = scriptDataHasScenes(data.script_data)
-      ? JSON.parse(JSON.stringify(data.script_data))
-      : null
     // 等待 Vue 完成本轮响应式更新，确保抽屉 watch 读到已含 items 的 dslTracks
     await nextTick()
     showOrchestrator.value = true
@@ -324,18 +313,24 @@ function buildTimelineFromTracks() {
     .map(track => {
       const physicals = track.items.filter(i => i.type === 'physical_asset' || !i.type)
       const tags      = track.items.filter(i => i.type === 'semantic_tag')
-      return {
+      // Phase 9.7.3 — 空间排版意图：hash → position_key（仅含已设置排版的素材）
+      const layoutHints = {}
+      physicals.forEach(pill => { if (pill.layout) layoutHints[pill.hash] = pill.layout })
+      const beatNode = {
         beat:          track.id,
         role:          track.role,
+        script_text:   track.script_text || '',
         address_mode:  physicals.length > 0 ? 'locked' : 'smart',
         asset_hashes:  physicals.map(i => i.hash),
         semantic_tags: tags.map(i => i.tag),
       }
+      if (Object.keys(layoutHints).length > 0) beatNode.layout_hints = layoutHints
+      return beatNode
     })
     .filter(b => b.asset_hashes.length > 0 || b.semantic_tags.length > 0)
 }
 
-/** 极速裂变：timeline 为空 + 有 prompt → 后端盲裂变；战术板有装填 → 完整 timeline + script_data */
+/** 极速裂变：timeline 为空 + 有 prompt → 后端盲裂变；战术板有装填 → 完整 timeline + script_text */
 async function blindFission() {
   const rawPrompt = omniPrompt.value.trim()
   const hasPrompt = rawPrompt.length > 0
@@ -377,9 +372,6 @@ async function blindFission() {
       enable_tts:       enableTts.value,
       enable_subtitles: enableSubtitles.value,
       ...(hasPrompt && { prompt: pureText || rawPrompt }),
-      ...(hasBlocks && scriptDataHasScenes(stagedScriptData.value)
-        ? { script_data: stagedScriptData.value }
-        : {}),
     }
 
     const resp   = await axios.post(`${store.API_BASE}/api/v1/tasks/submit-dsl`, payload)
@@ -394,9 +386,8 @@ async function blindFission() {
     })
     await nextTick()
 
-    dslTracks.value.forEach(t => { t.items = [] })
+    dslTracks.value.forEach(t => { t.items = []; t.script_text = '' })
     omniPrompt.value = ''
-    stagedScriptData.value = null
 
     store.showToast('🚀 矩阵任务已投入后台熔炉')
   } catch (err) {
@@ -604,7 +595,6 @@ async function blindFission() {
       :build-video-url="store.buildVideoUrl"
       :api-base="store.API_BASE"
       :show-toast="store.showToast"
-      :script-data="stagedScriptData"
       :default-batch-size="batchSize"
       :default-aspect-ratio="aspectRatio"
       :default-language="testLanguage"

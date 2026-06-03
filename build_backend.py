@@ -96,7 +96,7 @@ def clean_build_cache():
 
 def prepare_release_data():
     """
-    出厂前清理：清空 output 下的产物，并重置 clipflow.db 中的任务历史与素材疲劳计数。
+    出厂前清理：清空 output 下的产物，并重置 dopamatrix.db 中的任务历史与素材疲劳计数。
     """
     root = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(root, "output")
@@ -117,7 +117,7 @@ def prepare_release_data():
     except Exception as exc:
         print(f"  ⚠️  警告：清理或创建 output 目录失败：{exc}")
 
-    db_path = os.path.join(root, "clipflow.db")
+    db_path = os.path.join(root, "dopamatrix.db")
     if not os.path.exists(db_path):
         print(f"  ⚠️  警告：未找到数据库 {db_path}，跳过数据库出厂重置。")
         return

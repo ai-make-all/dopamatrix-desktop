@@ -1,29 +1,20 @@
 <script setup>
-import { ref, watch, onMounted, computed } from 'vue'
+import { ref, watch, onMounted, computed, reactive } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import axios from 'axios'
 import AudioAssetCard from '../components/AudioAssetCard.vue'
 import { useAppStore } from '../stores/appStore'
 import { parseFacetedTags, getVisiblePills, getTagPillParts } from '../utils/tagParser.js'
+import { ASSET_REGISTRY, FACET_NAMESPACES } from '../utils/assetConfig.js'
 
 const store = useAppStore()
-
-// ── AssetRegistry: 去中心化配置字典 (DAM 唯一真相源) ─────────
-const AssetRegistry = {
-  video:        { label: '视频骨料',   icon: '🎬', axis_type: 'X',          color: '#3b82f6', facet_prefix: ['hook', 'entity'], dsl_layer: 'main_v_track', is_container: false },
-  image:        { label: '静态画面',   icon: '🖼️', axis_type: 'X',          color: '#10b981', facet_prefix: ['entity'],         dsl_layer: 'main_v_track', is_container: false },
-  audio_bgm:    { label: '听觉配乐',   icon: '🎼', axis_type: 'Y',          color: '#f59e0b', facet_prefix: ['vibe'],           dsl_layer: 'AudioTrack',   is_container: false },
-  vfx:          { label: '视觉特效层', icon: '✨', axis_type: 'Y',          color: '#fbbf24', facet_prefix: ['vfx'],            dsl_layer: 'overlay',      is_container: false },
-  sfx:          { label: '音效层',     icon: '⚡', axis_type: 'Y',          color: '#f97316', facet_prefix: ['sfx'],            dsl_layer: 'AudioTrack',   is_container: false },
-  scene_master: { label: '场景底模',   icon: '🏛️', axis_type: 'X_STRUCTURE', color: '#ec4899', facet_prefix: ['slot', 'vibe'],  dsl_layer: 'SceneMaster',  is_container: true  },
-}
 
 const activeCategory  = ref('video')
 const viewMode        = ref('grid')   // 'grid' | 'list'
 const assetList       = ref([])
 
 const isAudioCategory = computed(() => ['audio_bgm', 'sfx'].includes(activeCategory.value))
-const activeMeta      = computed(() => AssetRegistry[activeCategory.value])
+const activeMeta      = computed(() => ASSET_REGISTRY[activeCategory.value])
 
 // ── Search / Filter / Bulk-select ─────────────────────────────
 const searchQuery        = ref('')
@@ -73,6 +64,10 @@ const FACET_BUCKETS = [
   { key: 'vibe',   prefix: 'vibe:',   label: '情绪氛围区', icon: '🌊', theme: 'vibe',   ph: '如 燃 / 治愈 / 悬疑紧张…'    },
   { key: 'layer',  prefix: '',        label: 'Y轴扩展层',  icon: '⚡', theme: 'layer',  ph: '如 vfx:粒子爆炸 / sfx:打击音…' },
 ]
+
+// ── Text Template Modal ────────────────────────────────────────
+const showTextModal = ref(false)
+const textForm = reactive({ asset_name: '', zh: '', en: '', ar: '' })
 
 // ── Import Modal ───────────────────────────────────────────────
 const showImportModal     = ref(false)
@@ -157,17 +152,18 @@ async function fetchAssets() {
   }
 }
 
-const importFilterMap = {
-  video:        { name: '视频素材',            extensions: ['mp4', 'mov']                    },
-  image:        { name: '静态画面',            extensions: ['png', 'jpg', 'jpeg', 'webp']     },
-  audio_bgm:    { name: '背景音乐 (BGM)',       extensions: ['mp3', 'wav', 'aac']             },
-  vfx:          { name: '视觉特效层',           extensions: ['png', 'gif', 'webp']            },
-  sfx:          { name: '短促音效 (SFX)',       extensions: ['mp3', 'wav']                    },
-  scene_master: { name: '场景底模 (背景底图)',   extensions: ['mp4', 'mov', 'png', 'jpg', 'jpeg'] },
-}
-
 async function importAssets() {
-  const filter = importFilterMap[activeCategory.value] ?? importFilterMap.video
+  const meta = ASSET_REGISTRY[activeCategory.value] ?? ASSET_REGISTRY.video
+  if (!meta.extensions || meta.extensions.length === 0) {
+    if (activeCategory.value === 'text_template') {
+      textForm.asset_name = ''; textForm.zh = ''; textForm.en = ''; textForm.ar = ''
+      showTextModal.value = true
+    } else {
+      store.showToast('⚠️ 该资产类型不支持直接导入文件')
+    }
+    return
+  }
+  const filter = { name: meta.label, extensions: meta.extensions }
   try {
     const selected = await open({ multiple: true, filters: [filter] })
     if (!selected || selected.length === 0) return
@@ -214,6 +210,33 @@ async function confirmImport() {
   }
 }
 
+async function submitTextAsset() {
+  if (!textForm.asset_name.trim()) {
+    store.showToast('⚠️ 请填写资产名称')
+    return
+  }
+  if (!textForm.zh.trim() && !textForm.en.trim() && !textForm.ar.trim()) {
+    store.showToast('⚠️ 至少填写一种语言的内容')
+    return
+  }
+  const payload = {
+    asset_name: textForm.asset_name.trim(),
+    content_matrix: {
+      ...(textForm.zh.trim() && { zh: textForm.zh.trim() }),
+      ...(textForm.en.trim() && { en: textForm.en.trim() }),
+      ...(textForm.ar.trim() && { ar: textForm.ar.trim() }),
+    },
+  }
+  try {
+    await axios.post(`${store.API_BASE}/api/v1/assets/text`, payload)
+    showTextModal.value = false
+    store.showToast(`✅ 文本资产「${payload.asset_name}」已成功写入 DAM`)
+    fetchAssets()
+  } catch (err) {
+    store.showToast('创建失败: ' + (err.response?.data?.detail || err.message))
+  }
+}
+
 async function updateAudioEmotion(item) {
   try {
     await axios.patch(`${store.API_BASE}/api/v1/assets/${item.id}/emotion`, { emotion_tag: item.emotion_tag })
@@ -244,7 +267,7 @@ function formatAxisLabel(axisType) {
 }
 
 // 底模分类检测
-const isContainerCategory = computed(() => AssetRegistry[activeCategory.value]?.is_container ?? false)
+const isContainerCategory = computed(() => ASSET_REGISTRY[activeCategory.value]?.is_container ?? false)
 
 // 场景底模在 Data Grid 列表模式额外展示插槽数列
 const dgVisualGridStyle = computed(() =>
@@ -275,9 +298,13 @@ const tagModalItem         = ref(null)
 const selectedFacetPrefix  = ref('')
 const tagValue             = ref('')
 
+// 当前打标目标的资产类型：单选时取素材自身类型，批量时取当前分类页
+const tagTargetType = computed(() =>
+  tagModalItem.value?.asset_type || activeCategory.value
+)
+
 function openTagModal(item) {
-  selectedFacetPrefix.value = ''
-  tagValue.value            = ''
+  tagValue.value = ''
   if (item !== undefined && item !== null) {
     tagModalMode.value = 'single'
     tagModalItem.value = item
@@ -289,6 +316,9 @@ function openTagModal(item) {
     tagModalMode.value = 'bulk'
     tagModalItem.value = null
   }
+  // 强制初始化为该类型的第一个合法前缀，杜绝无前缀空提交
+  const allowedPrefixes = ASSET_REGISTRY[tagTargetType.value]?.facet_prefix ?? []
+  selectedFacetPrefix.value = allowedPrefixes[0] ?? ''
   showTagModal.value = true
 }
 
@@ -411,7 +441,7 @@ async function confirmTrashAction() {
 
 // ── 语义对齐雷达 — 基于 facet:tag 生成 DSL 召回定位提示 ──────
 function buildAlignmentHints(item, categoryKey) {
-  const meta  = AssetRegistry[categoryKey]
+  const meta  = ASSET_REGISTRY[categoryKey]
   const hints = []
 
   // 底模容器专属路径 — 直接展示插槽结构信息
@@ -556,10 +586,10 @@ async function restoreAsset(item) {
       </div>
     </div>
 
-    <!-- ── 动态 Tab 导航 (AssetRegistry 字典驱动) ────────────── -->
+    <!-- ── 动态 Tab 导航 (ASSET_REGISTRY SSOT 驱动) ─────────── -->
     <div class="assets-tabs">
       <button
-        v-for="(meta, key) in AssetRegistry"
+        v-for="(meta, key) in ASSET_REGISTRY"
         :key="key"
         :class="['tab-btn', activeCategory === key ? 'tab-active' : '']"
         :style="activeCategory === key
@@ -594,9 +624,9 @@ async function restoreAsset(item) {
         </div>
         <div v-else class="trash-list">
           <div v-for="item in trashedAssets" :key="item.id" class="trash-item">
-            <div class="trash-item-icon">{{ AssetRegistry[item.asset_type]?.icon ?? '📄' }}</div>
+            <div class="trash-item-icon">{{ ASSET_REGISTRY[item.asset_type]?.icon ?? '📄' }}</div>
             <div class="trash-item-name" :title="item.file_path">{{ item.file_path.split(/[/\\]/).pop() }}</div>
-            <div class="trash-item-type">{{ AssetRegistry[item.asset_type]?.label ?? item.asset_type }}</div>
+            <div class="trash-item-type">{{ ASSET_REGISTRY[item.asset_type]?.label ?? item.asset_type }}</div>
             <div class="trash-item-tags">
               <span v-for="t in (item.tags || []).slice(0, 4)" :key="t" class="tag-pill facet-generic">{{ t }}</span>
             </div>
@@ -729,6 +759,10 @@ async function restoreAsset(item) {
                       controls muted preload="metadata"
                       class="asset-media-el"
                     ></video>
+                    <div
+                      v-else-if="item.asset_type === 'text_template'"
+                      class="text-asset-preview"
+                    >{{ item.manifest?.content_matrix?.zh || item.asset_name || '📝 文本资产' }}</div>
                     <img
                       v-else
                       :src="store.buildVideoUrl(item.file_path)"
@@ -864,6 +898,10 @@ async function restoreAsset(item) {
                       muted preload="metadata"
                       class="dg-thumb-media"
                     ></video>
+                    <div
+                      v-else-if="item.asset_type === 'text_template'"
+                      class="text-asset-preview text-asset-preview--thumb"
+                    >{{ item.manifest?.content_matrix?.zh || item.asset_name || '📝' }}</div>
                     <img
                       v-else
                       :src="store.buildVideoUrl(item.file_path)"
@@ -1001,12 +1039,11 @@ async function restoreAsset(item) {
             </p>
             <div class="cpm-input-group">
               <select v-model="selectedFacetPrefix" class="cpm-facet-select">
-                <option value="">通用属性 (无前缀)</option>
-                <option value="hook">⚓ 剧情钩子 (Hook)</option>
-                <option value="entity">👁️ 视觉实体 (Entity)</option>
-                <option value="vibe">✨ 氛围情绪 (Vibe)</option>
-                <option value="vfx">💥 视觉特效 (VFX)</option>
-                <option value="sfx">🎵 音效配乐 (SFX)</option>
+                <option
+                  v-for="prefix in ASSET_REGISTRY[tagTargetType]?.facet_prefix ?? []"
+                  :key="prefix"
+                  :value="prefix"
+                >{{ FACET_NAMESPACES.find(f => f.value === prefix)?.label || prefix }}</option>
               </select>
               <input
                 v-model="tagValue"
@@ -1195,6 +1232,62 @@ async function restoreAsset(item) {
             </button>
           </div>
 
+        </div>
+      </div>
+    </Transition>
+
+    <!-- ── 文本资产多语种创建弹窗 ───────────────────────────────── -->
+    <Transition name="modal-fade">
+      <div v-if="showTextModal" class="modal-overlay cpm-overlay" @click.self="showTextModal = false">
+        <div class="modal-box cpm-box text-modal-box">
+          <div class="cpm-header">
+            <span class="cpm-icon">📝</span>
+            <span class="cpm-title">文本动态资产 · 多语种创建</span>
+          </div>
+          <div class="cpm-body">
+            <p class="cpm-desc">虚拟创建一个 <code>text_template</code> 资产，无需物理文件；多语种内容将写入 DAM。</p>
+            <div class="text-modal-field">
+              <label class="text-modal-label">资产名称 <span class="modal-required">* 必填</span></label>
+              <input
+                v-model="textForm.asset_name"
+                class="text-modal-input"
+                placeholder="如：主推文案 · 双十一版"
+                maxlength="120"
+              />
+            </div>
+            <div class="text-modal-field">
+              <label class="text-modal-label">🇨🇳 ZH 中文内容</label>
+              <textarea
+                v-model="textForm.zh"
+                class="text-modal-textarea"
+                rows="3"
+                placeholder="输入中文版本文案..."
+              ></textarea>
+            </div>
+            <div class="text-modal-field">
+              <label class="text-modal-label">🇬🇧 EN 英语内容</label>
+              <textarea
+                v-model="textForm.en"
+                class="text-modal-textarea"
+                rows="3"
+                placeholder="Enter English copy..."
+              ></textarea>
+            </div>
+            <div class="text-modal-field">
+              <label class="text-modal-label">🇸🇦 AR 阿语内容</label>
+              <textarea
+                v-model="textForm.ar"
+                class="text-modal-textarea text-modal-textarea--rtl"
+                rows="3"
+                placeholder="أدخل النص العربي..."
+                dir="rtl"
+              ></textarea>
+            </div>
+          </div>
+          <div class="cpm-actions">
+            <button type="button" class="cpm-cancel-btn" @click="showTextModal = false">取消</button>
+            <button type="button" class="cpm-confirm-btn" @click="submitTextAsset">✅ 确认创建</button>
+          </div>
         </div>
       </div>
     </Transition>
@@ -3013,4 +3106,64 @@ async function restoreAsset(item) {
 .modal-fade-leave-active { transition: opacity 0.15s; }
 .modal-fade-enter-from  { opacity: 0; transform: scale(0.96) translateY(8px); }
 .modal-fade-leave-to    { opacity: 0; }
+
+/* ── Text Template 专属预览块 ─────────────────────────────────── */
+.text-asset-preview {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.75rem;
+  box-sizing: border-box;
+  background: linear-gradient(135deg, #4c1d95 0%, #2e1065 50%, #1e1b4b 100%);
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  text-align: center;
+  word-break: break-all;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  border-radius: 4px;
+  letter-spacing: 0.01em;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+.text-asset-preview--thumb {
+  font-size: 0.7rem;
+  -webkit-line-clamp: 2;
+  padding: 0.4rem;
+  border-radius: 3px;
+}
+
+/* ── 文本创建弹窗 ──────────────────────────────────────────────── */
+.text-modal-box { max-width: 560px; width: 90vw; }
+.text-modal-field { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 1rem; }
+.text-modal-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+  letter-spacing: 0.02em;
+}
+.text-modal-input,
+.text-modal-textarea {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 0.85rem;
+  padding: 0.55rem 0.75rem;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.18s, box-shadow 0.18s;
+  font-family: inherit;
+}
+.text-modal-input:focus,
+.text-modal-textarea:focus {
+  border-color: rgba(139, 92, 246, 0.7);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+}
+.text-modal-textarea--rtl { direction: rtl; text-align: right; }
 </style>

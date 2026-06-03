@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 # ── 生产环境（PyInstaller 打包）：将工作目录切换到可执行文件所在目录 ──────────
-# 必须在所有其他代码之前执行，确保 clipflow.db / .env / output/ 等相对路径
+# 必须在所有其他代码之前执行，确保 dopamatrix.db / .env / output/ 等相对路径
 # 全部解析到安装目录（如 C:\ClipFlow\），而非系统默认工作目录。
 if getattr(sys, "frozen", False):
     os.chdir(os.path.dirname(sys.executable))
@@ -43,6 +43,8 @@ from src.api import routes as task_routes
 from src.api import routes_assets
 from src.api import routes_dsl
 from src.api import routes_history
+from src.api.routes_history import tasks_router as tasks_today_router
+from src.api import routes_matrix
 from src.api import routes_gateway
 from src.api import routes_media
 from src.api import routes_video
@@ -164,6 +166,10 @@ async def health_check() -> HealthResponse:
 app.include_router(task_routes.router, prefix="/api/v1")
 app.include_router(routes_assets.router, prefix="/api/v1")
 app.include_router(routes_history.router, prefix="/api/v1")
+# 今日态任务列表（QueueView 刷新水合用）
+app.include_router(tasks_today_router, prefix="/api/v1")
+# 审批状态机 & 交付包导出 (Phase 9.9)
+app.include_router(routes_matrix.router, prefix="/api/v1")
 # Story DSL 意图解析器 — Dry-run 渲染蓝图接口 (Phase 4.1)
 app.include_router(routes_dsl.router, prefix="/api/v1")
 # 动态流媒体网关 — 替代 StaticFiles 挂载，支持任意绝对路径透传预览

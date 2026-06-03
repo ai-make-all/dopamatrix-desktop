@@ -73,9 +73,9 @@ function handleLogout() {
               <span class="nav-icon">💬</span><span>矩阵工厂</span>
             </button>
           </router-link>
-          <router-link to="/history" custom v-slot="{ navigate, isActive }">
+          <router-link to="/approval" custom v-slot="{ navigate, isActive }">
             <button @click="navigate" :class="['nav-item', isActive ? 'nav-active' : '']">
-              <span class="nav-icon">🕒</span><span>历史记录</span>
+              <span class="nav-icon">🔬</span><span>矩阵质检舱</span>
             </button>
           </router-link>
           <router-link to="/settings" custom v-slot="{ navigate, isActive }">

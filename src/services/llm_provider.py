@@ -43,7 +43,7 @@ def _load_api_key_from_db(setting_key: str = "openai_api_key") -> str:
     带字典缓存的多模型 API Key 加载器。
 
     命中路径（热路径）：setting_key 已在字典中，直接返回，零 I/O。
-    冷路径（首次 / 缓存失效后）：查询 clipflow.db，结果写入字典后返回。
+    冷路径（首次 / 缓存失效后）：查询 dopamatrix.db，结果写入字典后返回。
 
     Args:
         setting_key: app_settings 表中的键名，默认 'openai_api_key'。
@@ -58,7 +58,7 @@ def _load_api_key_from_db(setting_key: str = "openai_api_key") -> str:
     if setting_key in _api_key_cache:
         return _api_key_cache[setting_key]
 
-    db_path = "clipflow.db"
+    db_path = "dopamatrix.db"
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(db_path)

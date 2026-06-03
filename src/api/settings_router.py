@@ -10,7 +10,7 @@ BYOK（Bring Your Own Key）设置接口。
   GET  /api/v1/settings/llm  — 读取脱敏后的 LLM API Key（仅暴露首尾字符）
   POST /api/v1/settings/llm  — 写入 / 更新 LLM API Key
 
-数据库：clipflow.db（全局共享，非租户隔离）
+数据库：dopamatrix.db（全局共享，非租户隔离）
 表结构：app_settings (key_name TEXT PRIMARY KEY, key_value TEXT)
 """
 
@@ -37,7 +37,7 @@ _KEY_OPENAI = "openai_api_key"
 @contextmanager
 def _settings_conn() -> Generator[sqlite3.Connection, None, None]:
     """
-    Yield 一个到全局 clipflow.db 的 sqlite3 连接。
+    Yield 一个到全局 dopamatrix.db 的 sqlite3 连接。
     使用 contextmanager 确保连接在函数退出（含异常路径）时始终关闭。
     """
     conn = sqlite3.connect(SETTINGS_DB_PATH)

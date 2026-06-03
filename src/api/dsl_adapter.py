@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 _AUDIO_ASSET_TYPES: frozenset[str] = frozenset({"audio_bgm", "audio_sfx"})
 _BGM_TYPE = "audio_bgm"
+_TEXT_ASSET_TYPE = "text_template"
 
 
 def compile_plan_to_timeline(
@@ -86,6 +87,40 @@ def compile_plan_to_timeline(
 
         # 保证 layer 按 layer_index 升序处理（主轴优先）
         for layer in sorted(beat_result.layers, key=lambda lyr: lyr.layer_index):
+            # text_template 是虚拟资产（virtual://...），直接走 text_overlay 分支，
+            # 无需 file_path 物理存在性校验。其他类型仍做空值防呆。
+            if layer.asset_type == _TEXT_ASSET_TYPE:
+                # 三级优先级：DSL layout > manifest default_position > 系统默认 center
+                text_position = (
+                    layer.layout
+                    or (layer.manifest or {}).get("default_position")
+                    or "center"
+                )
+                text_track = Track(
+                    name=f"text_b{beat_idx}_l{layer.layer_index}",
+                    z_index=overlay_z,
+                    track_type="text_overlay",
+                )
+                text_track.add_clip(
+                    Clip(
+                        file_path=layer.file_path,
+                        start_time=beat_start,
+                        duration=beat_duration,
+                        manifest=layer.manifest,
+                        beat_index=beat_idx,
+                        layout=text_position,
+                    )
+                )
+                timeline.add_track(text_track)
+                overlay_z += 1
+                logger.debug(
+                    "[DSLAdapter] beat[%d] → text_overlay Track(z=%d) asset_id=%d "
+                    "layout=%r manifest_keys=%s",
+                    beat_idx, overlay_z - 1, layer.asset_id, text_position,
+                    list((layer.manifest or {}).keys()),
+                )
+                continue
+
             if not layer.file_path:
                 logger.warning(
                     "[DSLAdapter] beat[%d] layer[%d] file_path 为空，跳过",
@@ -96,12 +131,14 @@ def compile_plan_to_timeline(
             if layer.layer_index == 0:
                 # ── X 轴主视频 ────────────────────────────────────────────
                 # start_time 固定 0.0：concat 管线按 clip 在 Track 内的插入顺序
-                # 自动拼接，无需手动指定全局偏移。
+                # 自动拼接，无需手动指定全局偏移。beat_index 供渲染引擎后期
+                # 绑定（Late-Binding）真实物理时长时定位该 Beat 在全局时间线的位置。
                 main_v_track.add_clip(
                     Clip(
                         file_path=layer.file_path,
                         start_time=0.0,
                         duration=beat_duration,
+                        beat_index=beat_idx,
                     )
                 )
                 logger.debug(
@@ -121,6 +158,7 @@ def compile_plan_to_timeline(
                         file_path=layer.file_path,
                         start_time=beat_start,
                         duration=beat_duration,
+                        beat_index=beat_idx,
                     )
                 )
                 timeline.add_audio_track(audio_track)
@@ -133,6 +171,12 @@ def compile_plan_to_timeline(
                 # ── Y 轴视觉叠加层（sticker / logo）→ 独立 overlay Track ─
                 # 每个 overlay Track 存放 1 个 Clip，与 _build_filtergraph
                 # 的 "overlay 轨道通常只有 1 个 Clip" 约定严格对齐。
+                # 三级优先级：DSL layout > manifest default_position > 系统默认 center
+                overlay_position = (
+                    layer.layout
+                    or (layer.manifest or {}).get("default_position")
+                    or "center"
+                )
                 overlay_track = Track(
                     name=f"overlay_b{beat_idx}_l{layer.layer_index}",
                     z_index=overlay_z,
@@ -143,13 +187,15 @@ def compile_plan_to_timeline(
                         file_path=layer.file_path,
                         start_time=beat_start,
                         duration=beat_duration,
+                        beat_index=beat_idx,
+                        layout=overlay_position,
                     )
                 )
                 timeline.add_track(overlay_track)
                 overlay_z += 1
                 logger.debug(
-                    "[DSLAdapter] beat[%d] → overlay Track(z=%d): %s",
-                    beat_idx, overlay_z - 1, layer.file_path,
+                    "[DSLAdapter] beat[%d] → overlay Track(z=%d) layout=%r: %s",
+                    beat_idx, overlay_z - 1, overlay_position, layer.file_path,
                 )
 
     # 主轨最后添加，让 timeline.add_track 的 z_index 排序不受影响

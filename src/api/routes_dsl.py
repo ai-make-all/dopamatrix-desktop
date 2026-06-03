@@ -32,21 +32,23 @@ Story DSL 接口集  (Phase 4.1 → Phase 5.2)
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session, sessionmaker
 
 from .database import get_db, get_tenant_engine
 from .dsl_adapter import compile_plan_to_timeline
 from src.api.ws_manager import manager as ws_manager
 from .dsl_parser import DSLParserNode
-from .models import LocalAsset
+from .models import LocalAsset, TaskHistory
 from .schemas import (
     CompilationPlan,
     CompilationPlanSummary,
@@ -62,6 +64,7 @@ from src.services.llm_provider import OpenAIProvider
 from src.utils.prompt_loader import prompt_loader
 from src.core.context import WorkflowContext
 from src.nodes.compositor import FFmpegCompositorNode
+from src.nodes.cover_node import CoverNode
 from src.nodes.director_node import DirectorNode
 from src.nodes.subtitle import SubtitleNode
 from src.nodes.tts_node import TTSNode
@@ -79,6 +82,40 @@ def _parse_plan_from_db(tenant_id: str, payload: StoryDSLPayload) -> Compilation
         return DSLParserNode(db).parse_and_resolve(payload)
 
 
+def _fetch_available_tags(tenant_id: str) -> list[str]:
+    """
+    从租户素材库查询所有 LocalAsset 的不重复标签列表。
+
+    供 DirectorNode.draft_blueprint 注入 Jinja 模板，约束 LLM 的
+    semantic_tags 只能从库内真实存在的标签中挑选，杜绝幻觉捏造。
+    """
+    _engine = get_tenant_engine(tenant_id)
+    _Session = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+    tag_set: set[str] = set()
+    try:
+        with _Session() as db:
+            rows = (
+                db.query(LocalAsset.tags)
+                .filter(
+                    LocalAsset.is_deleted.is_(False),
+                    LocalAsset.tags.isnot(None),
+                )
+                .all()
+            )
+            for (tags,) in rows:
+                if isinstance(tags, list):
+                    tag_set.update(
+                        t for t in tags if isinstance(t, str) and t.strip()
+                    )
+    except Exception:
+        logger.warning(
+            "[routes_dsl] _fetch_available_tags 查询失败，返回空标签库", exc_info=True
+        )
+    result = sorted(tag_set)
+    logger.debug("[routes_dsl] _fetch_available_tags tenant=%s tags=%d", tenant_id, len(result))
+    return result
+
+
 def _is_blind_fission(payload: RenderDSLRequest) -> bool:
     """极速闭眼裂变：batch≥1 + 非空 prompt + 空 timeline。"""
     return (
@@ -86,13 +123,6 @@ def _is_blind_fission(payload: RenderDSLRequest) -> bool:
         and bool(payload.prompt and payload.prompt.strip())
         and len(payload.timeline) == 0
     )
-
-
-def _script_data_has_scenes(data: Optional[dict]) -> bool:
-    if not data or not isinstance(data, dict):
-        return False
-    scenes = data.get("scenes")
-    return isinstance(scenes, list) and len(scenes) > 0
 
 
 # ================================================================== #
@@ -113,23 +143,22 @@ def render_worker(
     *,
     blind_dsl: bool = False,
     engine_type: str = "content",
-    script_data_prefetch: Optional[dict] = None,
     director_mode: str = "auto",
     dsl_payload: Optional[StoryDSLPayload] = None,
     enable_tts: bool = True,
     enable_subtitles: bool = True,
 ) -> list[dict]:
     """
-    后台渲染主 Worker（Phase 9.2 导演中枢 + 双离合台词 + 闭眼裂变）。
+    后台渲染主 Worker（Phase 9.11.2 单轨线性架构）。
 
-    blind_dsl=True 时在本线程内由 DirectorNode 生成 timeline/script_data，
+    blind_dsl=True 时在本线程内由 DirectorNode 生成含 script_text 的 timeline，
     再经 DSLParserNode 编译为 CompilationPlan；各矩阵子线程独立调用大模型，
     利用采样随机性产生差异化文案与打标。
 
-    混合模态（prompt 非空）：
-      离合器 A — 若 script_data_prefetch 含有效 scenes，则跳过导演 LLM 文案，
-                 直接写入 context 供 TTS；
-      离合器 B — 否则调用 DirectorNode.execute，由 LLM 写入 script_data。
+    单轨线性架构要点：
+      - 每个 Beat 的 script_text 直接驱动 TTS，不再依赖独立 script_data 根节点。
+      - context.assets["tts_script"] = {lang: "聚合全文"} 作为 TTSNode 的唯一入口。
+      - 无 Beat 台词时（纯积木模式），DirectorNode 兜底生成后同样写入 tts_script。
 
     纯积木模式（prompt 为空）：注入 default 变体，仅合流 BGM/SFX。
     """
@@ -140,10 +169,10 @@ def render_worker(
     )
 
     collected_assets: list[dict] = []
+    _start_time: float = time.time()
 
     try:
         working_plan: Optional[CompilationPlan] = plan
-        blueprint_script: Optional[dict] = None
 
         if blind_dsl:
             if not prompt or not str(prompt).strip():
@@ -153,26 +182,27 @@ def render_worker(
                 return []
             langs = [test_language] if test_language else ["en"]
             director = DirectorNode()
+
+            # 注入可用标签菜单（防幻觉）：从租户库实时抽取真实存在的 Faceted Tags
+            _available_tags = _fetch_available_tags(tenant_id)
+            logger.info(
+                "[render_worker] task_id=%s 标签菜单注入：%d 个可用标签供 LLM 约束",
+                task_id, len(_available_tags),
+            )
+
             bp = director.draft_blueprint(
                 str(prompt).strip(),
                 director_mode,
                 target_duration,
                 langs,
+                available_tags=_available_tags,
                 llm_temperature=0.92,
             )
-            if _script_data_has_scenes(script_data_prefetch):
-                bp["script_data"] = script_data_prefetch  # type: ignore[assignment]
-                logger.info(
-                    "[render_worker] task_id=%s 离合器 A：沿用前端 script_data，"
-                    "导演线程仅负责 timeline 寻址",
-                    task_id,
-                )
-            else:
-                logger.info(
-                    "[render_worker] task_id=%s 离合器 B：导演线程生成 timeline + script_data",
-                    task_id,
-                )
-            blueprint_script = bp.get("script_data")
+            # 单轨模式：script_text 已内聚于各 Beat，无需独立 script_data 根节点
+            logger.info(
+                "[render_worker] task_id=%s 单轨闭眼裂变：DirectorNode 生成含 script_text 的 timeline",
+                task_id,
+            )
 
             beat_nodes: list[DSLBeatNode] = []
             for i, row in enumerate(bp.get("timeline") or []):
@@ -286,24 +316,37 @@ def render_worker(
         # ── 4. 动态模态路由 ────────────────────────────────────────────
         if prompt:
             logger.info(
-                "[render_worker] task_id=%s 混合编排：导演/台词 → TTS → Subtitle → Compositor",
+                "[render_worker] task_id=%s 混合编排：单轨台词 → TTS → Subtitle → Compositor",
                 task_id,
             )
 
-            if blind_dsl:
-                context.set_asset("script_data", blueprint_script or {})
-            elif _script_data_has_scenes(script_data_prefetch):
-                context.set_asset("script_data", script_data_prefetch)
+            # 单轨原位提取：从 dsl_payload.timeline 各 Beat 的 script_text 聚合
+            _active_payload = dsl_payload
+            _beat_texts = [
+                b.script_text.strip()
+                for b in (_active_payload.timeline if _active_payload else [])
+                if b.script_text and b.script_text.strip()
+            ]
+
+            if _beat_texts:
+                _tts_lang = test_language or "en"
+                context.set_asset("tts_script", {_tts_lang: "\n".join(_beat_texts)})
                 logger.info(
-                    "[render_worker] task_id=%s 离合器 A：使用请求体 script_data，"
-                    "跳过大模型文案",
-                    task_id,
+                    "[render_worker] task_id=%s 单轨模式：聚合 %d 个 Beat script_text "
+                    "→ tts_script[%s] len=%d",
+                    task_id, len(_beat_texts), _tts_lang,
+                    sum(len(t) for t in _beat_texts),
                 )
             else:
+                # 无 Beat 台词 → DirectorNode 兜底生成（写入 context.assets["tts_script"]）
+                logger.info(
+                    "[render_worker] task_id=%s Beat 无 script_text，导演节点兜底生成台词",
+                    task_id,
+                )
                 context.set_asset("script", prompt)
                 DirectorNode().execute(context)
 
-            # TTSNode 读取 script_data，将 MP3 + VTT 写入 context.variants[lang]
+            # TTSNode 读取 tts_script，将 MP3 + VTT 写入 context.variants[lang]
             if enable_tts:
                 TTSNode().execute(context)
             else:
@@ -313,32 +356,31 @@ def render_worker(
                     task_id,
                 )
 
-            # ── TranslationBridge（内联）：聚合旁白文本 → SubtitleNode 降级兜底 ──
-            # SubtitleNode 精准模式依赖 vtt_path（TTSNode 已写入），但若 VTT 为空
-            # 则降级读取 context.config["translations"] + subtitle_start/end。
-            # 此段逻辑与 run_matrix_factory.py 中的 TranslationBridgeNode 保持一致。
+            # ── TranslationBridge（内联）：从 tts_script + Beat 时长计算字幕时间轴 ──
             if enable_subtitles:
-                script_data: dict = context.get_asset("script_data") or {}
-                _translations: dict = {}
-                _total_duration: float = 0.0
-                for _scene in script_data.get("scenes", []):
-                    _total_duration += float(_scene.get("duration", 0))
-                    for _lang, _text in _scene.get("narrations", {}).items():
-                        if _text and _text.strip():
-                            _translations.setdefault(_lang, []).append(_text.strip())
-                context.config["translations"] = {
-                    lang: "\n".join(lines) for lang, lines in _translations.items()
+                tts_script: dict = context.get_asset("tts_script") or {}
+                _translations: dict = {
+                    lang: text
+                    for lang, text in tts_script.items()
+                    if text and str(text).strip()
                 }
+                # Beat 时长累加；若 LLM 未提供 duration，回退至 target_duration
+                _beats_for_dur = _active_payload.timeline if _active_payload else []
+                _total_duration = sum(
+                    float(b.duration) for b in _beats_for_dur if b.duration
+                )
+                if _total_duration <= 0:
+                    _total_duration = float(target_duration)
+
+                context.config["translations"] = _translations
                 context.config["subtitle_start"] = 0.0
-                context.config["subtitle_end"] = _total_duration if _total_duration > 0 else 5.0
+                context.config["subtitle_end"] = _total_duration
                 logger.debug(
                     "[render_worker] task_id=%s TranslationBridge: langs=%s subtitle_end=%.1fs",
                     task_id,
-                    list(context.config["translations"].keys()),
-                    context.config["subtitle_end"],
+                    list(_translations.keys()),
+                    _total_duration,
                 )
-                # SubtitleNode：精准模式（VTT → 逐句 ASS）或降级模式（单 Dialogue）
-                # 写入 context.variants[lang]["subtitle_ass"]
                 SubtitleNode().execute(context)
             else:
                 logger.info(
@@ -366,12 +408,67 @@ def render_worker(
             # 驱动 compositor._render_variant 进入 BGM/SFX 合流阶段。
             context.variants = {"default": {}}
 
-        # ── 5. 引擎点火 ────────────────────────────────────────────────
+        # ── 5. 渲染前安检（Pre-flight Check）────────────────────────────
+        # 统计有效主视频层（layer_index == 0）数量；归零则熔断，绝不下发 FFmpeg。
+        _valid_main_clips = sum(
+            1
+            for _beat in (working_plan.beats if working_plan else [])
+            if _beat.resolved and any(lyr.layer_index == 0 for lyr in _beat.layers)
+        )
+        if _valid_main_clips == 0:
+            logger.error(
+                "❌ 任务 %s 缺乏主视觉素材，触发安全熔断！引擎拦截渲染，不调用 FFmpeg。",
+                task_id,
+            )
+            try:
+                ws_manager.broadcast_sync(
+                    {
+                        "type": "WS_UPDATE",
+                        "payload": {
+                            "taskId": task_id,
+                            "status": "failed",
+                            "error": (
+                                "严重缺料：未找到匹配的主视觉视频。"
+                                "请检查素材库标签覆盖，或向素材库添加「通用空镜」兜底素材。"
+                            ),
+                        },
+                    },
+                    user_id=tenant_id,
+                )
+            except Exception:
+                logger.warning(
+                    "[render_worker] 熔断 WS failed 广播异常 task_id=%s", task_id
+                )
+            return []
+
+        # ── 5b. 引擎点火 ───────────────────────────────────────────────
         render_ok = _run_compositor(FFmpegCompositorNode(), context)
 
-        # ── 6. 收集输出资产 & 疲劳值回写 ──────────────────────────────────
+        # ── 5c. 封面抽帧（Phase 9.8.2）─────────────────────────────────
+        # CoverNode 为非关键路径：失败只记录日志，不回滚渲染结果。
         if render_ok:
-            # 从 context.variants 读取每个语种的最终变体路径
+            logger.info(
+                "[render_worker] task_id=%s 渲染完成，启动 CoverNode 封面抽帧...",
+                task_id,
+            )
+            cover_ok = _run_cover_node(CoverNode(), context)
+            _cover_path: str = context.get_asset("cover_path") or ""
+            if cover_ok:
+                logger.info(
+                    "[render_worker] task_id=%s CoverNode ✅ 封面生成成功: %s",
+                    task_id, _cover_path,
+                )
+            else:
+                logger.warning(
+                    "[render_worker] task_id=%s CoverNode ⚠️ 封面抽帧失败，"
+                    "前端将显示缺省占位块。",
+                    task_id,
+                )
+        else:
+            _cover_path = ""
+
+        # ── 6. 收集输出资产 ─────────────────────────────────────────────
+        if render_ok:
             for _variant_assets in context.variants.values():
                 _fp = _variant_assets.get("final_video", "")
                 if _fp and os.path.exists(_fp):
@@ -384,7 +481,67 @@ def render_worker(
                     collected_assets.append({
                         "file_path": _fp,
                         "file_hash": _h.hexdigest(),
+                        "cover_path": _cover_path,  # ← CoverNode 执行完毕后才填入，时序正确
                     })
+
+        # ── 6b. WS 最终 completed 推送（CoverNode 已执行完毕，封面路径已就绪）──
+        # suppress_completed_ws=True 时由 render_batch_worker 统一推送，此处跳过。
+        if render_ok and not suppress_completed_ws:
+            _ws_status = "completed" if collected_assets else "failed"
+            _ws_payload: dict = {"taskId": task_id, "status": _ws_status}
+            if collected_assets:
+                _ws_payload["assets"] = collected_assets
+            try:
+                ws_manager.broadcast_sync(
+                    {"type": "WS_UPDATE", "payload": _ws_payload},
+                    user_id=tenant_id,
+                )
+                logger.info(
+                    "[render_worker] ✅ WS completed 推送完成 task_id=%s assets=%d cover=%s",
+                    task_id, len(collected_assets), bool(_cover_path),
+                )
+            except Exception as _ws_exc:
+                logger.warning(
+                    "[render_worker] WS completed 广播异常（不阻断主流程）: %r", _ws_exc
+                )
+
+        # ── 6c. 历史记录写入 TaskHistory ──────────────────────────────────
+        if render_ok and collected_assets:
+            try:
+                _elapsed = round(time.time() - _start_time, 1)
+                _beats_json: str = json.dumps(
+                    [b.model_dump() for b in (working_plan.beats if working_plan else [])],
+                    ensure_ascii=False,
+                )
+                _history_prompt = prompt or ""
+                _history_record = TaskHistory(
+                    task_id=task_id,
+                    prompt=_history_prompt,
+                    batch_size=batch_size,
+                    duration=_elapsed,
+                    output_assets=collected_assets,
+                    prompt_details=_beats_json,
+                    created_at=datetime.utcnow(),
+                )
+                _hist_engine = get_tenant_engine(tenant_id)
+                _HistSession = sessionmaker(
+                    autocommit=False, autoflush=False, bind=_hist_engine
+                )
+                with _HistSession() as _db:
+                    _db.add(_history_record)
+                    _db.commit()
+                logger.info(
+                    "[render_worker] ✅ 历史记录写入成功: task_id=%s duration=%.1fs",
+                    task_id, _elapsed,
+                )
+            except Exception as e:
+                logger.error(
+                    "[render_worker] ❌ 历史记录写入数据库失败: task_id=%s error=%s",
+                    task_id, str(e), exc_info=True,
+                )
+
+        # ── 6d. 疲劳值回写 ────────────────────────────────────────────────
+        if render_ok and working_plan:
             try:
                 used_asset_ids: set[int] = set()
                 for beat in working_plan.beats:
@@ -445,7 +602,6 @@ def render_batch_worker(
     *,
     blind_dsl: bool = False,
     engine_type: str = "content",
-    script_data_prefetch: Optional[dict] = None,
     director_mode: str = "auto",
     enable_tts: bool = True,
     enable_subtitles: bool = True,
@@ -481,7 +637,6 @@ def render_batch_worker(
                 True,  # suppress_completed_ws
                 blind_dsl=blind_dsl,
                 engine_type=engine_type,
-                script_data_prefetch=script_data_prefetch,
                 director_mode=director_mode,
                 dsl_payload=None if blind_dsl else dsl_payload,
                 enable_tts=enable_tts,
@@ -557,6 +712,26 @@ def _run_compositor(
         return False
 
 
+def _run_cover_node(cover: CoverNode, context: WorkflowContext) -> bool:
+    """
+    CoverNode 调用封装层（Phase 9.8.2）。
+
+    封面抽帧为非关键路径——失败不阻断渲染主流程，仅记录日志。
+    Returns:
+        True  — 封面 JPEG 已生成并写入 context.assets["cover_path"]；
+        False — 抽帧失败，context 不含 cover_path（前端降级显示占位）。
+    """
+    try:
+        cover.execute(context)
+        return bool(context.get_asset("cover_path"))
+    except Exception:
+        logger.exception(
+            "[_run_cover_node] CoverNode 异常（不阻断主流程） session_id=%s",
+            context.session_id,
+        )
+        return False
+
+
 # ================================================================== #
 # POST /tasks/draft-blueprint  — 战术板同步蓝图  (Phase 9.2)         #
 # ================================================================== #
@@ -572,13 +747,26 @@ def _run_compositor(
         "供战术板预览与微调后再走 submit-dsl。"
     ),
 )
-def draft_blueprint_endpoint(body: DraftBlueprintRequest) -> dict[str, Any]:
+def draft_blueprint_endpoint(
+    body: DraftBlueprintRequest,
+    request: Request,
+) -> dict[str, Any]:
+    # 如果前端没有提供可用标签，从租户库自动查询并注入（防幻觉菜单供给）
+    available_tags: list[str] = list(body.available_tags or [])
+    if not available_tags:
+        _tenant_id = request.headers.get("X-Local-User", "default") or "default"
+        available_tags = _fetch_available_tags(_tenant_id)
+        logger.info(
+            "[routes_dsl] draft-blueprint 自动注入标签菜单：%d 个可用标签（tenant=%s）",
+            len(available_tags), _tenant_id,
+        )
+
     return DirectorNode().draft_blueprint(
         body.prompt,
         body.mode,
         body.duration,
         body.langs,
-        available_tags=body.available_tags,
+        available_tags=available_tags,
         user_hard_tags=body.user_hard_tags,
     )
 
@@ -754,7 +942,6 @@ def submit_dsl(
     _worker_kw: dict[str, Any] = {
         "blind_dsl": is_blind,
         "engine_type": payload.engine_type,
-        "script_data_prefetch": payload.script_data,
         "director_mode": payload.mode,
         "enable_tts": payload.enable_tts,
         "enable_subtitles": payload.enable_subtitles,
@@ -895,7 +1082,6 @@ def render_dsl(
     _worker_kw: dict[str, Any] = {
         "blind_dsl": is_blind,
         "engine_type": payload.engine_type,
-        "script_data_prefetch": payload.script_data,
         "director_mode": payload.mode,
         "enable_tts": payload.enable_tts,
         "enable_subtitles": payload.enable_subtitles,

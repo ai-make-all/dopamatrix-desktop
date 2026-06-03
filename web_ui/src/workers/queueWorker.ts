@@ -18,6 +18,15 @@
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
 
+export interface QueueTaskAsset {
+  file_path: string
+  file_hash: string
+  /** 封面帧路径（历史水合后注入，WS 推送时可能为空）*/
+  cover_path?: string
+  /** 审批状态（历史水合后注入）*/
+  status?: string
+}
+
 export interface QueueTask {
   id: string
   type: TaskStatus
@@ -28,7 +37,7 @@ export interface QueueTask {
   endTime?: number
   endTs?: string
   duration?: string
-  assets?: Array<{ file_path: string; file_hash: string }>
+  assets?: QueueTaskAsset[]
 }
 
 export interface QueueStats {
@@ -44,7 +53,7 @@ export interface WsUpdatePayload {
   taskId: string
   status: TaskStatus
   prompt?: string
-  assets?: QueueTask['assets']
+  assets?: QueueTaskAsset[]
   startTime?: number
 }
 
@@ -202,8 +211,9 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
       existing.assets = payload.assets
         .filter(a => a && typeof a === 'object')
         .map(a => ({
-          file_path: typeof a.file_path === 'string' ? a.file_path : '',
-          file_hash: typeof a.file_hash === 'string' ? a.file_hash : '',
+          file_path:  typeof a.file_path  === 'string' ? a.file_path  : '',
+          file_hash:  typeof a.file_hash  === 'string' ? a.file_hash  : '',
+          cover_path: typeof a.cover_path === 'string' ? a.cover_path : undefined,
         }))
     }
 

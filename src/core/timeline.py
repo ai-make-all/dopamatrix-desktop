@@ -11,6 +11,9 @@ class Clip:
         effects: Optional[List[str]] = None,
         overlay_x: Optional[str] = None,
         overlay_y: Optional[str] = None,
+        manifest: Optional[dict] = None,
+        beat_index: Optional[int] = None,
+        layout: Optional[str] = None,
     ):
         self.file_path = file_path
         self.start_time = start_time  # 在时间线上的起始时间 (秒)
@@ -22,6 +25,16 @@ class Clip:
         # 例：overlay_x="W-w-30", overlay_y="30" → 右上角距边框 30px
         self.overlay_x: Optional[str] = overlay_x
         self.overlay_y: Optional[str] = overlay_y
+        # text_template 虚拟资产的多态载荷（含 content_matrix 多语种文本字典）
+        # 仅 track_type="text_overlay" 时使用，其他类型保持 None
+        self.manifest: Optional[dict] = manifest
+        # DSL 路径专用：所属 Beat 的序号（0-based），供渲染引擎在 ffprobe
+        # 完成后将均等时间切分替换为真实物理时长。assembler 路径保持 None。
+        self.beat_index: Optional[int] = beat_index
+        # 九宫格空间排版意图（Phase 9.7.2）：DSL 控制 > Manifest 预设 > 系统默认
+        # 取值：'center' | 'bottom_center' | 'top_center' | 'top_left' |
+        #       'top_right' | 'bottom_left' | None（None 等同 'center'）
+        self.layout: Optional[str] = layout
 
 
 class Track:

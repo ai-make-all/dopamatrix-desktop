@@ -1,15 +1,16 @@
 """
-DirectorNode — Phase 9.2 全自动导演中枢（微管线 + 蓝图 Schema）
+DirectorNode — Phase 9.11.2 单轨线性一体化导演中枢
 
 职责：
-  - 单次 LLM 调用产出融合蓝图：视觉 timeline（DSL Beat 意向）与 script_data（TTS 消费）。
+  - 单次 LLM 调用产出单轨融合蓝图：timeline 中每个 Beat 直接内聚 script_text。
+  - 彻底废弃独立 script_data 根节点，实现台词（灵魂）与资产图层（肉体）空间绑定。
   - 解析层采用深度合并 + 可扩展键读取，未来追加 audio_effects / camera_moves 等
     无需改动核心编排，只需在 EXTENSION_KEYS 注册并消费。
 
 WorkflowContext 契约（execute 路径）：
   读  context.assets["script"]、context.script_mode、context.target_languages、
       context.target_duration
-  写  context.assets["script_data"]
+  写  context.assets["tts_script"]   → {lang: "聚合全文"} 供 TTSNode 消费
 """
 
 from __future__ import annotations
@@ -23,11 +24,34 @@ from src.core.logger import logger
 from src.services.llm_provider import BaseLLMProvider, OpenAIProvider
 from src.utils.prompt_loader import prompt_loader
 
-# ── Schema Registry：契约说明（写入 Jinja，并供代码侧防呆参考）──────────────
+# ── Schema Registry：单轨线性一体化契约（Phase 9.11.2）─────────────────────────
 BLUEPRINT_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["timeline", "script_data"],
+    "required": ["meta", "timeline"],
     "properties": {
+        "meta": {
+            "type": "object",
+            "description": "全局社交媒体投放文案（Phase 9.12 归因管线）",
+            "required": ["social_title", "social_caption", "social_hashtags", "emotional_tag"],
+            "properties": {
+                "social_title": {
+                    "type": "string",
+                    "description": "极具网感、带 Emoji 的短标题（≤20字）",
+                },
+                "social_caption": {
+                    "type": "string",
+                    "description": "情绪化描述文案，结尾必须包含占位符 {TRACKING_LINK}",
+                },
+                "social_hashtags": {
+                    "type": "string",
+                    "description": "3–5 个高流量话题标签，空格分隔",
+                },
+                "emotional_tag": {
+                    "type": "string",
+                    "description": "情绪微标：纯英文驼峰或纯中文，2–4字/≤15字母，禁止空格标点",
+                },
+            },
+        },
         "timeline": {
             "type": "array",
             "items": {
@@ -38,24 +62,22 @@ BLUEPRINT_JSON_SCHEMA: dict[str, Any] = {
                     "address_mode",
                     "asset_hashes",
                     "semantic_tags",
+                    "script_text",
+                    "duration",
                 ],
-            },
-        },
-        "script_data": {
-            "type": "object",
-            "required": ["scenes"],
-            "properties": {
-                "scenes": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["duration", "visual_prompt", "narrations"],
-                    },
-                }
+                "properties": {
+                    "beat":          {"type": "string"},
+                    "role":          {"type": "string"},
+                    "address_mode":  {"type": "string", "enum": ["smart", "locked"]},
+                    "asset_hashes":  {"type": "array",  "items": {"type": "string"}},
+                    "semantic_tags": {"type": "array",  "items": {"type": "string"}},
+                    "script_text":   {"type": "string", "description": "该分镜的高光口播台词"},
+                    "duration":      {"type": "number", "description": "该分镜预估时长（秒）"},
+                },
             },
         },
         "audio_effects": {"type": "array", "description": "预留：音效时间轴"},
-        "camera_moves": {"type": "array", "description": "预留：运镜指令"},
+        "camera_moves":  {"type": "array", "description": "预留：运镜指令"},
     },
 }
 
@@ -139,32 +161,35 @@ class DirectorNode(BaseNode):
 
     def _parse_llm_blueprint(self, raw: dict[str, Any]) -> dict[str, Any]:
         """
-        自适应字典合并：保证 timeline / script_data 默认值，并根级并入扩展键。
-        未来新增子模块时，只需把键加入 EXTENSION_KEYS（或依赖深合并自动保留未知键）。
+        自适应字典合并：保证 timeline 默认值，并根级并入扩展键。
+        单轨线性架构（Phase 9.11.2）：每个 Beat 必须含 script_text，无需 script_data 根节点。
         """
-        seed: dict[str, Any] = {
-            "timeline": [],
-            "script_data": {"scenes": []},
-        }
+        seed: dict[str, Any] = {"meta": {}, "timeline": []}
         merged = self._deep_merge(seed, raw)
 
-        if not isinstance(merged.get("timeline"), list):
-            merged["timeline"] = []
-        sd = merged.get("script_data")
-        if not isinstance(sd, dict):
-            merged["script_data"] = {"scenes": []}
-        elif not isinstance(sd.get("scenes"), list):
-            merged["script_data"]["scenes"] = []
-
-        scenes = merged["script_data"].get("scenes", [])
-        if not scenes:
-            raise ValueError(
-                f"[{self.name}] LLM blueprint missing non-empty script_data.scenes."
-            )
-        if not merged["timeline"]:
+        if not isinstance(merged.get("timeline"), list) or not merged["timeline"]:
             raise ValueError(
                 f"[{self.name}] LLM blueprint missing non-empty timeline."
             )
+
+        # 防呆：过滤掉缺少 script_text 的 beat，并记录警告
+        valid_beats = []
+        for i, beat in enumerate(merged["timeline"]):
+            if not isinstance(beat, dict):
+                logger.warning("[%s] timeline[%d] 非对象，跳过: %r", self.name, i, beat)
+                continue
+            if not beat.get("script_text", "").strip():
+                logger.warning(
+                    "[%s] timeline[%d] beat=%r 缺少 script_text，已补充占位符",
+                    self.name, i, beat.get("beat"),
+                )
+                beat["script_text"] = ""
+            valid_beats.append(beat)
+
+        if not valid_beats:
+            raise ValueError(f"[{self.name}] LLM blueprint has no valid beats after filtering.")
+
+        merged["timeline"] = valid_beats
         return self._extend_blueprint_facets(merged)
 
     def draft_blueprint(
@@ -188,7 +213,9 @@ class DirectorNode(BaseNode):
                         强制 LLM 在 timeline 中精确落位这些标签。
 
         Returns:
-            dict: 至少含 timeline、script_data；可含 audio_effects、camera_moves 等扩展键。
+            dict: 至少含 timeline（每个 Beat 内聚 script_text + duration）；
+                  可含 audio_effects、camera_moves 等扩展键。
+                  单轨线性架构（Phase 9.11.2）：不再返回独立 script_data 根节点。
         """
         if not prompt or not str(prompt).strip():
             raise ValueError(f"[{self.name}] prompt is empty.")
@@ -218,6 +245,7 @@ class DirectorNode(BaseNode):
         script_mode: str = getattr(context, "script_mode", "auto")
         target_duration: int = getattr(context, "target_duration", 15)
         target_languages: List[str] = getattr(context, "target_languages", ["en"])
+        target_lang: str = (target_languages[0] if target_languages else None) or "en"
 
         self.log(
             f"Director pipeline | mode={script_mode} | duration={target_duration}s "
@@ -230,10 +258,24 @@ class DirectorNode(BaseNode):
             target_languages,
             llm_temperature=0.78,
         )
-        context.set_asset("script_data", bp.get("script_data", {}))
+
+        # 单轨聚合：从 Beat 原位提取 script_text → tts_script[lang]
+        beat_texts = [
+            beat.get("script_text", "").strip()
+            for beat in bp.get("timeline", [])
+            if beat.get("script_text", "").strip()
+        ]
+        if beat_texts:
+            context.set_asset("tts_script", {target_lang: "\n".join(beat_texts)})
+            self.log(
+                f"tts_script[{target_lang!r}] written to Context: "
+                f"{len(beat_texts)} beats, {sum(len(t) for t in beat_texts)} chars"
+            )
+        else:
+            self.log("Warning: no non-empty script_text found in timeline beats.")
+
         # 可选：供未来节点消费扩展切面
         for ek in EXTENSION_KEYS:
             if ek in bp:
                 context.set_asset(ek, bp[ek])
-        self.log('script_data written to Context.assets["script_data"]')
         return context

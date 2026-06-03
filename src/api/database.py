@@ -8,7 +8,7 @@ SQLAlchemy 数据库配置层 — 多租户动态物理隔离架构。
 
 Engine 实例按租户缓存，避免重复创建；线程锁保证并发安全。
 
-此外，提供全局共享数据库 clipflow.db 的路径常量，供 app_settings
+此外，提供全局共享数据库 dopamatrix.db 的路径常量，供 app_settings
 等跨租户表使用（通过原生 sqlite3 直连，不经过 ORM 层）。
 """
 
@@ -50,7 +50,7 @@ os.makedirs("data", exist_ok=True)
 # 全局共享数据库（app_settings 等非租户数据存储于此）                     #
 # main.py 中 `from src.api.database import engine, Base` 依赖此变量。  #
 # ------------------------------------------------------------------ #
-SETTINGS_DB_PATH = "clipflow.db"
+SETTINGS_DB_PATH = "dopamatrix.db"
 
 # 全局默认 Engine（向后兼容，供 main.py 的 Base.metadata.create_all 使用）
 engine = create_engine(

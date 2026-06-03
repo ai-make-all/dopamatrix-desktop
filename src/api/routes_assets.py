@@ -5,6 +5,8 @@ src/api/routes_assets.py
 """
 
 import os
+import uuid
+import json
 import hashlib
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -16,7 +18,7 @@ from sqlalchemy import select
 
 from .database import get_db
 from .models import LocalAsset
-from .schemas import LocalAssetCreate, LocalAssetResponse, LocalAssetImportResponse, AssetRoleUpdate, AssetTagsUpdate, AssetAppendTags
+from .schemas import LocalAssetCreate, LocalAssetResponse, LocalAssetImportResponse, AssetRoleUpdate, AssetTagsUpdate, AssetAppendTags, TextAssetCreate
 
 router = APIRouter(prefix="/assets", tags=["DAM Assets"])
 
@@ -93,6 +95,42 @@ def import_asset(asset_in: LocalAssetCreate, db: Session = Depends(get_db)):
         skipped_count=skipped_count,
         message=f"成功导入 {success_count} 个素材，跳过 {skipped_count} 个已存在或无效的文件"
     )
+
+
+@router.post("/text", response_model=LocalAssetResponse, summary="虚拟创建文本模板资产")
+def create_text_asset(payload: TextAssetCreate, db: Session = Depends(get_db)):
+    """
+    无需物理文件，直接在 DAM 中创建 text_template 类型的虚拟资产。
+    多语种内容矩阵存入 manifest.content_matrix 字段，以 JSON MD5 作为防重指纹。
+    """
+    content_json = json.dumps(payload.content_matrix, ensure_ascii=False, sort_keys=True)
+    file_hash    = hashlib.md5(content_json.encode("utf-8")).hexdigest()
+
+    existing = db.execute(
+        select(LocalAsset).where(LocalAsset.file_hash == file_hash)
+    ).scalar_one_or_none()
+    if existing and not existing.is_deleted:
+        raise HTTPException(status_code=409, detail="相同内容的文本资产已存在，请勿重复创建")
+    if existing and existing.is_deleted:
+        existing.is_deleted   = False
+        existing.asset_name   = payload.asset_name
+        existing.manifest     = {"content_matrix": payload.content_matrix}
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    new_asset = LocalAsset(
+        file_hash  = file_hash,
+        file_path  = f"virtual://text_{uuid.uuid4().hex[:8]}",
+        asset_type = "text_template",
+        video_role = "general",
+        asset_name = payload.asset_name,
+        manifest   = {"content_matrix": payload.content_matrix},
+    )
+    db.add(new_asset)
+    db.commit()
+    db.refresh(new_asset)
+    return new_asset
 
 
 @router.get("", response_model=List[LocalAssetResponse], summary="查询素材库")

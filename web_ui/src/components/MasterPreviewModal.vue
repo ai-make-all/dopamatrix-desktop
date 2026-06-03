@@ -200,13 +200,14 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
           :class="['strip-cell', { 'strip-cell--active': idx === currentIdx }]"
           @click="currentIdx = idx"
         >
-          <video
-            :src="store.buildVideoUrl(asset.file_path)"
+          <img
+            v-if="asset.cover_path"
+            :src="store.buildVideoUrl(asset.cover_path)"
+            :alt="`缩略图 ${idx + 1}`"
             class="strip-thumb"
-            preload="none"
-            muted
-            playsinline
+            loading="lazy"
           />
+          <div v-else class="strip-thumb-placeholder" />
           <span
             v-if="getStatus(asset.file_hash) !== 'none'"
             :class="['strip-status', `strip-status--${getStatus(asset.file_hash)}`]"
@@ -434,6 +435,11 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
 .strip-cell:hover      { transform: scale(1.06); border-color: rgba(99, 102, 241, 0.5); }
 .strip-cell--active    { border-color: #a78bfa; box-shadow: 0 0 8px rgba(167, 139, 250, 0.5); }
 .strip-thumb { width: 100%; height: 100%; object-fit: cover; display: block; aspect-ratio: 1/1; }
+.strip-thumb-placeholder {
+  width: 100%; height: 100%;
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  display: flex; align-items: center; justify-content: center;
+}
 
 .strip-status {
   position:   absolute;

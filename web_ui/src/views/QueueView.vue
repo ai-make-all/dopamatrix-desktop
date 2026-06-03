@@ -15,14 +15,61 @@ import { useQueueStore }  from '../stores/useQueueStore'
 import type { QueueTask } from '../stores/useQueueStore'
 import { useAppStore }    from '../stores/appStore'
 import MasterPreviewModal from '../components/MasterPreviewModal.vue'
+import CoverPreviewCard   from '../components/matrix/CoverPreviewCard.vue'
 
 const queueStore = useQueueStore()
 const appStore   = useAppStore()
+
+// ── 今日态水合（解决刷新丢失已完成任务）─────────────────────────────────────
+async function fetchTodayTasks(): Promise<void> {
+  try {
+    const userId = appStore.loggedInUser || 'default'
+    const resp = await fetch(`${appStore.API_BASE}/api/v1/tasks/today`, {
+      headers: { 'X-Local-User': userId },
+    })
+    if (!resp.ok) return
+
+    const records: any[] = await resp.json()
+
+    const todayCompleted: QueueTask[] = records.map(r => {
+      const createdAt = new Date(r.created_at)
+      const ts = createdAt.toLocaleTimeString('zh', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      })
+      return {
+        id:        r.task_id,
+        type:      'completed' as const,
+        prompt:    r.prompt || '',
+        ts,
+        startTime: createdAt.getTime(),
+        startTs:   ts,
+        endTs:     ts,
+        duration:  r.duration != null ? `${Number(r.duration).toFixed(1)}s` : '',
+        assets: (r.output_assets || []).map((asset: any) => ({
+          file_path:  asset.path       || '',
+          file_hash:  asset.hash       || '',
+          cover_path: asset.cover_path || '',
+          status:     asset.status     || 'PENDING',
+        })),
+      }
+    })
+
+    // 仅追加本地尚未记录的任务，不覆盖 WS 实时推送的任务
+    const existingIds = new Set(queueStore.tasks.map(t => t.id))
+    const newTasks    = todayCompleted.filter(t => !existingIds.has(t.id))
+    if (newTasks.length > 0) {
+      queueStore.initTasks([...queueStore.tasks, ...newTasks])
+    }
+  } catch (err) {
+    console.warn('[QueueView] fetchTodayTasks 失败（已忽略）:', err)
+  }
+}
 
 // ── 生命周期 ─────────────────────────────────────────────────────────────────
 onMounted(() => {
   queueStore.initWorker()
   queueStore.connectEventBus(appStore.loggedInUser || 'default')
+  fetchTodayTasks()
 })
 onUnmounted(() => {
   queueStore.dispose()
@@ -124,6 +171,11 @@ function openModal(task: QueueTask, globalIdx: number) {
   modalTask.value     = task
   modalAssetIdx.value = globalIdx
   modalOpen.value     = true
+}
+
+/** CoverPreviewCard @preview 事件的适配器（localIdx → globalIdx → openModal） */
+function handleCardPreview(task: QueueTask, localIdx: number) {
+  openModal(task, getGlobalIdx(task, localIdx))
 }
 
 function onModalClose() {
@@ -417,18 +469,21 @@ const triggerRealWsFlood = async () => {
                     { 'carousel-cell--active': getGlobalIdx(item, localIdx) === getCarousel(item.id).activeIdx },
                     { 'carousel-cell--fixed': item.assets.length <= PAGE_SIZE },
                   ]"
-                  @click.stop="openModal(item, getGlobalIdx(item, localIdx))"
                 >
-                  <video
-                    :src="appStore.buildVideoUrl(asset.file_path)"
-                    class="carousel-thumb"
-                    preload="none"
-                    muted
-                    playsinline
-                    @mouseenter="(e) => (e.target as HTMLVideoElement).play()"
-                    @mouseleave="(e) => { const v = e.target as HTMLVideoElement; v.pause(); v.currentTime = 0 }"
+                  <!-- CoverPreviewCard 替代裸 video，复用封面/状态角标/hover 交互 -->
+                  <CoverPreviewCard
+                    :variant="{
+                      id:             asset.file_hash,
+                      task_id:        item.id,
+                      video_url:      appStore.buildVideoUrl(asset.file_path),
+                      cover_url:      asset.cover_path ? appStore.buildVideoUrl(asset.cover_path) : '',
+                      status:         asset.status || 'PENDING',
+                      cover_strategy: 'EXTRACT',
+                    }"
+                    :hide-actions="true"
+                    aspect-ratio="1/1"
+                    @preview="handleCardPreview(item, localIdx)"
                   />
-                  <span class="carousel-hash">{{ asset.file_hash?.slice(0, 6) }}</span>
                 </div>
               </div>
 
@@ -919,46 +974,30 @@ const triggerRealWsFlood = async () => {
   justify-content: flex-start;
 }
 .carousel-cell {
-  flex:     1 1 0;
-  position: relative;
-  cursor:   pointer;
+  flex:          1 1 0;
+  position:      relative;
+  cursor:        pointer;
   border-radius: 7px;
-  border:   2px solid transparent;
-  overflow: hidden;
-  transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
-  aspect-ratio: 1 / 1;
-  background: #000;
+  border:        2px solid transparent;
+  overflow:      hidden;
+  transition:    border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+  /* 1:1 相册方块比例 */
+  aspect-ratio:  1 / 1;
+  background:    #000;
 }
 .carousel-cell--fixed {
   flex:       0 0 auto;
-  width:      120px;
-  height:     120px;
-  max-width:  120px;
+  width:      78px;
+  aspect-ratio: 1 / 1;
+  max-width:  78px;
 }
-.carousel-cell:hover { transform: scale(1.03); border-color: rgba(99, 102, 241, 0.5); }
+.carousel-cell:hover {
+  transform:    scale(1.03);
+  border-color: rgba(99, 102, 241, 0.5);
+}
 .carousel-cell--active {
   border-color: #a78bfa !important;
   box-shadow:   0 0 0 2px rgba(167, 139, 250, 0.35), 0 0 16px rgba(167, 139, 250, 0.4);
-}
-.carousel-thumb {
-  width:       100%;
-  height:      100%;
-  object-fit:  cover;
-  display:     block;
-  aspect-ratio: 1 / 1;
-}
-.carousel-hash {
-  position:    absolute;
-  bottom:      3px;
-  left:        0;
-  right:       0;
-  text-align:  center;
-  font-size:   0.55rem;
-  font-family: monospace;
-  color:       rgba(255,255,255,0.55);
-  background:  rgba(0,0,0,0.45);
-  padding:     1px 0;
-  pointer-events: none;
 }
 .carousel-arrow {
   flex-shrink: 0;
