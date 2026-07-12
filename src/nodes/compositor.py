@@ -409,7 +409,23 @@ class FFmpegCompositorNode(BaseNode):
             per_clip_labels: List[str] = []
 
             for clip in track.clips:
-                input_args.extend(["-i", clip.file_path])
+                # 静态图片嗅探与时空膨胀：单帧图片需要 -loop 1 撑开为视频流，
+                # 否则 concat 滤镜只见一帧即丢弃，导致主轴片段缺失。
+                _ext = clip.file_path.rsplit(".", 1)[-1].lower() if "." in clip.file_path else ""
+                _is_static_image = _ext in {"png", "jpg", "jpeg", "webp", "bmp"}
+
+                if _is_static_image:
+                    actual_dur = (clip.duration or 0.0) if (clip.duration or 0.0) > 0 else 5.0
+                    input_args.extend([
+                        "-loop", "1",
+                        "-framerate", str(self.TARGET_FPS),
+                        "-t", str(actual_dur),
+                        "-i", clip.file_path,
+                    ])
+                    self.log(f"[VideoTrack] X轴主图膨胀: {clip.file_path!r} → {actual_dur}s")
+                else:
+                    input_args.extend(["-i", clip.file_path])
+
                 raw = f"[{clip_index}:v]"
 
                 if len(track.clips) > 1:

@@ -21,16 +21,27 @@ export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
 export interface QueueTaskAsset {
   file_path: string
   file_hash: string
+  path?: string
+  hash?: string
+  url?: string
+  video_url?: string
+  cover_url?: string
   /** 封面帧路径（历史水合后注入，WS 推送时可能为空）*/
   cover_path?: string
   /** 审批状态（历史水合后注入）*/
   status?: string
+  social_title?: string
+  social_caption?: string
+  social_hashtags?: string
+  meta?: Record<string, unknown>
 }
 
 export interface QueueTask {
   id: string
   type: TaskStatus
   prompt: string
+  mode?: string
+  generation_mode?: string
   ts: string
   startTime: number
   startTs: string
@@ -53,6 +64,8 @@ export interface WsUpdatePayload {
   taskId: string
   status: TaskStatus
   prompt?: string
+  mode?: string
+  generation_mode?: string
   assets?: QueueTaskAsset[]
   startTime?: number
 }
@@ -196,6 +209,8 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
       id:        payload.taskId,
       type:      payload.status ?? 'pending',
       prompt:    (payload.prompt?.trim() ? payload.prompt : '正在解析任务描述...').slice(0, 120),
+      mode:      payload.mode || payload.generation_mode,
+      generation_mode: payload.generation_mode || payload.mode,
       ts,
       startTime: payload.startTime ?? Date.now(),
       startTs:   ts,
@@ -206,13 +221,18 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
     const prevType = existing.type
 
     existing.type = payload.status
+    if (payload.mode || payload.generation_mode) {
+      existing.mode = payload.mode || payload.generation_mode
+      existing.generation_mode = payload.generation_mode || payload.mode
+    }
 
     if (payload.assets?.length) {
       existing.assets = payload.assets
         .filter(a => a && typeof a === 'object')
         .map(a => ({
-          file_path:  typeof a.file_path  === 'string' ? a.file_path  : '',
-          file_hash:  typeof a.file_hash  === 'string' ? a.file_hash  : '',
+          ...a,
+          file_path:  typeof a.file_path  === 'string' ? a.file_path  : (typeof a.path === 'string' ? a.path : ''),
+          file_hash:  typeof a.file_hash  === 'string' ? a.file_hash  : (typeof a.hash === 'string' ? a.hash : ''),
           cover_path: typeof a.cover_path === 'string' ? a.cover_path : undefined,
         }))
     }

@@ -53,6 +53,89 @@ export const useAppStore = defineStore('app', () => {
     _toastTimer = setTimeout(() => { toastVisible.value = false }, duration)
   }
 
+  // ── Delivery Hub Notifications ───────────────────────────────────────────
+  const notifications = ref([])
+  const unreadCount = computed(() => notifications.value.filter(n => !n.isRead).length)
+  const exportPollTimers = new Map()
+
+  function addNotification(notif) {
+    const id = 'msg_' + Date.now() + Math.random().toString(36).slice(2, 5)
+    notifications.value.unshift({
+      id,
+      isRead: false,
+      timestamp: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      ...notif,
+    })
+    return id
+  }
+
+  function updateNotification(id, updates) {
+    const idx = notifications.value.findIndex(n => n.id === id)
+    if (idx !== -1) {
+      notifications.value[idx] = {
+        ...notifications.value[idx],
+        ...updates,
+        timestamp: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      }
+    }
+  }
+
+  function markAllRead() {
+    notifications.value.forEach(n => { n.isRead = true })
+  }
+
+  function stopExportPolling(filename) {
+    const pollTimer = exportPollTimers.get(filename)
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      exportPollTimers.delete(filename)
+    }
+  }
+
+  function startGlobalExportPolling(filename, count) {
+    if (!filename) return
+    stopExportPolling(filename)
+
+    const ticketId = addNotification({
+      type: 'loading',
+      title: '📦 交付任务下发成功',
+      message: `正在后台并发打包装填 ${count} 个视频，您可以继续处理其他工作。`,
+    })
+
+    const pollTimer = setInterval(async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/api/v1/matrix/export/status`, {
+          params: { filename },
+        })
+        if (res.data.status === 'ready') {
+          stopExportPolling(filename)
+          updateNotification(ticketId, {
+            type: 'success',
+            isRead: false,
+            title: '⚡ 矩阵弹药箱装填完毕',
+            message: `成功打包 ${count} 个成片与专属短链 CSV，请点击立即提货。`,
+            downloadUrl: `${API_BASE}${res.data.download_url}`,
+            localPath: res.data.local_path,
+          })
+          // 全局总线：通知质检舱数据库已完成 tracking_link 写入，触发列表刷新
+          window.dispatchEvent(new CustomEvent('matrix-delivery-ready'))
+        } else if (res.data.status === 'failed') {
+          stopExportPolling(filename)
+          updateNotification(ticketId, {
+            type: 'error',
+            isRead: false,
+            title: '⚠️ 交付包生成失败',
+            message: '后台打包未完成，请确认已通过变体的物理文件仍然存在后重试。',
+          })
+        }
+      } catch (e) {
+        console.error('[Polling Failed]', e)
+      }
+    }, POLL_INTERVAL_MS)
+
+    exportPollTimers.set(filename, pollTimer)
+  }
+
   // ── Task Feed ─────────────────────────────────────────────────────────────
   const feedItems    = ref([])
   let _feedIdCounter = 0
@@ -60,6 +143,8 @@ export const useAppStore = defineStore('app', () => {
 
   function clearPollTimer() {
     if (_pollTimer !== null) { clearInterval(_pollTimer); _pollTimer = null }
+    for (const timer of exportPollTimers.values()) clearInterval(timer)
+    exportPollTimers.clear()
   }
 
   function pushQueuedItem(promptText) {
@@ -146,6 +231,7 @@ export const useAppStore = defineStore('app', () => {
    */
   function buildVideoUrl(filePath) {
     if (!filePath) return ''
+    if (/^(https?:|blob:|data:)/i.test(filePath)) return filePath
     // 含路径分隔符 → 本地绝对路径，走动态流媒体网关
     if (filePath.includes('/') || filePath.includes('\\')) {
       return `${API_BASE}/api/v1/media/preview?path=${encodeURIComponent(filePath)}`
@@ -176,6 +262,8 @@ export const useAppStore = defineStore('app', () => {
     initAuth, handleLogin, handleLogout,
     // Toast
     toastVisible, toastMsg, toastType, showToast,
+    // Delivery Hub
+    notifications, unreadCount, markAllRead, updateNotification, startGlobalExportPolling,
     // Feed
     feedItems,
     clearPollTimer, startGlobalPolling,

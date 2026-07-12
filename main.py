@@ -33,18 +33,19 @@ load_env()
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from pyngrok import ngrok
 
 from src.core.logger import setup_logger, logger
-from src.api.database import engine, Base
+from src.api.database import engine, Base, evolve_schema
 from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
 from src.api import routes_assets
 from src.api import routes_dsl
 from src.api import routes_history
 from src.api.routes_history import tasks_router as tasks_today_router
-from src.api import routes_matrix
+from src.api import routes_matrix, routes_approval
 from src.api import routes_gateway
 from src.api import routes_media
 from src.api import routes_video
@@ -76,6 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ---- 启动阶段 ---- #
     logger.info("[ClipFlow] 正在初始化数据库表结构…")
     Base.metadata.create_all(bind=engine)
+    evolve_schema(engine)
     logger.info("[ClipFlow] 数据库就绪 ✓")
 
     # ---- 注入事件循环到 WebSocket 广播中枢 ---- #
@@ -138,6 +140,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.makedirs(os.path.join("output", "exports"), exist_ok=True)
+app.mount("/exports", StaticFiles(directory=os.path.join("output", "exports")), name="exports")
+
 
 # ================================================================== #
 # 路由 — 健康检查                                                        #
@@ -170,6 +175,7 @@ app.include_router(routes_history.router, prefix="/api/v1")
 app.include_router(tasks_today_router, prefix="/api/v1")
 # 审批状态机 & 交付包导出 (Phase 9.9)
 app.include_router(routes_matrix.router, prefix="/api/v1")
+app.include_router(routes_approval.router, prefix="/api/v1")
 # Story DSL 意图解析器 — Dry-run 渲染蓝图接口 (Phase 4.1)
 app.include_router(routes_dsl.router, prefix="/api/v1")
 # 动态流媒体网关 — 替代 StaticFiles 挂载，支持任意绝对路径透传预览

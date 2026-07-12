@@ -8,65 +8,103 @@
  *  - 状态机操作栏：废弃 / 已审 / 微调（微调触发 open-detail 事件，禁止路由跳转）
  */
 
-import { ref, computed, watch } from 'vue'
-import { useAppStore } from '../stores/appStore'
-import type { QueueTask } from '../stores/useQueueStore'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+
+interface GenericVideoAsset {
+  hash: string
+  url?: string
+  video_url?: string
+  download_url?: string
+  path?: string
+  file_path?: string
+  cover_url?: string
+  social_title?: string
+  title?: string
+  social_caption?: string
+  caption?: string
+  description?: string
+  social_hashtags?: string
+  hashtags?: string
+  status?: string
+  meta?: {
+    social_title?: string
+    social_caption?: string
+    social_hashtags?: string
+    title?: string
+    caption?: string
+    description?: string
+    hashtags?: string
+  }
+  [key: string]: any
+}
 
 const props = defineProps<{
-  task:         QueueTask
+  visible:      boolean
+  videoList:    GenericVideoAsset[]
   initialIndex: number
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'open-detail', hash: string): void
+  (e: 'action', payload: {
+    action: 'approve' | 'reject' | 'tune'
+    hash: string
+    index: number
+  }): void
 }>()
-
-const store = useAppStore()
 
 // ── 当前预览索引 ──────────────────────────────────────────────────────────
 const currentIdx = ref(props.initialIndex)
 
-// 确保索引合法
 watch(() => props.initialIndex, (v) => { currentIdx.value = v }, { immediate: true })
 
-const assets = computed(() => props.task.assets ?? [])
-
+const assets       = computed(() => props.videoList ?? [])
 const currentAsset = computed(() => assets.value[currentIdx.value] ?? null)
 const hasPrev      = computed(() => currentIdx.value > 0)
 const hasNext      = computed(() => currentIdx.value < assets.value.length - 1)
-
-const videoUrl = computed(() =>
-  currentAsset.value ? store.buildVideoUrl(currentAsset.value.file_path) : ''
-)
+const videoUrl     = computed(() => {
+  const a = currentAsset.value
+  return a?.url || a?.video_url || a?.download_url || a?.path || a?.file_path || ''
+})
 
 function prev() { if (hasPrev.value) currentIdx.value-- }
 function next() { if (hasNext.value) currentIdx.value++ }
 
 // ── 状态机 ───────────────────────────────────────────────────────────────
-// 每个资产的状态独立存储（hash → status）
 type AssetStatus = 'none' | 'discarded' | 'approved' | 'fine-tune'
-const assetStatusMap = ref<Map<string, AssetStatus>>(new Map())
 
-function getStatus(hash: string | undefined): AssetStatus {
-  return hash ? (assetStatusMap.value.get(hash) ?? 'none') : 'none'
+function getStatus(asset: GenericVideoAsset | null | undefined): AssetStatus {
+  const status = asset?.status?.toUpperCase()
+  if (status === 'APPROVED') return 'approved'
+  if (status === 'REJECTED' || status === 'DISCARDED') return 'discarded'
+  if (status === 'FINE_TUNE' || status === 'TUNING') return 'fine-tune'
+  return 'none'
 }
 
-function setStatus(status: AssetStatus) {
-  const hash = currentAsset.value?.file_hash
-  if (!hash) return
-  assetStatusMap.value.set(hash, status)
+const currentStatus = computed(() => getStatus(currentAsset.value))
+
+function handleApprove() {
+  if (!currentAsset.value) return
+  emit('action', {
+    action: 'approve',
+    hash: currentAsset.value.hash,
+    index: currentIdx.value,
+  })
 }
 
-const currentStatus = computed(() => getStatus(currentAsset.value?.file_hash))
+function handleReject() {
+  if (!currentAsset.value) return
+  emit('action', {
+    action: 'reject',
+    hash: currentAsset.value.hash,
+    index: currentIdx.value,
+  })
+}
 
-function doDiscard()  { setStatus('discarded') }
-function doApprove()  { setStatus('approved')  }
-function doFineTune() {
-  const hash = currentAsset.value?.file_hash
-  if (!hash) return
-  setStatus('fine-tune')
-  emit('open-detail', hash)
+function handleRetune() {
+  if (!currentAsset.value) return
+  emit('open-detail', currentAsset.value.hash)
 }
 
 // ── 键盘快捷键 ───────────────────────────────────────────────────────────
@@ -75,15 +113,31 @@ function onKeydown(e: KeyboardEvent) {
   else if (e.key === 'ArrowLeft')  { prev() }
   else if (e.key === 'ArrowRight') { next() }
 }
-// 挂载时注册
-import { onMounted, onUnmounted } from 'vue'
 onMounted(()   => document.addEventListener('keydown', onKeydown))
 onUnmounted(() => document.removeEventListener('keydown', onKeydown))
+
+// ── 社交文案面板状态 ───────────────────────────────────────────────────────
+const isMetaExpanded = ref(false)
+
+// 每次切换视频时，自动收起文案面板
+watch(currentIdx, () => { isMetaExpanded.value = false })
+
+const metaInfo = computed(() => {
+  const a = currentAsset.value
+  if (!a) return null
+  // 兼容数据结构：优先从 meta 对象取，兜底取根级别
+  const title = a.meta?.social_title || a.social_title || a.meta?.title || a.title || ''
+  const tags  = a.meta?.social_hashtags || a.social_hashtags || a.meta?.hashtags || a.hashtags || ''
+  const desc  = a.meta?.social_caption || a.social_caption || a.meta?.caption || a.caption || a.meta?.description || a.description || ''
+
+  if (!title && !tags && !desc) return null
+  return { title, tags, desc }
+})
 </script>
 
 <template>
   <Teleport to="body">
-    <div class="modal-backdrop" @click.self="emit('close')">
+    <div v-if="visible" class="modal-backdrop" @click.self="emit('close')">
 
       <!-- 关闭按钮 -->
       <button class="modal-close" @click="emit('close')" aria-label="关闭">
@@ -114,6 +168,21 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
 
       <!-- 中心播放器 -->
       <div class="modal-player-wrap">
+        <div
+          v-if="metaInfo"
+          class="preview-meta-panel"
+          :class="{ 'preview-meta-panel--expanded': isMetaExpanded }"
+        >
+          <div class="pm-title">{{ metaInfo.title || '未生成社交标题' }}</div>
+          <div class="pm-tags">{{ metaInfo.tags }}</div>
+          <div class="pm-desc">{{ metaInfo.desc }}</div>
+
+          <div v-if="!isMetaExpanded" class="pm-mask" @click="isMetaExpanded = true"></div>
+          <button class="pm-expand-btn" @click="isMetaExpanded = !isMetaExpanded">
+            {{ isMetaExpanded ? '↑ 收起' : '↓ 展开' }}
+          </button>
+        </div>
+
         <!-- 状态覆盖层 -->
         <Transition name="status-overlay">
           <div
@@ -149,7 +218,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
 
         <!-- hash 信息 -->
         <div class="asset-info">
-          <span class="asset-hash">{{ currentAsset?.file_hash ?? '' }}</span>
+          <span class="asset-hash">{{ currentAsset?.hash ?? '' }}</span>
           <span class="asset-index">第 {{ currentIdx + 1 }} 个 · 共 {{ assets.length }} 个</span>
         </div>
       </div>
@@ -171,21 +240,21 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
       <div class="action-bar">
         <button
           :class="['action-btn', 'action-btn--discard', { 'action-btn--active': currentStatus === 'discarded' }]"
-          @click="doDiscard"
+          @click="handleReject"
         >
           <span>🗑️</span>
           <span>废弃</span>
         </button>
         <button
           :class="['action-btn', 'action-btn--approve', { 'action-btn--active': currentStatus === 'approved' }]"
-          @click="doApprove"
+          @click="handleApprove"
         >
           <span>✅</span>
           <span>已审</span>
         </button>
         <button
           :class="['action-btn', 'action-btn--finetune', { 'action-btn--active': currentStatus === 'fine-tune' }]"
-          @click="doFineTune"
+          @click="handleRetune"
         >
           <span>🛠️</span>
           <span>微调</span>
@@ -196,23 +265,23 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
       <div v-if="assets.length > 1" class="thumbnail-strip">
         <div
           v-for="(asset, idx) in assets"
-          :key="asset.file_hash || idx"
+          :key="asset.hash || idx"
           :class="['strip-cell', { 'strip-cell--active': idx === currentIdx }]"
           @click="currentIdx = idx"
         >
           <img
-            v-if="asset.cover_path"
-            :src="store.buildVideoUrl(asset.cover_path)"
+            v-if="asset.cover_url"
+            :src="asset.cover_url"
             :alt="`缩略图 ${idx + 1}`"
             class="strip-thumb"
             loading="lazy"
           />
           <div v-else class="strip-thumb-placeholder" />
           <span
-            v-if="getStatus(asset.file_hash) !== 'none'"
-            :class="['strip-status', `strip-status--${getStatus(asset.file_hash)}`]"
+            v-if="getStatus(asset) !== 'none'"
+            :class="['strip-status', `strip-status--${getStatus(asset)}`]"
           >
-            {{ getStatus(asset.file_hash) === 'discarded' ? '🗑️' : getStatus(asset.file_hash) === 'approved' ? '✅' : '🛠️' }}
+            {{ getStatus(asset) === 'discarded' ? '🗑️' : getStatus(asset) === 'approved' ? '✅' : '🛠️' }}
           </span>
         </div>
       </div>
@@ -448,4 +517,77 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown))
   font-size:  0.7rem;
   line-height: 1;
 }
+
+/* ── 悬浮文案面板 (HUD 风格) ────────────────────────────────────────────── */
+.preview-meta-panel {
+  width: min(45vh, 300px); /* 与 player-frame 宽度绝对对齐 */
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 12px;
+  padding: 0.65rem 0.8rem;
+  position: relative;
+  overflow: hidden;
+  max-height: 72px; /* 固定折叠状态高度 */
+  transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s;
+  flex-shrink: 0;
+  text-align: left;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.preview-meta-panel--expanded {
+  max-height: 250px;
+  border-color: rgba(56, 189, 248, 0.6);
+  overflow-y: auto;
+}
+.preview-meta-panel--expanded::-webkit-scrollbar { width: 4px; }
+.preview-meta-panel--expanded::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.3); border-radius: 2px; }
+
+.pm-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #e2e8f0;
+  margin-bottom: 0.25rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preview-meta-panel--expanded .pm-title {
+  white-space: normal; /* 展开后允许标题换行 */
+}
+
+.pm-tags {
+  font-size: 0.65rem;
+  color: #38bdf8;
+  margin-bottom: 0.4rem;
+  font-family: 'Inter', sans-serif;
+}
+.pm-desc {
+  font-size: 0.7rem;
+  color: #94a3b8;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  padding-bottom: 1.2rem; /* 为底部控制按钮留出呼吸空间 */
+}
+
+/* 渐变遮罩 */
+.pm-mask {
+  position: absolute;
+  bottom: 0; left: 0; right: 0; height: 35px;
+  background: linear-gradient(transparent, rgba(15, 23, 42, 1));
+  cursor: pointer;
+}
+.pm-expand-btn {
+  position: absolute;
+  bottom: 6px;
+  right: 12px;
+  font-size: 0.65rem;
+  color: #38bdf8;
+  font-weight: 600;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  z-index: 2;
+  padding: 0;
+  transition: color 0.2s;
+}
+.pm-expand-btn:hover { color: #7dd3fc; }
 </style>

@@ -7,12 +7,66 @@
 ///      Phase-2  taskkill /F /T /IM backend.exe     兜底斩杀整个进程树（Windows 专属）
 ///   这样无论 ProcessPoolExecutor 派生了多少子进程，都能被连根拔起。
 
+use std::path::Path;
+use std::process::Command;
+
+#[tauri::command]
+fn show_in_folder(path: String) -> Result<(), String> {
+    let path_ref = Path::new(&path);
+    if !path_ref.exists() {
+        return Err(format!("Path does not exist: {path}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        // `explorer /select,"<path>"` 是 Windows 官方支持的"打开文件夹并高亮指定文件"方式，
+        // 比 Shell.Application COM 自动化可靠得多：无需等待窗口出现、无需遍历窗口句柄。
+        let select_arg = format!("/select,{}", path);
+        let status = Command::new("explorer.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg(&select_arg)
+            .status()
+            .map_err(|e| format!("Failed to launch explorer.exe /select: {e}"))?;
+
+        // explorer.exe /select 在成功时返回 exit code 1（Windows 历史遗留行为），
+        // 因此不能通过 status.success() 判断，只要能启动就视为成功。
+        let _ = status;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open finder: {e}"))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(dir) = path_ref.parent() {
+            Command::new("xdg-open")
+                .arg(dir)
+                .spawn()
+                .map_err(|e| format!("Failed to open file manager: {e}"))?;
+        } else {
+            return Err(format!("Path has no parent directory: {path}"));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![show_in_folder])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(

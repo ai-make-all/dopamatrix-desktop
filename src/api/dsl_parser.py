@@ -47,8 +47,11 @@ ASSET_REGISTRY = {
     "scene_master_video": {"axis_type": "X_STRUCTURE"},  # B端视频级底模
     "audio_bgm": {"axis_type": "Y_LAYER"},
     "audio_sfx": {"axis_type": "Y_LAYER"},
+    "sfx": {"axis_type": "Y_LAYER"},       # 前端上传时使用的短名（兼容 audio_sfx）
     "sticker": {"axis_type": "Y_LAYER"},
     "logo": {"axis_type": "Y_LAYER"},
+    "image": {"axis_type": "Y_LAYER"},     # 通用静态图片，渲染为 Y 轴 overlay
+    "vfx": {"axis_type": "Y_LAYER"},       # 视觉特效资产（前端 asset_type=vfx）
     # text_template 为虚拟资产（无物理文件），归属 Y 轴叠加层；
     # 渲染阶段由 compositor 从 manifest.content_matrix 提取文本并注入 drawtext 滤镜
     "text_template": {"axis_type": "Y_LAYER"},
@@ -250,6 +253,18 @@ class DSLParserNode:
                             user_hard_tags=self._user_hard_tags,
                             request_tags=node.semantic_tags,
                         )
+                        # 硬约束一票否决可能清空 scored_fb；此时降级为无兜底，
+                        # 避免 IndexError，交由下方 else 分支输出警告。
+                        if not scored_fb:
+                            logger.warning(
+                                "[DSLParser] locked X轴兜底：_score_candidates 硬约束"
+                                " veto 后候选池为空（hard_tags=%s semantic_tags=%s），"
+                                "跳过 X 轴兜底。",
+                                self._user_hard_tags,
+                                node.semantic_tags,
+                            )
+                            x_fallback = []  # 触发下方 else 警告分支
+                    if x_fallback and scored_fb:
                         fb_asset, fb_matched = scored_fb[0]
                         layers.insert(
                             0,
@@ -322,6 +337,7 @@ class DSLParserNode:
                 )
                 next_layer_idx += 1
 
+        _apply_layout_hints(layers, node)
         resolved = any(lyr.layer_index == 0 for lyr in layers) or (len(layers) > 0)
 
         return BeatCompilationResult(
@@ -488,6 +504,8 @@ class DSLParserNode:
                 for i, (a, m) in enumerate(scored)
             ]
 
+        _apply_layout_hints(layers, node)
+
         return BeatCompilationResult(
             beat=node.beat,
             role=node.role,
@@ -566,6 +584,18 @@ def _make_layer(
         matched_tags=matched_tags,
         manifest=dict(asset.manifest) if getattr(asset, "manifest", None) else None,
     )
+
+
+def _apply_layout_hints(layers: List[ResolvedLayer], node: DSLBeatNode) -> None:
+    """Apply DSL asset-hash layout hints to resolved layers in-place."""
+    hints = getattr(node, "layout_hints", None) or {}
+    if not hints:
+        return
+
+    for layer in layers:
+        hint = hints.get(layer.file_hash)
+        if hint:
+            layer.layout = hint
 
 
 def _intersect_tags(asset: LocalAsset, request_tags: List[str]) -> List[str]:

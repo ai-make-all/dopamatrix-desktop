@@ -1,13 +1,22 @@
 <script setup>
-import { onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { invoke, isTauri as tauriIsTauri } from '@tauri-apps/api/core'
+import { open as openPath } from '@tauri-apps/plugin-shell'
 import { useAppStore } from './stores/appStore'
 import Login from './components/Login.vue'
 
 const router = useRouter()
 const store  = useAppStore()
+const isBellOpen = ref(false)
 
-onUnmounted(() => store.clearPollTimer())
+const closeBell = () => { isBellOpen.value = false }
+
+onMounted(() => window.addEventListener('click', closeBell))
+onUnmounted(() => {
+  window.removeEventListener('click', closeBell)
+  store.clearPollTimer()
+})
 
 function handleLogin(username) {
   store.handleLogin(username)
@@ -17,6 +26,86 @@ function handleLogin(username) {
 function handleLogout() {
   store.handleLogout()
   router.push('/login')
+}
+
+function isTauriRuntime() {
+  try {
+    return tauriIsTauri()
+  } catch {
+    return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__?.invoke || window.__TAURI__?.core?.invoke)
+  }
+}
+
+function isMissingTauriIpcError(error) {
+  const message = String(error?.message || error || '')
+  return message.includes('__TAURI_INTERNALS__')
+    || message.includes('Cannot read properties of undefined')
+    || message.includes('window.__TAURI__')
+}
+
+function getParentPath(path) {
+  if (!path) return ''
+  const normalized = String(path).replace(/[\\/]+$/, '')
+  const idx = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'))
+  return idx > 0 ? normalized.slice(0, idx) : normalized
+}
+
+async function triggerDownload(notification) {
+  notification.isRead = true
+  isBellOpen.value = false
+
+  const tauriRuntime = isTauriRuntime()
+  const localPath = notification.localPath || notification.local_path
+
+  console.info('[Delivery] triggerDownload', {
+    tauriRuntime,
+    hasLocalPath: Boolean(localPath),
+    localPath,
+    downloadUrl: notification.downloadUrl,
+  })
+
+  if (localPath) {
+    const folderPath = getParentPath(localPath)
+    try {
+      console.log('[Delivery] reveal file via native command:', localPath)
+      await invoke('show_in_folder', { path: localPath })
+      return
+    } catch (revealError) {
+      console.warn('show_in_folder failed, falling back to opening folder', revealError)
+    }
+
+    console.log('[Delivery] open folder via shell plugin:', folderPath)
+    try {
+      await openPath(folderPath)
+      return
+    } catch (e) {
+      console.error('open delivery folder failed', e)
+      if (!isMissingTauriIpcError(e)) {
+        store.showToast?.('原生资源管理器打开失败，请查看控制台日志。', 'error')
+        return
+      }
+      console.info('[Web] Tauri IPC unavailable, using HTTP download')
+    }
+  } else if (tauriRuntime) {
+    console.warn('[Tauri] localPath is missing, skip native reveal', notification)
+    store.showToast?.('缺少本地物理路径，无法唤起资源管理器。', 'error')
+    return
+  } else {
+    console.info('[Web] Tauri runtime not detected, using HTTP download')
+  }
+
+  fallbackWebDownload(notification.downloadUrl)
+}
+
+function fallbackWebDownload(url) {
+  if (!url) return
+
+  const link = document.createElement('a')
+  link.href = url
+  link.target = '_blank'
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
 }
 </script>
 
@@ -55,6 +144,50 @@ function handleLogout() {
         <div class="sidebar-logo">
           <div class="logo-icon">⚡</div>
           <span class="logo-text">DopaMatrix</span>
+
+          <div class="sidebar-bell-zone">
+            <button
+              class="sbar-bell-btn"
+              :class="{ 'sbar-bell-btn--active': store.unreadCount > 0 }"
+              @click.stop="isBellOpen = !isBellOpen"
+              title="通知中枢"
+            >
+              🔔
+              <span v-if="store.unreadCount > 0" class="sbar-bell-badge">{{ store.unreadCount }}</span>
+            </button>
+
+            <Transition name="panel-slide-right">
+              <div v-if="isBellOpen" class="sbar-msg-panel" @click.stop>
+                <div class="sbar-msg-header">
+                  <span class="sbar-msg-title">通知中枢</span>
+                  <button class="sbar-msg-readall" @click="store.markAllRead">全部已读</button>
+                </div>
+
+                <div class="sbar-msg-list">
+                  <div v-if="store.notifications.length === 0" class="sbar-msg-empty">暂无后台交付日志</div>
+
+                  <div
+                    v-for="n in store.notifications"
+                    :key="n.id"
+                    :class="['sbar-msg-item', { 'sbar-msg-item--unread': !n.isRead }]"
+                  >
+                    <div class="sbar-msg-item-top">
+                      <span class="sbar-msg-item-tag" :class="`tag--${n.type}`">●</span>
+                      <span class="sbar-msg-item-title">{{ n.title }}</span>
+                      <span class="sbar-msg-item-time">{{ n.timestamp }}</span>
+                    </div>
+                    <div class="sbar-msg-item-body">{{ n.message }}</div>
+
+                    <button
+                      v-if="n.downloadUrl"
+                      class="sbar-msg-dl-btn"
+                      @click.stop="triggerDownload(n)"
+                    >⬇️ 立即提取加密 ZIP 包</button>
+                  </div>
+                </div>
+              </div>
+            </Transition>
+          </div>
         </div>
 
         <nav class="sidebar-nav">
@@ -147,6 +280,7 @@ function handleLogout() {
 }
 
 .sidebar-logo {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 0.6rem;
@@ -170,6 +304,141 @@ function handleLogout() {
   -webkit-text-fill-color: transparent;
   letter-spacing: -0.01em;
 }
+
+/* ── 边栏消息铃铛总线 ────────────────────────────────────────────────── */
+.sidebar-bell-zone {
+  margin-left: auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.sbar-bell-btn {
+  background: transparent;
+  border: none;
+  font-size: 0.95rem;
+  cursor: pointer;
+  padding: 0.3rem;
+  border-radius: 6px;
+  position: relative;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #475569;
+}
+.sbar-bell-btn:hover { background: rgba(255,255,255,0.06); color: #a78bfa; }
+.sbar-bell-btn--active { color: #f59e0b; animation: bell-shake 0.5s ease-in-out infinite alternate; }
+
+.sbar-bell-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  min-width: 14px;
+  height: 14px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 0.55rem;
+  font-weight: 900;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 3px;
+  box-shadow: 0 0 8px rgba(239,68,68,0.6);
+}
+
+.sbar-msg-panel {
+  position: absolute;
+  left: calc(100% + 18px);
+  top: -12px;
+  width: 320px;
+  background: rgba(10, 15, 35, 0.96);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.7), 0 0 20px rgba(139,92,246,0.1);
+  backdrop-filter: blur(16px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 9999;
+}
+
+.sbar-msg-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  background: rgba(0,0,0,0.2);
+}
+.sbar-msg-title { font-size: 0.8rem; font-weight: 800; color: #a78bfa; letter-spacing: 0.05em; }
+.sbar-msg-readall { background: transparent; border: none; color: #64748b; font-size: 0.68rem; cursor: pointer; font-weight: 600; }
+.sbar-msg-readall:hover { color: #cbd5e1; }
+
+.sbar-msg-list {
+  max-height: 380px;
+  overflow-y: auto;
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.sbar-msg-list::-webkit-scrollbar { width: 4px; }
+.sbar-msg-list::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.2); border-radius: 2px; }
+.sbar-msg-empty { padding: 2rem 0; text-align: center; color: #334155; font-size: 0.75rem; font-style: italic; }
+
+.sbar-msg-item {
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  transition: background 0.2s;
+}
+.sbar-msg-item--unread { background: rgba(139,92,246,0.04); border-color: rgba(139,92,246,0.15); }
+
+.sbar-msg-item-top { display: flex; align-items: center; gap: 0.4rem; }
+.sbar-msg-item-tag { font-size: 0.5rem; }
+.tag--loading { color: #f59e0b; animation: opacity-pulse 1s infinite alternate; }
+.tag--success { color: #10b981; }
+.tag--error { color: #f87171; }
+.sbar-msg-item-title { font-size: 0.75rem; font-weight: 700; color: #cbd5e1; flex: 1; min-width: 0; }
+.sbar-msg-item-time { font-size: 0.6rem; color: #475569; font-family: 'JetBrains Mono', monospace; flex-shrink: 0; }
+.sbar-msg-item-body { font-size: 0.68rem; color: #94a3b8; line-height: 1.4; word-break: break-all; }
+
+.sbar-msg-dl-btn {
+  margin-top: 0.4rem;
+  display: block;
+  width: 100%;
+  text-align: center;
+  font-size: 0.68rem;
+  font-weight: 800;
+  padding: 0.4rem;
+  border-radius: 6px;
+  background: linear-gradient(135deg, rgba(79,70,229,0.2), rgba(99,102,241,0.2));
+  border: 1px solid rgba(99,102,241,0.4);
+  color: #a5b4fc;
+  text-decoration: none;
+  transition: all 0.2s;
+  cursor: pointer;
+  font-family: inherit;
+}
+.sbar-msg-dl-btn:hover {
+  background: linear-gradient(135deg, #4f46e5, #6366f1);
+  color: #fff;
+  box-shadow: 0 0 10px rgba(99,102,241,0.4);
+}
+
+.panel-slide-right-enter-active { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
+.panel-slide-right-leave-active { transition: all 0.15s ease-in; }
+.panel-slide-right-enter-from,
+.panel-slide-right-leave-to { opacity: 0; transform: translateX(-10px) scale(0.98); }
+
+@keyframes bell-shake { 0% { transform: rotate(-10deg); } 100% { transform: rotate(10deg); } }
+@keyframes opacity-pulse { 0% { opacity: 0.3; } 100% { opacity: 1; } }
 
 .sidebar-nav {
   display: flex;

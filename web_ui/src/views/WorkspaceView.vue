@@ -163,14 +163,22 @@ const dslTemplates = {
 const currentTemplate = ref('content')
 
 // ── Story DSL 轨道状态（规范数据层，由抽屉写入）────────────────────────────
-const dslTracks = ref(dslTemplates.content.map(t => ({ ...t, items: [] })))
+const dslTracks = ref(dslTemplates.content.map(t => ({
+  ...t,
+  items: [],
+  script_text: '',
+  visual_script: '',
+  emotion: '',
+})))
+const draftMeta = ref(null)
 
 // ── 抽屉控制 ────────────────────────────────────────────────────────────────
 const showOrchestrator = ref(false)
 
-function onOrchestratorConfirm({ tracks, template, directRender, params }) {
+function onOrchestratorConfirm({ tracks, template, directRender, params, meta }) {
   dslTracks.value = tracks
   currentTemplate.value = template
+  draftMeta.value = meta ?? draftMeta.value
 
   // 将战术舱局部参数回写全局状态，override 工具栏中的值
   if (params) {
@@ -219,7 +227,15 @@ function applyBlueprintTimelineToTracks(apiTimeline) {
   dslTracks.value = dslTracks.value.map((track, index) => {
     // 用索引直接对位：LLM 的 beat 字段是自由文本，不做字符串匹配
     const row = rows[index]
-    if (!row || !Array.isArray(row.semantic_tags)) return { ...track, items: [], script_text: '' }
+    if (!row || !Array.isArray(row.semantic_tags)) {
+      return {
+        ...track,
+        items: [],
+        script_text: '',
+        visual_script: '',
+        emotion: '',
+      }
+    }
 
     const base = Date.now()
     const items = row.semantic_tags
@@ -230,7 +246,13 @@ function applyBlueprintTimelineToTracks(apiTimeline) {
         type: 'semantic_tag',
         tag,
       }))
-    return { ...track, items, script_text: row.script_text || '' }
+    return {
+      ...track,
+      items,
+      script_text: row.script_text || '',
+      visual_script: row.visual_script || '',
+      emotion: row.emotion || '',
+    }
   })
 }
 
@@ -289,6 +311,7 @@ async function draftBlueprint() {
       { timeout: 15000 },
     )
     const data = resp.data || {}
+    draftMeta.value = data.meta || null
     applyBlueprintTimelineToTracks(data.timeline)
     // 等待 Vue 完成本轮响应式更新，确保抽屉 watch 读到已含 items 的 dslTracks
     await nextTick()
@@ -319,7 +342,9 @@ function buildTimelineFromTracks() {
       const beatNode = {
         beat:          track.id,
         role:          track.role,
-        script_text:   track.script_text || '',
+        script_text:   track.script_text   || '',
+        visual_script: track.visual_script || '',
+        emotion:       track.emotion       || '',
         address_mode:  physicals.length > 0 ? 'locked' : 'smart',
         asset_hashes:  physicals.map(i => i.hash),
         semantic_tags: tags.map(i => i.tag),
@@ -369,6 +394,7 @@ async function blindFission() {
       tenant_id:        store.loggedInUser || 'default',
       mode:             scriptMode.value,
       user_hard_tags:   hardTags,
+      meta:             draftMeta.value,
       enable_tts:       enableTts.value,
       enable_subtitles: enableSubtitles.value,
       ...(hasPrompt && { prompt: pureText || rawPrompt }),
@@ -386,7 +412,13 @@ async function blindFission() {
     })
     await nextTick()
 
-    dslTracks.value.forEach(t => { t.items = []; t.script_text = '' })
+    dslTracks.value.forEach(t => {
+      t.items = []
+      t.script_text = ''
+      t.visual_script = ''
+      t.emotion = ''
+    })
+    draftMeta.value = null
     omniPrompt.value = ''
 
     store.showToast('🚀 矩阵任务已投入后台熔炉')
@@ -592,14 +624,17 @@ async function blindFission() {
       :dsl-tracks="dslTracks"
       :templates="dslTemplates"
       :current-template="currentTemplate"
+      :draft-meta="draftMeta"
       :build-video-url="store.buildVideoUrl"
       :api-base="store.API_BASE"
       :show-toast="store.showToast"
       :default-batch-size="batchSize"
       :default-aspect-ratio="aspectRatio"
       :default-language="testLanguage"
+      :default-target-duration="targetDuration"
       :default-enable-tts="enableTts"
       :default-enable-subtitles="enableSubtitles"
+      :tenant-id="store.loggedInUser || 'default'"
       @confirm="onOrchestratorConfirm"
     />
 

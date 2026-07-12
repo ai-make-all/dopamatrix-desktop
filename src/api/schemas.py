@@ -9,10 +9,31 @@ Pydantic v2 请求 / 响应模型。
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, ConfigDict
 
+from .approval_types import VariantStatus
+
+
+class BatchUpdateStatusRequest(BaseModel):
+    hashes: List[str] = Field(default_factory=list)
+    target_status: Literal[
+        VariantStatus.PENDING,
+        VariantStatus.APPROVED,
+        VariantStatus.REJECTED,
+        VariantStatus.DELETED,
+    ]
+
+
+class BatchUpdateStatusResponse(BaseModel):
+    message: str = "success"
+    updated_count: int
+    target_status: VariantStatus
+    updated_hashes: List[str] = Field(default_factory=list)
+    missing_hashes: List[str] = Field(default_factory=list)
+    missing_files: List[str] = Field(default_factory=list)
+    cleanup_errors: List[str] = Field(default_factory=list)
 
 # ================================================================== #
 # VideoTask Schemas                                                    #
@@ -169,7 +190,7 @@ class TaskSubmitAck(BaseModel):
 
 class LocalAssetCreate(BaseModel):
     file_paths:  List[str] = Field(..., description="本地素材文件绝对路径列表")
-    asset_type:  str = Field(..., description="枚举: 'video', 'logo', 'sticker'")
+    asset_type:  str = Field(..., description="枚举: 'video' | 'logo' | 'sticker' | 'image' | 'vfx' | 'audio_bgm' | 'audio_sfx' | 'sfx' | 'text_template' | 'scene_master_video'")
     video_role:  str = Field(default="general", description="枚举: 'hook', 'body', 'general'")
     tags:        Optional[List[str]] = Field(default=[], description="自定义标签内容，例如 ['高转化', 'Hook']")
     entity_id:   Optional[str] = Field(default=None, description="素材归属实体/产品线标识，例如 '@DogFood_BrandA'")
@@ -228,10 +249,11 @@ class BlueprintMeta(BaseModel):
     由 LLM 在 draft_blueprint 时一同生成，存入 TaskHistory.prompt_details["meta"]。
     导出 ZIP 时，social_caption 中的 {TRACKING_LINK} 将被替换为 CF KV 短链。
     """
-    social_title:    Optional[str] = Field(default=None, description="极具网感、带 Emoji 的短标题（≤20字）。")
-    social_caption:  Optional[str] = Field(default=None, description="情绪化描述文案，结尾必须含 {TRACKING_LINK} 占位符。")
-    social_hashtags: Optional[str] = Field(default=None, description="3–5 个高流量话题标签，空格分隔。")
-    emotional_tag:   Optional[str] = Field(default=None, description="情绪微标，纯英文驼峰或纯中文，2–4字/≤15字母，无空格标点。")
+    social_title:    str = Field(..., description="极具网感的短标题")
+    social_caption:  str = Field(..., description="情绪化描述文案，必须包含 {TRACKING_LINK}")
+    social_hashtags: str = Field(..., description="高流量话题标签")
+    human_drive:     str = Field(..., description="核心利用的人性本能/七宗罪，单选")
+    emotional_tag:   str = Field(..., description="提炼的情绪标签，用于文件命名")
 
 
 class DSLBeatNode(BaseModel):
@@ -252,7 +274,11 @@ class DSLBeatNode(BaseModel):
     address_mode:  str            = Field(..., description="寻址模式：'locked' | 'smart'。")
     asset_hashes:  List[str]      = Field(default_factory=list, description="locked 模式下指定的素材 MD5 哈希列表。")
     semantic_tags: List[str]      = Field(default_factory=list, description="语义标签列表，用于 smart 模式匹配与 Y 轴叠加查询。")
-    script_text:   Optional[str]  = Field(default=None, description="内聚于该节拍的高光口播台词；TTS 管线直接原位消费，无需旁路 script_data 字典。")
+    script_text:   Optional[str]  = Field(default="", description="内聚于该节拍的高光口播台词；TTS 管线直接原位消费，无需旁路 script_data 字典。")
+    visual_script: Optional[str]  = Field(default="", description="动作描写与画面分镜指令")
+    emotion:       Optional[str]  = Field(default="", description="该分镜的核心情绪标签")
+    layout_hints:  Dict[str, str] = Field(default_factory=dict, description="asset hash -> layout position key.")
+    tts_params:    Optional[str]  = Field(default="", description="该情绪下的 TTS 语速/语调特征，如 'fast, high-pitch'。")
     duration:      Optional[float] = Field(default=None, description="该节拍预估时长（秒），LLM 生成时填写，字幕时间轴兜底计算依据。")
 
     # ── Phase 9.12 社交媒体归因字段（Beat 级可选，全局 meta 优先）─────────── #
@@ -269,6 +295,7 @@ class StoryDSLPayload(BaseModel):
     """
     engine_type:    str               = Field(..., description="引擎类型：'content' | 'ua'。")
     timeline:       List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
+    meta:           Optional[BlueprintMeta] = Field(default=None, description="全局社交文案与情绪归因元数据")
     prompt:         Optional[str]     = Field(default=None, description="用户输入的提示词。若存在，将触发大模型与 TTS 配音管线。")
     user_hard_tags: List[str]         = Field(default_factory=list, description="前端剥离的硬约束标签列表，DSLParserNode 寻址时执行一票否决过滤。")
     language:       Optional[str]     = Field(default=None, description="目标渲染语种，如 'zh'、'en'、'ar'；供 FFmpeg 渲染阶段从 text_template content_matrix 提取对应文本。")
@@ -337,6 +364,7 @@ class RenderDSLRequest(BaseModel):
     """
     engine_type:     str              = Field(..., description="引擎类型：'content' | 'ua'。")
     timeline:        List[DSLBeatNode] = Field(..., description="Beat 节点时间轴，顺序即渲染顺序。")
+    meta:            Optional[BlueprintMeta] = Field(default=None, description="全局社交文案与情绪归因元数据")
 
     # ── 渲染配置 ─────────────────────────────────────────────────── #
     session_id:      Optional[str]   = Field(

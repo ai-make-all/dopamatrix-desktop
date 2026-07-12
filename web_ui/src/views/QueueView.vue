@@ -12,22 +12,67 @@
 
 import { onMounted, onUnmounted, computed, ref, reactive } from 'vue'
 import { useQueueStore }  from '../stores/useQueueStore'
-import type { QueueTask } from '../stores/useQueueStore'
+import type { QueueTask, QueueTaskAsset } from '../stores/useQueueStore'
 import { useAppStore }    from '../stores/appStore'
+import { updateVideoStatus } from '../api'
 import MasterPreviewModal from '../components/MasterPreviewModal.vue'
 import CoverPreviewCard   from '../components/matrix/CoverPreviewCard.vue'
 
 const queueStore = useQueueStore()
 const appStore   = useAppStore()
 
+function parseRecordMeta(record: any): Record<string, any> {
+  let details = record?.prompt_details || {}
+  if (typeof details === 'string') {
+    try {
+      details = JSON.parse(details)
+    } catch {
+      details = {}
+    }
+  }
+  return details?.meta || {}
+}
+
+function normalizeHistoryAsset(asset: any, recordMeta: Record<string, any> = {}) {
+  const filePath = asset.path || asset.file_path || asset.raw_path || ''
+  const fileHash = asset.hash || asset.file_hash || asset.asset_hash || ''
+  const videoUrl = asset.video_url || asset.url || appStore.buildVideoUrl(filePath)
+  const coverUrl = asset.cover_url || (asset.cover_path ? appStore.buildVideoUrl(asset.cover_path) : '')
+  const meta = {
+    ...recordMeta,
+    ...(asset.meta || {}),
+    social_title: asset.social_title || asset.meta?.social_title || recordMeta.social_title || '',
+    social_caption: asset.social_caption || asset.meta?.social_caption || recordMeta.social_caption || '',
+    social_hashtags: asset.social_hashtags || asset.meta?.social_hashtags || recordMeta.social_hashtags || '',
+  }
+
+  return {
+    ...asset,
+    file_path: filePath,
+    file_hash: fileHash,
+    cover_path: asset.cover_path || '',
+    cover_url: coverUrl,
+    video_url: videoUrl,
+    url: videoUrl,
+    status: asset.status || 'PENDING',
+    social_title: meta.social_title,
+    social_caption: meta.social_caption,
+    social_hashtags: meta.social_hashtags,
+    meta,
+  }
+}
+
 // ── 今日态水合（解决刷新丢失已完成任务）─────────────────────────────────────
-async function fetchTodayTasks(): Promise<void> {
+// 返回本次水合得到的 taskId → QueueTask 映射，供 openModal 直接使用，
+// 绕过 Worker 异步 TICK 尚未回写 queueStore.tasks 的时序竞态。
+async function fetchTodayTasks(): Promise<Map<string, QueueTask>> {
+  const hydratedById = new Map<string, QueueTask>()
   try {
     const userId = appStore.loggedInUser || 'default'
     const resp = await fetch(`${appStore.API_BASE}/api/v1/tasks/today`, {
       headers: { 'X-Local-User': userId },
     })
-    if (!resp.ok) return
+    if (!resp.ok) return hydratedById
 
     const records: any[] = await resp.json()
 
@@ -36,6 +81,7 @@ async function fetchTodayTasks(): Promise<void> {
       const ts = createdAt.toLocaleTimeString('zh', {
         hour: '2-digit', minute: '2-digit', second: '2-digit',
       })
+      const recordMeta = parseRecordMeta(r)
       return {
         id:        r.task_id,
         type:      'completed' as const,
@@ -45,24 +91,29 @@ async function fetchTodayTasks(): Promise<void> {
         startTs:   ts,
         endTs:     ts,
         duration:  r.duration != null ? `${Number(r.duration).toFixed(1)}s` : '',
-        assets: (r.output_assets || []).map((asset: any) => ({
-          file_path:  asset.path       || '',
-          file_hash:  asset.hash       || '',
-          cover_path: asset.cover_path || '',
-          status:     asset.status     || 'PENDING',
-        })),
+        mode:      r.mode || r.generation_mode || recordMeta.mode || 'manual',
+        generation_mode: r.generation_mode || r.mode || recordMeta.mode || 'manual',
+        assets: (r.output_assets || [])
+          .filter((asset: any) => asset.status !== 'DELETED')
+          .map((asset: any) => normalizeHistoryAsset(asset, recordMeta)),
       }
     })
 
+    todayCompleted.forEach(t => hydratedById.set(t.id, t))
+
     // 仅追加本地尚未记录的任务，不覆盖 WS 实时推送的任务
-    const existingIds = new Set(queueStore.tasks.map(t => t.id))
-    const newTasks    = todayCompleted.filter(t => !existingIds.has(t.id))
-    if (newTasks.length > 0) {
-      queueStore.initTasks([...queueStore.tasks, ...newTasks])
-    }
+    const mergedTasks = queueStore.tasks.map(t =>
+      t.type === 'completed' && hydratedById.has(t.id)
+        ? { ...t, ...hydratedById.get(t.id)! }
+        : t
+    )
+    const existingIds = new Set(mergedTasks.map(t => t.id))
+    const newTasks = todayCompleted.filter(t => !existingIds.has(t.id))
+    queueStore.initTasks([...mergedTasks, ...newTasks])
   } catch (err) {
     console.warn('[QueueView] fetchTodayTasks 失败（已忽略）:', err)
   }
+  return hydratedById
 }
 
 // ── 生命周期 ─────────────────────────────────────────────────────────────────
@@ -119,6 +170,48 @@ function togglePrompt(id: string) {
   else expandedPrompts.add(id)
 }
 
+const expandedAssetTitles = reactive<Set<string>>(new Set())
+
+function assetTitleKey(task: QueueTask, asset: QueueTaskAsset, localIdx: number): string {
+  return `${task.id}:${asset.file_hash || asset.hash || localIdx}`
+}
+
+function toggleAssetTitle(task: QueueTask, asset: QueueTaskAsset, localIdx: number, e: Event) {
+  e.stopPropagation()
+  const key = assetTitleKey(task, asset, localIdx)
+  if (expandedAssetTitles.has(key)) expandedAssetTitles.delete(key)
+  else expandedAssetTitles.add(key)
+}
+
+function getAssetTitle(task: QueueTask, asset: QueueTaskAsset): string {
+  const meta = (asset.meta || {}) as Record<string, unknown>
+  return String(
+    asset.social_title
+      || meta.social_title
+      || (asset as any).title
+      || (asset as any).asset_name
+      || task.prompt
+      || 'Untitled video'
+  )
+}
+
+function normalizeAssetStatus(status?: string): 'PENDING' | 'APPROVED' | 'REJECTED' {
+  const normalized = String(status || 'PENDING').toUpperCase()
+  return normalized === 'APPROVED' || normalized === 'REJECTED' ? normalized : 'PENDING'
+}
+
+function getModeLabel(task: QueueTask): string {
+  const mode = String((task as any).mode || (task as any).generation_mode || '').toLowerCase()
+  if (mode === 'director') return 'AI起草模式'
+  if (mode === 'blind') return '极速闭眼裂变'
+  return '手工战术板模式'
+}
+
+function getModeClass(task: QueueTask): string {
+  const mode = String((task as any).mode || (task as any).generation_mode || 'manual').toLowerCase()
+  return mode === 'director' || mode === 'blind' ? `mode-badge--${mode}` : 'mode-badge--manual'
+}
+
 // ── Row-3 轮播状态（completed tab 专用）─────────────────────────────────────
 interface CarouselState { page: number; activeIdx: number }
 const carouselMap = reactive<Map<string, CarouselState>>(new Map())
@@ -164,22 +257,66 @@ function getGlobalIdx(task: QueueTask, localIdx: number): number {
 const modalOpen     = ref(false)
 const modalTask     = ref<QueueTask | null>(null)
 const modalAssetIdx = ref(0)
+const modalVideoList = computed(() =>
+  (modalTask.value?.assets ?? []).map((asset: any) => {
+    const assetMeta = (asset.meta as Record<string, any> | undefined) || {}
+    const meta = {
+      ...assetMeta,
+      social_title:    asset.social_title    || assetMeta.social_title    || '',
+      social_caption:  asset.social_caption  || assetMeta.social_caption  || '',
+      social_hashtags: asset.social_hashtags || assetMeta.social_hashtags || '',
+    }
+    return {
+      ...asset,
+      hash:            asset.file_hash || asset.hash,
+      url:             asset.url || asset.video_url || appStore.buildVideoUrl(asset.file_path || asset.path || ''),
+      cover_url:       asset.cover_url || (asset.cover_path ? appStore.buildVideoUrl(asset.cover_path) : ''),
+      social_title:    meta.social_title,
+      social_caption:  meta.social_caption,
+      social_hashtags: meta.social_hashtags,
+      meta,
+    }
+  })
+)
 
-function openModal(task: QueueTask, globalIdx: number) {
+async function openModal(task: QueueTask, globalIdx: number) {
+  const hydratedById = await fetchTodayTasks()
+  // 优先使用本次水合的新鲜数据，避免 Worker TICK 异步回写的时序竞态
+  const hydratedTask = hydratedById.get(task.id) || queueStore.tasks.find(t => t.id === task.id) || task
   const c = getCarousel(task.id)
   c.activeIdx     = globalIdx
-  modalTask.value     = task
+  modalTask.value     = hydratedTask
   modalAssetIdx.value = globalIdx
   modalOpen.value     = true
 }
 
 /** CoverPreviewCard @preview 事件的适配器（localIdx → globalIdx → openModal） */
 function handleCardPreview(task: QueueTask, localIdx: number) {
-  openModal(task, getGlobalIdx(task, localIdx))
+  void openModal(task, getGlobalIdx(task, localIdx))
 }
 
 function onModalClose() {
   modalOpen.value = false
+}
+
+async function handleQueuePreviewAction(payload: {
+  action: 'approve' | 'reject' | 'tune'
+  hash: string
+  index: number
+}) {
+  if (payload.action === 'tune' || !modalTask.value) return
+
+  const asset = modalTask.value.assets?.[payload.index] as QueueTaskAsset | undefined
+  if (!asset || asset.file_hash !== payload.hash) return
+
+  const status = payload.action === 'approve' ? 'APPROVED' : 'REJECTED'
+  try {
+    await updateVideoStatus(payload.hash, status)
+    asset.status = status
+  } catch (err) {
+    console.error('[QueueView] 预览状态更新失败:', err)
+    appStore.showToast('⚠️ 状态更新失败，请稍后重试')
+  }
 }
 
 // ── 向上透传"微调"事件 ────────────────────────────────────────────────────────
@@ -385,12 +522,12 @@ const triggerRealWsFlood = async () => {
         <p>暂无完成成果，等待流水线产出战果</p>
       </div>
 
-      <!-- item-size = card(220px) + margin-bottom(12px) = 232 -->
+      <!-- item-size = card(258px) + margin-bottom(12px) = 270 -->
       <RecycleScroller
         v-else
         class="task-scroller"
         :items="completedTasks"
-        :item-size="232"
+        :item-size="270"
         :prerender="8"
         key-field="id"
         v-slot="{ item }"
@@ -403,6 +540,7 @@ const triggerRealWsFlood = async () => {
             <div class="meta-left">
               <span class="meta-task-id">#{{ item.id.slice(-8) }}</span>
               <span v-if="item.assets?.length" class="meta-batch">包含 {{ item.assets.length }} 个视频</span>
+              <span :class="['mode-badge', getModeClass(item)]">{{ getModeLabel(item) }}</span>
               <span class="status-badge badge-completed">已完成</span>
             </div>
             <div class="meta-right">
@@ -461,29 +599,72 @@ const triggerRealWsFlood = async () => {
                 class="carousel-viewport"
                 :class="{ 'carousel-viewport--few': item.assets.length <= PAGE_SIZE }"
               >
+                <!-- 每个 asset 用 carousel-item-wrapper 包裹：
+                   上层 carousel-cell 仅负责 1:1 卡片；
+                   carousel-title-box 位于 cell 外部正下方，展开时不撑变卡片。 -->
                 <div
                   v-for="(asset, localIdx) in getVisibleAssets(item)"
                   :key="asset.file_hash || localIdx"
                   :class="[
-                    'carousel-cell',
-                    { 'carousel-cell--active': getGlobalIdx(item, localIdx) === getCarousel(item.id).activeIdx },
-                    { 'carousel-cell--fixed': item.assets.length <= PAGE_SIZE },
+                    'carousel-item-wrapper',
+                    { 'carousel-item-wrapper--fixed': item.assets.length <= PAGE_SIZE },
                   ]"
                 >
-                  <!-- CoverPreviewCard 替代裸 video，复用封面/状态角标/hover 交互 -->
-                  <CoverPreviewCard
-                    :variant="{
-                      id:             asset.file_hash,
-                      task_id:        item.id,
-                      video_url:      appStore.buildVideoUrl(asset.file_path),
-                      cover_url:      asset.cover_path ? appStore.buildVideoUrl(asset.cover_path) : '',
-                      status:         asset.status || 'PENDING',
-                      cover_strategy: 'EXTRACT',
-                    }"
-                    :hide-actions="true"
-                    aspect-ratio="1/1"
-                    @preview="handleCardPreview(item, localIdx)"
-                  />
+                  <!-- 1:1 卡片容器（纯方形，不含标题） -->
+                  <div
+                    :class="[
+                      'carousel-cell',
+                      { 'carousel-cell--active': getGlobalIdx(item, localIdx) === getCarousel(item.id).activeIdx },
+                    ]"
+                  >
+                    <div class="carousel-thumb-frame">
+                      <CoverPreviewCard
+                        :variant="{
+                          id:             asset.file_hash,
+                          task_id:        item.id,
+                          video_url:      appStore.buildVideoUrl(asset.file_path),
+                          cover_url:      asset.cover_path ? appStore.buildVideoUrl(asset.cover_path) : '',
+                          status:         asset.status || 'PENDING',
+                          cover_strategy: 'EXTRACT',
+                        }"
+                        :hide-actions="true"
+                        aspect-ratio="1/1"
+                        @preview="handleCardPreview(item, localIdx)"
+                      />
+                      <div
+                        class="queue-corner-ribbon"
+                        :class="`queue-ribbon-${normalizeAssetStatus(asset.status).toLowerCase()}`"
+                      >
+                        <span>{{ normalizeAssetStatus(asset.status) }}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 标题区：位于卡片外部正下方，展开时向下伸展，不影响上方卡片 -->
+                  <div
+                    class="carousel-title-box"
+                    :class="{ 'carousel-title-box--expanded': expandedAssetTitles.has(assetTitleKey(item, asset, localIdx)) }"
+                    :title="getAssetTitle(item, asset)"
+                    @click.stop
+                  >
+                    <p class="carousel-title-text">{{ getAssetTitle(item, asset) }}</p>
+                    <button
+                      v-if="getAssetTitle(item, asset).length > 18"
+                      class="carousel-title-toggle"
+                      @click="toggleAssetTitle(item, asset, localIdx, $event)"
+                      :aria-label="expandedAssetTitles.has(assetTitleKey(item, asset, localIdx)) ? '折叠标题' : '展开标题'"
+                    >
+                      <svg
+                        class="toggle-arrow"
+                        :class="{ 'toggle-arrow--up': expandedAssetTitles.has(assetTitleKey(item, asset, localIdx)) }"
+                        width="10" height="10" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2.6"
+                        stroke-linecap="round" stroke-linejoin="round"
+                      >
+                        <polyline points="6 9 12 15 18 9"/>
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -523,10 +704,12 @@ const triggerRealWsFlood = async () => {
     <!-- ══ MasterPreviewModal ════════════════════════════════════════════════ -->
     <MasterPreviewModal
       v-if="modalOpen && modalTask"
-      :task="modalTask"
+      :visible="modalOpen"
+      :video-list="modalVideoList"
       :initial-index="modalAssetIdx"
       @close="onModalClose"
       @open-detail="onOpenDetail"
+      @action="handleQueuePreviewAction"
     />
 
   </div>
@@ -825,7 +1008,7 @@ const triggerRealWsFlood = async () => {
    高度：220px + margin-bottom 12px = 232px（匹配 RecycleScroller item-size）
 ══════════════════════════════════════════════════════════════════════════ */
 .task-card {
-  height:         220px;
+  height:         258px;
   box-sizing:     border-box;
   margin-bottom:  12px;
   padding:        0.6rem 0.85rem 0.5rem;
@@ -872,6 +1055,36 @@ const triggerRealWsFlood = async () => {
   border-radius: 10px;
   padding:      1px 7px;
   white-space:  nowrap;
+}
+.mode-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.78));
+  color: #bae6fd;
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  box-shadow: inset 0 0 12px rgba(56, 189, 248, 0.08);
+}
+.mode-badge--director {
+  border-color: rgba(167, 139, 250, 0.5);
+  color: #c4b5fd;
+  box-shadow: inset 0 0 12px rgba(167, 139, 250, 0.14), 0 0 10px rgba(167, 139, 250, 0.08);
+}
+.mode-badge--blind {
+  border-color: rgba(245, 158, 11, 0.48);
+  color: #fcd34d;
+  box-shadow: inset 0 0 12px rgba(245, 158, 11, 0.13), 0 0 10px rgba(245, 158, 11, 0.08);
+}
+.mode-badge--manual {
+  border-color: rgba(56, 189, 248, 0.32);
+  color: #7dd3fc;
 }
 .meta-time {
   font-size:    0.65rem;
@@ -959,12 +1172,12 @@ const triggerRealWsFlood = async () => {
   position: relative;
 }
 .carousel-viewport {
-  flex:     1 1 0;
-  display:  flex;
-  gap:      0.4rem;
-  align-items: stretch;
-  height:   100%;
-  overflow: hidden;
+  flex:        1 1 0;
+  display:     flex;
+  gap:         0.4rem;
+  align-items: flex-start;
+  height:      100%;
+  overflow:    hidden;
 }
 .carousel-viewport--few {
   flex:            0 0 auto;
@@ -973,31 +1186,143 @@ const triggerRealWsFlood = async () => {
 .row-carousel--few {
   justify-content: flex-start;
 }
-.carousel-cell {
-  flex:          1 1 0;
-  position:      relative;
+/* 每个 asset 的外层列容器（卡片 + 标题纵向排列） */
+.carousel-item-wrapper {
+  flex:          0 1 128px;
+  min-width:     86px;
+  max-width:     128px;
+  display:       flex;
+  flex-direction: column;
+  align-items:   stretch;
   cursor:        pointer;
+}
+.carousel-item-wrapper--fixed {
+  flex:      0 0 auto;
+  width:     96px;
+  max-width: 96px;
+}
+
+/* 1:1 卡片容器（纯方形，overflow:hidden 保证 border-radius 裁剪生效） */
+.carousel-cell {
+  position:      relative;
   border-radius: 7px;
   border:        2px solid transparent;
   overflow:      hidden;
   transition:    border-color 0.2s, box-shadow 0.2s, transform 0.15s;
-  /* 1:1 相册方块比例 */
+  background:    rgba(2, 6, 23, 0.88);
+  flex-shrink:   0;
   aspect-ratio:  1 / 1;
-  background:    #000;
+  width:         100%;
 }
-.carousel-cell--fixed {
-  flex:       0 0 auto;
-  width:      78px;
-  aspect-ratio: 1 / 1;
-  max-width:  78px;
-}
-.carousel-cell:hover {
+.carousel-item-wrapper:hover .carousel-cell {
   transform:    scale(1.03);
   border-color: rgba(99, 102, 241, 0.5);
 }
 .carousel-cell--active {
   border-color: #a78bfa !important;
   box-shadow:   0 0 0 2px rgba(167, 139, 250, 0.35), 0 0 16px rgba(167, 139, 250, 0.4);
+}
+.carousel-thumb-frame {
+  position: relative;
+  width:    100%;
+  height:   100%;
+  overflow: hidden;
+  background: #000;
+}
+.carousel-thumb-frame :deep(.cover-card) {
+  width:         100%;
+  height:        100%;
+  border-radius: 0;
+  border:        none;
+}
+.carousel-thumb-frame :deep(.cover-img) {
+  object-fit: cover;
+}
+.carousel-thumb-frame :deep(.status-badge) {
+  display: none;
+}
+.queue-corner-ribbon {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 68px;
+  height: 68px;
+  overflow: hidden;
+  z-index: 4;
+  pointer-events: none;
+}
+.queue-corner-ribbon span {
+  position: absolute;
+  top: 15px;
+  right: -21px;
+  width: 94px;
+  transform: rotate(45deg);
+  text-align: center;
+  color: #fff;
+  font-size: 0.52rem;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  padding: 3px 0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.36);
+}
+.queue-ribbon-pending span { background: #f59e0b; }
+.queue-ribbon-approved span { background: #10b981; }
+.queue-ribbon-rejected span { background: #ef4444; }
+/* 标题区：独立于卡片之外，位于卡片正下方 */
+.carousel-title-box {
+  position:   relative;
+  max-height: 30px;
+  overflow:   hidden;
+  display:    flex;
+  align-items: flex-start;
+  gap:        4px;
+  padding:    4px 4px 4px 6px;
+  box-sizing: border-box;
+  background: rgba(9, 14, 30, 0.82);
+  border-radius: 0 0 5px 5px;
+  border-top: 1px solid rgba(99, 102, 241, 0.14);
+  transition: max-height 0.25s ease;
+  /* 展开时不影响上方卡片的尺寸 */
+}
+.carousel-title-box--expanded {
+  max-height: 80px;
+}
+.carousel-title-text {
+  flex:      1 1 0;
+  min-width: 0;
+  margin:    0;
+  color:     #cbd5e1;
+  font-size: 0.61rem;
+  font-weight: 700;
+  line-height: 1.3;
+  display:            -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow:           hidden;
+  transition:         -webkit-line-clamp 0.2s;
+}
+.carousel-title-box--expanded .carousel-title-text {
+  -webkit-line-clamp: 5;
+  overflow:           visible;
+  display:            block;
+}
+.carousel-title-toggle {
+  flex:    0 0 14px;
+  width:   14px;
+  height:  14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding:    0;
+  margin-top: 1px;
+  border:        1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 3px;
+  background:    rgba(15, 23, 42, 0.8);
+  color:         #818cf8;
+  cursor:        pointer;
+  flex-shrink:   0;
 }
 .carousel-arrow {
   flex-shrink: 0;

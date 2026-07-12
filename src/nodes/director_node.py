@@ -32,7 +32,7 @@ BLUEPRINT_JSON_SCHEMA: dict[str, Any] = {
         "meta": {
             "type": "object",
             "description": "全局社交媒体投放文案（Phase 9.12 归因管线）",
-            "required": ["social_title", "social_caption", "social_hashtags", "emotional_tag"],
+            "required": ["social_title", "social_caption", "social_hashtags", "human_drive", "emotional_tag"],
             "properties": {
                 "social_title": {
                     "type": "string",
@@ -45,6 +45,10 @@ BLUEPRINT_JSON_SCHEMA: dict[str, Any] = {
                 "social_hashtags": {
                     "type": "string",
                     "description": "3–5 个高流量话题标签，空格分隔",
+                },
+                "human_drive": {
+                    "type": "string",
+                    "description": "核心利用的人性本能/七宗罪，单选",
                 },
                 "emotional_tag": {
                     "type": "string",
@@ -63,6 +67,9 @@ BLUEPRINT_JSON_SCHEMA: dict[str, Any] = {
                     "asset_hashes",
                     "semantic_tags",
                     "script_text",
+                    "visual_script",
+                    "emotion",
+                    "tts_params",
                     "duration",
                 ],
                 "properties": {
@@ -72,6 +79,17 @@ BLUEPRINT_JSON_SCHEMA: dict[str, Any] = {
                     "asset_hashes":  {"type": "array",  "items": {"type": "string"}},
                     "semantic_tags": {"type": "array",  "items": {"type": "string"}},
                     "script_text":   {"type": "string", "description": "该分镜的高光口播台词"},
+                    "visual_script": {"type": "string", "description": "该分镜的画面动作描写、视觉特效与人物状态"},
+                    "emotion": {
+                        "type": "string",
+                        "enum": ["焦虑", "愤怒", "扎心", "悬疑", "震惊", "渴望", "极度渴望", "专业", "舒缓", "解压"],
+                        "description": "该分镜唯一核心情绪标签，必须从神经营销学情绪分类库中选择。",
+                    },
+                    "tts_params": {
+                        "type": "string",
+                        "enum": ["fast, high-pitch", "medium, heavy-stress", "slow, calm, low-pitch"],
+                        "description": "匹配 emotion 所属象限的 TTS 语速/语调特征。",
+                    },
                     "duration":      {"type": "number", "description": "该分镜预估时长（秒）"},
                 },
             },
@@ -184,6 +202,8 @@ class DirectorNode(BaseNode):
                     self.name, i, beat.get("beat"),
                 )
                 beat["script_text"] = ""
+            beat["visual_script"] = beat.get("visual_script") or ""
+            beat["emotion"] = beat.get("emotion") or ""
             valid_beats.append(beat)
 
         if not valid_beats:

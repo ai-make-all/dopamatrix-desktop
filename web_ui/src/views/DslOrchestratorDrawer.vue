@@ -2,6 +2,8 @@
 import { ref, computed, watch, reactive, nextTick } from 'vue'
 import draggable from 'vuedraggable'
 import axios from 'axios'
+import { useAppStore } from '../stores/appStore'
+import { useQueueStore } from '../stores/useQueueStore'
 import { getTagPillParts, parseFacetedTags } from '../utils/tagParser.js'
 import { ASSET_FILTER_OPTIONS, FACET_NAMESPACES } from '../utils/assetConfig.js'
 
@@ -12,17 +14,22 @@ const props = defineProps({
   dslTracks:              { type: Array,    default: () => [] },
   templates:              { type: Object,   required: true },
   currentTemplate:        { type: String,   default: 'content' },
+  draftMeta:              { type: Object,   default: null },
   buildVideoUrl:          { type: Function, required: true },
   apiBase:                { type: String,   required: true },
   showToast:              { type: Function, default: () => {} },
   defaultBatchSize:       { type: Number,   default: 1 },
   defaultAspectRatio:     { type: String,   default: '9:16' },
   defaultLanguage:        { type: String,   default: 'en' },
+  defaultTargetDuration:  { type: Number,   default: 15 },
   defaultEnableTts:       { type: Boolean,  default: true },
   defaultEnableSubtitles: { type: Boolean,  default: true },
+  tenantId:               { type: String,   default: 'default' },
 })
 
 const emit = defineEmits(['update:modelValue', 'confirm'])
+const store = useAppStore()
+const queueStore = useQueueStore()
 
 // ── Asset registry & facet namespace config (均从 assetConfig.js SSOT 读取) ──
 
@@ -34,6 +41,12 @@ const LAYOUT_OPTIONS = [
   { value: 'top_left',      label: '↖️ 左上角' },
   { value: 'top_right',     label: '↗️ 右上角' },
   { value: 'bottom_left',   label: '↙️ 左下角' },
+]
+
+const TEXT_POSITION_OPTIONS = [
+  { value: 'top_center',    label: 'Top' },
+  { value: 'center',        label: 'Center' },
+  { value: 'bottom_center', label: 'Bottom' },
 ]
 
 // 需要画面显示的 Y 轴素材类型集合（音频类型不需排版控制）
@@ -48,11 +61,14 @@ function isVisualYAxis(pill) {
 // ── Local editor state ───────────────────────────────────────────────────────
 const localTracks   = ref([])
 const localTemplate = ref('content')
+const localMeta     = ref(null)
 const initialTracksCache = ref([])
+const isRenderSubmitting = ref(false)
 const leftTab       = ref('assets')
 const assetSearch     = ref('')
 const activeTag       = ref(null)
 const assetTypeFilter = ref('video')
+const templateInput   = ref(null)
 
 // ── 战术舱局部渲染参数（继承全局默认，抽屉内独立覆盖）────────────────────
 const localParams = reactive({
@@ -97,26 +113,36 @@ const activeConfigBeatIndex = ref(null)
 const beatConfigTab         = ref('script')
 const beatConfigPos         = reactive({ top: 0, left: 0 })
 const configForm            = ref({
-  script_text: '',
-  transition:  '',
-  vfx:         '',
+  script_text:    '',
+  visual_script:  '',
+  emotion:        '',
+  text_position:  'center',
+  transition:     '',
+  vfx:            '',
 })
 
 function openConfigPanel(index, track, evt) {
   const rect = evt.currentTarget.getBoundingClientRect()
-  beatConfigPos.top  = Math.min(rect.bottom + 6, window.innerHeight - 280)
+  beatConfigPos.top  = Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 450))
   beatConfigPos.left = Math.min(rect.left, window.innerWidth - 320 - 8)
   activeConfigBeatIndex.value = index
   beatConfigTab.value         = 'script'
   configForm.value = {
-    script_text: track.script_text || '',
-    transition:  track.transition  || '',
-    vfx:         track.vfx         || '',
+    script_text:   track.script_text   || '',
+    visual_script: track.visual_script || '',
+    emotion:       track.emotion       || '',
+    text_position: track.text_position || track.position || 'center',
+    transition:    track.transition    || '',
+    vfx:           track.vfx           || '',
   }
 }
 
 function saveConfigChanges(track) {
-  track.script_text = configForm.value.script_text
+  track.script_text   = configForm.value.script_text
+  track.visual_script = configForm.value.visual_script
+  track.emotion       = configForm.value.emotion
+  track.text_position = configForm.value.text_position || 'center'
+  track.position      = track.text_position
   // track.transition = configForm.value.transition  (未来扩展)
   // track.vfx        = configForm.value.vfx         (未来扩展)
   activeConfigBeatIndex.value = null
@@ -153,12 +179,29 @@ function getSlotTheme(slotKey) {
   return 'rose'
 }
 
+function normalizeDslTracks(tracks, options = {}) {
+  const { resetItems = false } = options
+  return (tracks || []).map(track => {
+    const cloned = JSON.parse(JSON.stringify(track))
+    return {
+      ...cloned,
+      emotion:       cloned.emotion       || '',
+      text_position: cloned.text_position || cloned.position || 'center',
+      position:      cloned.text_position || cloned.position || 'center',
+      visual_script: cloned.visual_script || '',
+      script_text:   cloned.script_text   || '',
+      items:         resetItems ? [] : (cloned.items || []),
+    }
+  })
+}
+
 // ── Sync on open ─────────────────────────────────────────────────────────────
 watch(() => props.modelValue, (opened) => {
   if (!opened) return
-  localTracks.value   = JSON.parse(JSON.stringify(props.dslTracks))
-  initialTracksCache.value = JSON.parse(JSON.stringify(props.dslTracks))
+  localTracks.value   = normalizeDslTracks(props.dslTracks)
+  initialTracksCache.value = normalizeDslTracks(props.dslTracks)
   localTemplate.value = props.currentTemplate
+  localMeta.value     = props.draftMeta ? JSON.parse(JSON.stringify(props.draftMeta)) : null
   leftTab.value       = 'assets'
   assetSearch.value     = ''
   activeTag.value       = null
@@ -174,15 +217,104 @@ watch(() => props.modelValue, (opened) => {
   localParams.enableSubtitles = props.defaultEnableSubtitles
 })
 
+watch(() => props.dslTracks, (newVal) => {
+  if (!newVal || newVal.length === 0) return
+  localTracks.value = normalizeDslTracks(newVal)
+  initialTracksCache.value = normalizeDslTracks(newVal)
+}, { immediate: true, deep: true })
+
 // Re-init tracks when template switches inside the drawer
 watch(localTemplate, (newTpl, oldTpl) => {
   if (newTpl === oldTpl) return
   const tpl = props.templates[newTpl]
   if (!tpl) return
-  localTracks.value = tpl.map(t => ({ ...t, items: [] }))
+  localTracks.value = normalizeDslTracks(tpl, { resetItems: true })
 })
 
 // ── Computed ──────────────────────────────────────────────────────────────────
+const HIGH_AROUSAL_EMOTIONS = new Set(['焦虑', '愤怒', '扎心', '悬疑', '震惊', '渴望', '极度渴望'])
+
+function getEmotionEmoji(emotion) {
+  if (!emotion) return '🎭'
+  const map = {
+    '焦虑': '😨',
+    '愤怒': '🤬',
+    '扎心': '💔',
+    '悬疑': '🤔',
+    '震惊': '😱',
+    '极度渴望': '🤤',
+    '渴望': '🤤',
+    '解压': '🧘',
+    '专业': '💡',
+    '舒缓': '🍃',
+  }
+  return map[emotion] || '🎭'
+}
+
+function getEmotionClass(emotion) {
+  if (!emotion) return ''
+  return HIGH_AROUSAL_EMOTIONS.has(emotion) ? 'beat-emo--high' : 'beat-emo--low'
+}
+
+const assetDensityState = computed(() => {
+  const activeTracks = localTracks.value.filter(t => t.items.length > 0)
+  if (activeTracks.length === 0) return { label: '空置', percent: 0, class: 'cold' }
+
+  let totalVisualLayers = 0
+  activeTracks.forEach(t => {
+    totalVisualLayers += t.items.filter(i => isVisualYAxis(i)).length
+  })
+
+  const density = totalVisualLayers / Math.max(activeTracks.length, 1)
+  if (density < 1.0) return { label: '🧊 极简', percent: 30, class: 'cold' }
+  if (density < 2.5) return { label: '🌊 均衡', percent: 60, class: 'warm' }
+  return { label: '🔥 高密度', percent: 100, class: 'hot' }
+})
+
+const emotionalArcState = computed(() => {
+  const activeTracks = localTracks.value.filter(t => t.items.length > 0)
+  if (activeTracks.length === 0) return { high: 0, low: 0 }
+
+  let highCount = 0
+  activeTracks.forEach(t => {
+    if (HIGH_AROUSAL_EMOTIONS.has(t.emotion)) highCount++
+  })
+
+  const highRatio = Math.round((highCount / activeTracks.length) * 100)
+  return { high: highRatio, low: 100 - highRatio }
+})
+
+const viralityScore = computed(() => {
+  const activeTracks = localTracks.value.filter(t => t.items.length > 0)
+  if (activeTracks.length === 0) return 0
+
+  let score = 0
+
+  const firstBeat = activeTracks[0]
+  if (firstBeat && HIGH_AROUSAL_EMOTIONS.has(firstBeat.emotion)) score += 40
+  else score += 10
+
+  if (activeTracks.length >= 3) score += 30
+  else score += 15
+
+  let hasTwist = false
+  for (let i = 1; i < activeTracks.length; i++) {
+    const prevHigh = HIGH_AROUSAL_EMOTIONS.has(activeTracks[i - 1].emotion)
+    const currHigh = HIGH_AROUSAL_EMOTIONS.has(activeTracks[i].emotion)
+    if (prevHigh !== currHigh) {
+      hasTwist = true
+      break
+    }
+  }
+  if (hasTwist) score += 20
+
+  if (assetDensityState.value.class === 'warm' || assetDensityState.value.class === 'hot') {
+    score += 10
+  }
+
+  return Math.min(score, 100)
+})
+
 const uniqueTags = computed(() => {
   const seen = new Set()
   for (const asset of props.dbAssetList)
@@ -233,6 +365,132 @@ const isAiDraftMode = computed(() =>
   initialTracksCache.value.some(t => t.items.length > 0)
 )
 
+function buildMasterTrackPlan() {
+  const masterItem = masterDropList.value[0] ?? null
+  return masterItem ? {
+    scene_master_id:   masterItem.id,
+    scene_master_hash: masterItem.hash,
+    dsl_layer:         'SceneMaster',
+    slot_bindings:     Object.entries(slotItemsMap)
+      .filter(([, arr]) => arr.length > 0)
+      .map(([slot_key, arr]) => ({
+        slot_key,
+        asset_hash: arr[0].hash,
+        asset_type: arr[0].asset_type,
+        asset_name: arr[0].name,
+      })),
+  } : null
+}
+
+function buildLayoutHints(track, physicals) {
+  const layoutHints = {}
+  physicals.forEach(pill => {
+    if (pill.hash && pill.layout) layoutHints[pill.hash] = pill.layout
+  })
+
+  const textPosition = track.text_position || track.position || ''
+  if (textPosition) {
+    physicals
+      .filter(pill => pill.hash && pill.asset_type === 'text_template' && !layoutHints[pill.hash])
+      .forEach(pill => { layoutHints[pill.hash] = textPosition })
+  }
+
+  return layoutHints
+}
+
+function buildTimelineFromLocalTracks() {
+  return localTracks.value
+    .map(track => {
+      const physicals = track.items.filter(i => i.type === 'physical_asset' || !i.type)
+      const tags      = track.items.filter(i => i.type === 'semantic_tag')
+      const layoutHints = buildLayoutHints(track, physicals)
+      const beatNode = {
+        beat:          track.id,
+        role:          track.role,
+        script_text:   track.script_text   || '',
+        visual_script: track.visual_script || '',
+        emotion:       track.emotion       || '',
+        text_position: track.text_position || track.position || 'center',
+        address_mode:  physicals.length > 0 ? 'locked' : 'smart',
+        asset_hashes:  physicals.map(i => i.hash),
+        semantic_tags: tags.map(i => i.tag),
+      }
+      if (Object.keys(layoutHints).length > 0) beatNode.layout_hints = layoutHints
+      return beatNode
+    })
+    .filter(b => b.asset_hashes.length > 0 || b.semantic_tags.length > 0)
+}
+
+async function submitRenderTask() {
+  if (isRenderSubmitting.value) return
+
+  if (isAiDraftMode.value) {
+    emit('confirm', {
+      tracks:       JSON.parse(JSON.stringify(localTracks.value)),
+      template:     localTemplate.value,
+      master_track: buildMasterTrackPlan(),
+      directRender: true,
+      params: { ...localParams },
+      meta: localMeta.value,
+    })
+    emit('update:modelValue', false)
+    return
+  }
+
+  const timeline = buildTimelineFromLocalTracks()
+  if (!timeline.length) {
+    props.showToast('Manual board is empty. Add at least one asset or tag before rendering.')
+    return
+  }
+
+  isRenderSubmitting.value = true
+  try {
+    const payload = {
+      engine_type:      localTemplate.value,
+      timeline,
+      meta:             localMeta.value,
+      aspect_ratio:     localParams.aspectRatio,
+      target_duration:  props.defaultTargetDuration,
+      batch_size:       localParams.batchSize,
+      test_language:    localParams.language,
+      tenant_id:        props.tenantId || store.loggedInUser || 'default',
+      enable_tts:       localParams.enableTts,
+      enable_subtitles: localParams.enableSubtitles,
+    }
+
+    const resp = await axios.post(`${props.apiBase}/api/v1/tasks/submit-manual`, payload)
+    const taskId = resp.data?.task_id
+    if (!taskId) throw new Error('Backend did not return task_id')
+
+    emit('confirm', {
+      tracks:       JSON.parse(JSON.stringify(localTracks.value)),
+      template:     localTemplate.value,
+      master_track: buildMasterTrackPlan(),
+      directRender: false,
+      params: { ...localParams },
+      meta: localMeta.value,
+    })
+
+    queueStore.pushTaskUpdate({
+      taskId,
+      status:    'pending',
+      prompt:    `Manual DSL | ${localTemplate.value} | ${timeline.length} beats | ${localParams.aspectRatio}`,
+      startTime: Date.now(),
+    })
+    await nextTick()
+    props.showToast('Manual render task submitted.')
+    emit('update:modelValue', false)
+  } catch (err) {
+    const raw    = err.response?.data?.detail
+    const detail = Array.isArray(raw)
+      ? raw.map(e => e.msg ?? JSON.stringify(e)).join('; ')
+      : (typeof raw === 'string' ? raw : (err.message ?? 'Unknown error'))
+    props.showToast(`[${err.response?.status ?? 'ERR'}] Manual submit failed: ${detail}`)
+  } finally {
+    isRenderSubmitting.value = false
+  }
+}
+
 // ── Clone factories ───────────────────────────────────────────────────────────
 function cloneAsset(asset) {
   return {
@@ -272,6 +530,60 @@ function handleResetWithConfirm() {
 }
 
 // ── 底模母槽事件处理 ──────────────────────────────────────────────────────────
+function exportTemplate() {
+  const data = JSON.stringify(localTracks.value, null, 2)
+  const blob = new Blob([data], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `dopa_recipe_${Date.now()}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function importTemplateTrigger() {
+  templateInput.value?.click()
+}
+
+function handleTemplateUpload(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const importedTracks = JSON.parse(e.target.result)
+      if (!Array.isArray(importedTracks)) throw new Error('Template must be an array')
+
+      const hasExistingScript = localTracks.value.some(t => t.script_text && t.script_text.length > 0)
+
+      if (hasExistingScript) {
+        const choice = window.confirm('检测到当前战术板已有 AI 起草台词！\n\n【点击 确认】：仅应用模板的骨架/节奏/素材，保留现有台词 (推荐)。\n【点击 取消】：全量覆盖，放弃现有台词！')
+        if (choice) {
+          localTracks.value = importedTracks.map((t, index) => {
+            const currentTrack = localTracks.value[index] || {}
+            return {
+              ...t,
+              script_text: currentTrack.script_text || '',
+              emotion: currentTrack.emotion || t.emotion,
+            }
+          })
+          props.showToast('🛡️ 骨架已应用，AI 台词已保留！')
+          return
+        }
+      }
+
+      localTracks.value = importedTracks
+      props.showToast('⚔️ 模板全量覆盖成功！')
+    } catch (err) {
+      props.showToast('❌ 模板解析失败，非法的 JSON 格式')
+    } finally {
+      event.target.value = ''
+    }
+  }
+  reader.readAsText(file)
+}
+
 function onMasterTrackChange(evt) {
   if (!evt.added) return
   const item = evt.added.element
@@ -439,7 +751,9 @@ async function runPreview() {
         const beatNode = {
           beat:          track.id,
           role:          track.role,
-          script_text:   track.script_text || '',
+          script_text:   track.script_text   || '',
+          visual_script: track.visual_script || '',
+          emotion:       track.emotion       || '',
           address_mode:  physicals.length > 0 ? 'locked' : 'smart',
           asset_hashes:  physicals.map(i => i.hash),
           semantic_tags: semantics.map(i => i.tag),
@@ -465,37 +779,24 @@ async function runPreview() {
 }
 
 // ── Confirm / Cancel ──────────────────────────────────────────────────────────
-function handleConfirm(directRender = false) {
-  const masterItem = masterDropList.value[0] ?? null
-  // 精准指纹回传：底模 ID + 各插槽绑定的 File Hash
-  const masterTrackPlan = masterItem ? {
-    scene_master_id:   masterItem.id,
-    scene_master_hash: masterItem.hash,
-    dsl_layer:         'SceneMaster',
-    slot_bindings:     Object.entries(slotItemsMap)
-      .filter(([, arr]) => arr.length > 0)
-      .map(([slot_key, arr]) => ({
-        slot_key,
-        asset_hash: arr[0].hash,
-        asset_type: arr[0].asset_type,
-        asset_name: arr[0].name,
-      })),
-  } : null
+function handleConfirm() {
+  return submitRenderTask()
+}
 
-  emit('confirm', {
-    tracks:       JSON.parse(JSON.stringify(localTracks.value)),
-    template:     localTemplate.value,
-    master_track: masterTrackPlan,
-    directRender,
-    params: { ...localParams },
-  })
+/** 取消确认弹窗可见状态 — 先弹窗，抽屉保持原位，用户确认后才执行关闭 */
+const cancelConfirmVisible = ref(false)
+
+function handleCancel() {
+  cancelConfirmVisible.value = true
+}
+
+function onCancelConfirm() {
+  cancelConfirmVisible.value = false
   emit('update:modelValue', false)
 }
 
-function handleCancel() {
-  if (window.confirm('确认要放弃编排战术板的装填结果吗？')) {
-    emit('update:modelValue', false)
-  }
+function onCancelDismiss() {
+  cancelConfirmVisible.value = false
 }
 </script>
 
@@ -523,7 +824,38 @@ function handleCancel() {
             <span v-if="totalStaged > 0" class="orch-staged-pill">{{ totalStaged }} 已装填</span>
           </div>
 
-          <div class="orch-header-right">
+          <div class="orch-header-right" style="flex: 1; justify-content: flex-end;">
+            <div class="dashboard-module">
+              <span class="db-label">素材配方</span>
+              <span class="db-value" :class="`db-val--${assetDensityState.class}`">{{ assetDensityState.label }}</span>
+            </div>
+
+            <div class="dashboard-module">
+              <span class="db-label">情绪配方</span>
+              <div class="db-emotion-bar">
+                <div class="db-emo-high" :style="{ width: emotionalArcState.high + '%' }" title="高唤醒度 (刺激)"></div>
+                <div class="db-emo-low" :style="{ width: emotionalArcState.low + '%' }" title="低唤醒度 (平缓)"></div>
+              </div>
+              <span class="db-value-sm">{{ emotionalArcState.high }}% 刺激</span>
+            </div>
+
+            <div class="dashboard-module virality-module">
+              <span class="db-label">爆款预测分</span>
+              <div class="virality-bar-bg">
+                <div
+                  class="virality-bar-fill"
+                  :style="{
+                    width: viralityScore + '%',
+                    background: viralityScore > 80 ? 'linear-gradient(90deg, #f97316, #ef4444)' :
+                                viralityScore > 50 ? 'linear-gradient(90deg, #eab308, #f97316)' :
+                                'linear-gradient(90deg, #10b981, #84cc16)'
+                  }"
+                ></div>
+              </div>
+              <span class="db-score" :class="{ 'score-explode': viralityScore > 80 }">
+                {{ viralityScore }} <span v-if="viralityScore > 80">🔥</span>
+              </span>
+            </div>
             <!-- 蓝图预览
             <button
               class="orch-btn orch-btn--preview"
@@ -534,7 +866,6 @@ function handleCancel() {
             >{{ isPreviewLoading ? '⏳ 解析中…' : '🔬 蓝图预览' }}</button>
             -->
 
-            <button class="orch-btn orch-btn--ghost" @click="handleConfirm(false)">✓ 仅装填</button>
           </div>
         </div>
 
@@ -588,7 +919,12 @@ function handleCancel() {
           </div>
           <div style="margin-left: auto;"></div>
           <button class="orch-btn orch-btn--cancel" @click="handleCancel">取消</button>
-          <button class="orch-btn orch-btn--confirm" @click="handleConfirm(true)">
+          <button
+            class="orch-btn orch-btn--confirm"
+            :class="{ 'orch-btn--loading': isRenderSubmitting }"
+            :disabled="isRenderSubmitting"
+            @click="submitRenderTask"
+          >
             🚀 确认并直接渲染
           </button>
         </div>
@@ -784,6 +1120,9 @@ function handleCancel() {
             </div>
 
             <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <button class="orch-btn orch-btn--ghost" style="color: #38bdf8; border-color: rgba(56,189,248,0.3);" @click="exportTemplate">💾 保存模板</button>
+              <button class="orch-btn orch-btn--ghost" style="color: #a78bfa; border-color: rgba(167,139,250,0.3);" @click="importTemplateTrigger">📂 读取模板</button>
+              <input type="file" ref="templateInput" accept=".json" style="display:none" @change="handleTemplateUpload" />
               <button
                 class="orch-btn orch-btn--ghost"
                 @click="handleClearWithConfirm"
@@ -924,17 +1263,28 @@ function handleCancel() {
                     :class="`orch-track--${track.role}`"
                   >
                     <div class="orch-track-label">
-                      <span class="orch-track-name">{{ track.name }}</span>
-                      <span
-                        v-if="track.items.length > 0"
-                        class="orch-track-count"
-                      >{{ track.items.length }}</span>
-                      <button
-                        class="beat-cfg-icon-btn"
-                        :class="{ 'beat-cfg-icon-btn--set': track.script_text }"
-                        @click.stop="openConfigPanel(index, track, $event)"
-                        :title="`配置 ${track.name} 属性`"
-                      >⚙️</button>
+                      <div class="orch-track-title-row">
+                        <span class="orch-track-name">{{ track.name }}</span>
+                        <div class="orch-track-count-wrap">
+                          <span v-if="track.items.length > 0" class="orch-track-count-inline">{{ track.items.length }}</span>
+                        </div>
+                        <button
+                          class="beat-cfg-icon-btn"
+                          :class="{ 'beat-cfg-icon-btn--set': track.script_text || track.visual_script }"
+                          @click.stop="openConfigPanel(index, track, $event)"
+                          :title="`配置 ${track.name} 属性`"
+                        >⚙️</button>
+                      </div>
+
+                      <div v-if="track.emotion" class="orch-track-subtitle-row">
+                        <span
+                          class="beat-emotion-badge"
+                          :class="getEmotionClass(track.emotion)"
+                          :title="track.emotion"
+                        >
+                          {{ getEmotionEmoji(track.emotion) }} {{ track.emotion }}
+                        </span>
+                      </div>
                     </div>
 
                     <draggable
@@ -1167,7 +1517,7 @@ function handleCancel() {
           <button
             :class="['beat-cfg-tab', beatConfigTab === 'script' ? 'beat-cfg-tab--active' : '']"
             @click="beatConfigTab = 'script'"
-          >📝 台词</button>
+          >🎬 导演分镜</button>
           <button class="beat-cfg-tab beat-cfg-tab--disabled" disabled title="开发中">
             🎬 转场
           </button>
@@ -1178,13 +1528,62 @@ function handleCancel() {
 
         <!-- Tab 内容区 -->
         <div class="beat-cfg-body">
-          <div v-if="beatConfigTab === 'script'">
-            <textarea
-              v-model="configForm.script_text"
-              placeholder="输入该分镜的高光口播台词..."
-              class="cpm-textarea-sm"
-              rows="3"
-            />
+          <div v-if="beatConfigTab === 'script'" class="cfg-scroll-body">
+            <div class="cfg-group">
+              <label class="cfg-label">🎭 核心情绪点 (影响归因)</label>
+              <select v-model="configForm.emotion" class="cpm-select-sm" style="width: 100%;">
+                <option value="">(继承大盘设定)</option>
+                <optgroup label="皮质醇 (高唤醒)">
+                  <option value="焦虑">😨 焦虑</option>
+                  <option value="愤怒">🤬 愤怒</option>
+                  <option value="扎心">💔 扎心</option>
+                </optgroup>
+                <optgroup label="多巴胺 (高唤醒)">
+                  <option value="悬疑">🤔 悬疑</option>
+                  <option value="震惊">😱 震惊</option>
+                  <option value="渴望">🤤 渴望</option>
+                  <option value="极度渴望">🤤 极度渴望</option>
+                </optgroup>
+                <optgroup label="内啡肽 (平缓)">
+                  <option value="解压">🧘 解压</option>
+                  <option value="专业">💡 专业</option>
+                  <option value="舒缓">🍃 舒缓</option>
+                </optgroup>
+              </select>
+            </div>
+
+            <div class="cfg-group">
+              <label class="cfg-label">⌖ 文字位置 (Text Position)</label>
+              <select v-model="configForm.text_position" class="cpm-select-sm" style="width: 100%;">
+                <option
+                  v-for="opt in TEXT_POSITION_OPTIONS"
+                  :key="opt.value"
+                  :value="opt.value"
+                >
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
+
+            <div class="cfg-group">
+              <label class="cfg-label">👁️ 分镜脚本 (画面视效与动作)</label>
+              <textarea
+                v-model="configForm.visual_script"
+                placeholder="描述该分镜画面，如：玩家手滑，爆出红叉..."
+                class="cpm-textarea-sm"
+                rows="2"
+              />
+            </div>
+
+            <div class="cfg-group">
+              <label class="cfg-label">🎙️ 口播台词 (驱动 TTS)</label>
+              <textarea
+                v-model="configForm.script_text"
+                placeholder="输入该分镜的高光台词..."
+                class="cpm-textarea-sm"
+                rows="3"
+              />
+            </div>
           </div>
           <div v-else-if="beatConfigTab === 'transition'" class="beat-cfg-placeholder">
             转场联动管线开发中...
@@ -1204,6 +1603,34 @@ function handleCancel() {
         </div>
       </div>
     </div>
+  </Teleport>
+
+  <!-- ── 取消编排确认弹窗 ────────────────────────────────────────────────────── -->
+  <Teleport to="body">
+    <Transition name="cancel-confirm-fade">
+      <div
+        v-if="cancelConfirmVisible"
+        class="cancel-confirm-mask"
+        @click.self="onCancelDismiss"
+        role="dialog"
+        aria-modal="true"
+        aria-label="取消编排确认"
+      >
+        <div class="cancel-confirm-box">
+          <div class="cancel-confirm-icon">⚠️</div>
+          <p class="cancel-confirm-title">放弃当前编排？</p>
+          <p class="cancel-confirm-desc">战术板中所有已装填的素材与配置将被清除，此操作不可撤销。</p>
+          <div class="cancel-confirm-actions">
+            <button class="cancel-confirm-btn cancel-confirm-btn--dismiss" @click="onCancelDismiss">
+              继续编排
+            </button>
+            <button class="cancel-confirm-btn cancel-confirm-btn--confirm" @click="onCancelConfirm">
+              确认放弃
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </Teleport>
 
 </template>
@@ -1299,6 +1726,93 @@ function handleCancel() {
   align-items: center;
   gap:         0.5rem;
   flex-wrap:   wrap;
+}
+
+.dashboard-module {
+  display:       flex;
+  align-items:   center;
+  gap:           0.5rem;
+  background:    rgba(15, 23, 42, 0.6);
+  padding:       0.3rem 0.6rem;
+  border-radius: 8px;
+  border:        1px solid rgba(99, 102, 241, 0.2);
+  margin-left:   0.5rem;
+}
+
+.db-label {
+  font-size:   0.65rem;
+  color:       #94a3b8;
+  font-weight: 600;
+}
+
+.db-value {
+  font-size:   0.7rem;
+  font-weight: 700;
+}
+
+.db-val--cold { color: #38bdf8; }
+.db-val--warm { color: #fbbf24; }
+.db-val--hot  { color: #f43f5e; }
+
+.db-emotion-bar {
+  width:         60px;
+  height:        6px;
+  display:       flex;
+  border-radius: 3px;
+  overflow:      hidden;
+}
+
+.db-emo-high {
+  background: #ef4444;
+  transition: width 0.3s ease;
+}
+
+.db-emo-low {
+  background: #3b82f6;
+  transition: width 0.3s ease;
+}
+
+.db-value-sm {
+  font-size: 0.6rem;
+  color:     #cbd5e1;
+}
+
+.virality-module {
+  border-color: rgba(244, 63, 94, 0.4);
+  background:   rgba(244, 63, 94, 0.05);
+}
+
+.virality-bar-bg {
+  width:         80px;
+  height:        8px;
+  background:    rgba(0, 0, 0, 0.4);
+  border-radius: 4px;
+  overflow:      hidden;
+}
+
+.virality-bar-fill {
+  height:     100%;
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.db-score {
+  font-size:   0.85rem;
+  font-weight: 900;
+  color:       #f8fafc;
+  font-family: 'JetBrains Mono', monospace;
+  width:       35px;
+  text-align:  right;
+}
+
+.score-explode {
+  color:       #ef4444;
+  text-shadow: 0 0 10px rgba(239, 68, 68, 0.6);
+  animation:   pulse 1s infinite alternate;
+}
+
+@keyframes pulse {
+  0%   { transform: scale(1); }
+  100% { transform: scale(1.1); }
 }
 
 /* ── Header Buttons ──────────────────────────────────────────────────────────── */
@@ -1749,6 +2263,7 @@ function handleCancel() {
 
 /* ── Individual Track ────────────────────────────────────────────────────────── */
 .orch-track {
+  position:       relative;
   flex:           1;
   min-width:      180px;
   max-width:      280px;
@@ -1766,11 +2281,31 @@ function handleCancel() {
 .orch-track--cta  { border-top: 3px solid #f43f5e; }
 
 .orch-track-label {
-  display:      flex;
-  align-items:  center;
-  justify-content: space-between;
-  padding:      0.55rem 0.75rem 0.4rem;
-  flex-shrink:  0;
+  display:         flex;
+  flex-direction:  column;
+  align-items:     flex-start;
+  gap:             0.5rem;
+  padding:         0.55rem 0.65rem;
+  flex-shrink:     0;
+  width:           100%;
+  box-sizing:      border-box;
+}
+
+.orch-track-title-row {
+  display:               grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items:           center;
+  width:                 100%;
+}
+
+.orch-track-name       { justify-self: start; }
+.orch-track-count-wrap { justify-self: center; display: flex; }
+.beat-cfg-icon-btn     { justify-self: end; }
+
+.orch-track-subtitle-row {
+  display:         flex;
+  align-items:     center;
+  width:           100%;
 }
 
 .orch-track-name {
@@ -1782,14 +2317,16 @@ function handleCancel() {
 .orch-track--body .orch-track-name { color: #a5b4fc; }
 .orch-track--cta  .orch-track-name { color: #fb7185; }
 
-.orch-track-count {
-  font-size:     0.65rem;
-  font-weight:   600;
-  padding:       0.08rem 0.38rem;
-  border-radius: 10px;
-  background:    rgba(99, 102, 241, 0.18);
-  color:         #818cf8;
+.orch-track-count-inline {
+  font-size:     0.6rem;
+  font-weight:   700;
+  padding:       0.1rem 0.5rem;
+  border-radius: 12px;
+  background:    rgba(99, 102, 241, 0.15);
+  color:         #a5b4fc;
   border:        1px solid rgba(99, 102, 241, 0.3);
+  box-shadow:    0 0 6px rgba(99, 102, 241, 0.1);
+  font-family:   'JetBrains Mono', monospace;
 }
 
 /* Drop zone */
@@ -3075,6 +3612,7 @@ function handleCancel() {
   line-height:   1.55;
   padding:       0.45rem 0.55rem;
   resize:        vertical;
+  min-height:    48px;
   outline:       none;
   transition:    border-color 0.18s, box-shadow 0.18s;
 }
@@ -3133,4 +3671,139 @@ function handleCancel() {
   background:  linear-gradient(135deg, #4338ca, #4f46e5);
   box-shadow:  0 0 18px rgba(99, 102, 241, 0.45);
 }
+
+/* 节拍头情绪微标 */
+.beat-emotion-badge {
+  font-size:       0.6rem;
+  font-weight:     600;
+  padding:         0.22rem 0.4rem;
+  border-radius:   5px;
+  white-space:     nowrap;
+  overflow:        hidden;
+  text-overflow:   ellipsis;
+  width:           100%;
+  justify-content: center;
+  flex-shrink:     0;
+  border:          1px solid transparent;
+  display:         inline-flex;
+  align-items:     center;
+  gap:             0.25rem;
+}
+.beat-emo--high {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.35);
+}
+.beat-emo--low {
+  background: rgba(59, 130, 246, 0.15);
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+/* 属性面板内部排版 */
+.cfg-scroll-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 0.3rem;
+}
+.cfg-scroll-body::-webkit-scrollbar { width: 4px; }
+.cfg-scroll-body::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.25); border-radius: 2px; }
+
+.cfg-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.cfg-label {
+  font-size: 0.65rem;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+/* ── 取消编排确认弹窗 ─────────────────────────────────────────────────────────── */
+.cancel-confirm-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cancel-confirm-box {
+  width: 340px;
+  background: linear-gradient(160deg, rgba(15, 23, 42, 0.98), rgba(9, 14, 30, 0.99));
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 16px;
+  padding: 2rem 1.75rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.65rem;
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.1),
+              0 0 40px rgba(239, 68, 68, 0.15),
+              0 24px 64px rgba(0, 0, 0, 0.7);
+}
+.cancel-confirm-icon {
+  font-size: 2.2rem;
+  line-height: 1;
+  filter: drop-shadow(0 0 10px rgba(239, 68, 68, 0.45));
+}
+.cancel-confirm-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 800;
+  color: #f1f5f9;
+  letter-spacing: 0.02em;
+}
+.cancel-confirm-desc {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #64748b;
+  text-align: center;
+  line-height: 1.5;
+  max-width: 280px;
+}
+.cancel-confirm-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  width: 100%;
+}
+.cancel-confirm-btn {
+  flex: 1;
+  padding: 0.55rem 0;
+  border-radius: 9px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  border: 1px solid;
+  transition: all 0.16s ease;
+}
+.cancel-confirm-btn--dismiss {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #94a3b8;
+}
+.cancel-confirm-btn--dismiss:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e2e8f0;
+}
+.cancel-confirm-btn--confirm {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #f87171;
+}
+.cancel-confirm-btn--confirm:hover {
+  background: rgba(239, 68, 68, 0.22);
+  box-shadow: 0 0 16px rgba(239, 68, 68, 0.25);
+}
+.cancel-confirm-fade-enter-active,
+.cancel-confirm-fade-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.cancel-confirm-fade-enter-from,
+.cancel-confirm-fade-leave-to     { opacity: 0; transform: scale(0.92); }
 </style>

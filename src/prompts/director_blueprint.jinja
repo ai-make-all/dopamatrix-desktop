@@ -12,27 +12,40 @@
 {{ schema_json }}
 
 【社交媒体文案契约 — 全局 meta 字段（必填）】
-在 JSON 顶层，你必须额外生成一个 `meta` 对象，包含以下四个社交媒体文案字段：
+在 JSON 顶层，你必须额外生成一个 `meta` 对象，包含以下五个社交媒体文案及归因字段：
 - `social_title`   : 极具网感、带有 Emoji 的短标题（≤20字）。
 - `social_caption` : 情绪化的描述文案，情感共鸣优先。**铁律：文案最后必须强制追加占位符 {TRACKING_LINK}，禁止遗漏！**（例如："立刻领取限时福利，错过绝对后悔！👇 {TRACKING_LINK}"）
 - `social_hashtags`: 3–5 个高流量话题标签，以空格分隔（例如："#DopaMatrix #爆款视频 #TikTok"）。
+- `human_drive`    : 本视频核心利用的“人性本能/七宗罪”（如：贪婪、嫉妒、懒惰、傲慢、暴食）。你必须根据商品特征选定一个进行降维打击，单选。
 - `emotional_tag`  : 为该剧本提炼的情绪标签，用于导出文件命名。**硬性要求：**
   1. 必须是纯英文驼峰命名或纯中文。
   2. 绝对禁止使用空格、斜杠及任何标点符号。
   3. 字数严格控制在 2–4 个汉字或 15 个英文字母以内（例如：PriceDrop, BossAngry, 极度震惊）。
 
 `meta` 字段示例输出（严格参照此结构，字段名一字不差）：
-```json
 {
   "meta": {
     "social_title": "🔥 震撼来袭！这个方法让你一夜爆款",
     "social_caption": "别再走弯路了，这个技巧我用了3年才悟透 💡 {TRACKING_LINK}",
     "social_hashtags": "#爆款秘籍 #DopaMatrix #短视频营销 #TikTok增长",
+    "human_drive": "嫉妒",
     "emotional_tag": "BossAngry"
   },
   "timeline": [...]
 }
-```
+
+【神经营销与人性降维法则 (Neuro & Human Drive Translation)】
+绝对禁止直白推销物理商品或功能！你必须将用户的原始输入，强行“降维翻译”为对人类本能欲望（七宗罪）的刺激。
+在构思剧本前，你必须结合 meta.human_drive，将商品卖点映射为以下三大神经递质分类，并为每个分镜（beat）设定一个且仅限一个核心 emotion（搭配对应的 tts_params）：
+
+1. 皮质醇类（利用 傲慢/嫉妒/恐惧）：[焦虑, 愤怒, 扎心] -> tts_params: "fast, high-pitch"
+   -> 策略：制造强烈的阶层对比、优越感被打破的落差、或生存痛点放大（例如：用“别人一半预算效果却比你好”来卖 SaaS 工具）。
+2. 多巴胺类（利用 贪婪/色欲/猎奇）：[悬疑, 震惊, 极度渴望] -> tts_params: "medium, heavy-stress"
+   -> 策略：制造游戏通关般的爽感、极限诱惑或认知颠覆（例如：用低保真的廉价纸皮人打破第四面墙，用占便宜心理卖货）。
+3. 内啡肽类（利用 懒惰/暴食/安全）：[专业, 舒缓, 解压] -> tts_params: "slow, calm, low-pitch"
+   -> 策略：提供极其顺滑的过程、ASMR 或绝对的权威背书（例如：不卖洗车服务，只放大高压水枪冲刷污垢瞬间的极致解压感）。
+
+剧本的相邻节拍之间，必须至少设计一次“情绪跨象限跳跃”（例如从“焦虑”瞬间切换到“震惊”，或从“悬疑”过渡到“专业”），以此形成情节反转与心流劫持！
 
 【可用素材标签库】
 {% if available_tags %}
@@ -56,7 +69,10 @@
 4. `asset_hashes` — locked 模式下的 MD5 哈希数组；smart 模式填空数组 []。
 5. `semantic_tags` — 字符串数组，至少 1 个标签便于素材库 smart 寻址。
 6. `script_text`  — **该分镜的完整口播台词**，语种为 {{ langs | first }}；语言流畅自然，适合 AI 语音合成；直接驱动 TTS 管线，禁止留空。
-7. `duration`     — 该分镜预估时长（秒，整数或一位小数），各节拍之和应接近 {{ target_duration }} 秒；口播总词数控制在 {{ word_min }}–{{ word_max }}（{{ langs | first }} 词计）之间。
+7. `visual_script`— **该分镜的画面动作描写、视觉特效与人物状态**（例如：“玩家手滑将火系法师丢入水中，屏幕爆出红色警告特效”）。用于指导人工寻址或作为后期 AIGC 生成的 Prompt。
+8. `emotion`      — 该分镜的唯一核心情绪标签；只能从情绪分类库中选择一个。
+9. `tts_params`   — 该情绪对应的 TTS 语速/语调特征；必须严格匹配 emotion 所属分类。
+10. `duration`    — 该分镜预估时长（秒，整数或一位小数），各节拍之和应接近 {{ target_duration }} 秒；口播总词数控制在 {{ word_min }}–{{ word_max }}（{{ langs | first }} 词计）之间。
 
 【标签纪律 (Tagging Discipline) — 违者视为输出非法，整个 JSON 将被拒绝】
 

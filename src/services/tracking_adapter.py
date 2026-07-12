@@ -93,7 +93,7 @@ class CloudflareKVAdapter:
             import httpx  # 延迟导入，避免未安装时在 mock 模式下报错
         except ImportError as exc:
             logger.error("[Tracking] httpx 未安装，无法写入 CF KV: %s", exc)
-            return
+            raise RuntimeError("httpx 未安装，无法写入 Cloudflare KV") from exc
 
         url = (
             f"https://api.cloudflare.com/client/v4/accounts/{self._account_id}"
@@ -111,3 +111,4 @@ class CloudflareKVAdapter:
                 "[Tracking] CF KV 写入失败 (short_code=%s, variant=%.8s): %s",
                 short_code, variant_id, exc,
             )
+            raise

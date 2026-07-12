@@ -44,6 +44,8 @@ DopaMatrix 采用 **“单核双擎 (Single Core, Dual Engines)”** 战略，�
 
 > DopaMatrix 致力于提供**纯粹的音视频渲染管线与动态 DSL 解析底座**。我们接收来自云端「GrowthOS」的高阶互动指令，完成高质量渲染，并返回带指纹与成本估算的结果报告。业务决策、数据学习、爆款分析等高阶逻辑，由 GrowthOS 负责。
 
+> DopaMatrix 是一个声明式增长创意操作系统。客户声明增长目标，平台自动编译成可投放、可交互、可归因、可迭代的多模态创意矩阵。**声明增长目标，编译创意矩阵，归因驱动进化。Declare growth. Compile creatives. Learn from attribution.**
+
 > **商业模式跃迁 — 从纯 SaaS 到 SwaS (Software with a Service) 闭环**
 >
 > 传统的 SaaS 只给客户提供“铲子”，而 DopaMatrix 提供的是“金矿（结果）”。面对缺乏流量认知与精细化运营能力的实体商家和游戏发行商，平台全面拥抱 **SwaS (半平台+半代运营)** 模式。
@@ -498,6 +500,11 @@ workflow_def = {
 - [ ] **反差高光提权 (The "Conflict is Hook" Strategy)**：当视听双模态发生极端冲突且双高置信时，系统不进行抹杀，而是生成稀有标签 `[emotion: extreme_contrast]`，强制提权为 S 级片头 Hook。
 - [ ] **云端大脑兜底 (Cloud Escalation)**：对于本地小模型无法解析的复杂语境（如：阴阳怪气的反语），引擎将特征切片极速打包上报，由云端 NeuroFlow 大模型进行上下文终极仲裁。
 
+#### 8.6 留存断崖与情绪逆向诊断 (Drop-off Sentiment Analysis) 📉
+> **设计原则**：改变单一的“正向点击归因”，引入基于完播率的反向情绪修正机制。
+- [ ] **断崖特征抓取**：通过平台 API 抓取投流后的“3秒完播率”与“平均跳出节点”（如：视频第 4 秒流失 80% 用户）。
+- [ ] **情绪弧线比对 (Arc Collision)**：GrowthOS 将跳出节点与本地 `Story DSL` 蓝图进行对齐。若发现流失点恰逢情绪从 `震惊 (High-Arousal)` 跌落到 `平缓 (Low-Arousal)`，系统自动告警：“皮质醇断崖，建议补充视觉刺激”，指导下一轮自动剪辑。
+
 ---
 
 ### Phase 9 — V3.0 互动买量与 Playable 引擎 (The Interactive Frontier) 🚀
@@ -534,6 +541,11 @@ workflow_def = {
 - [ ] **游戏资产碎片化入库 (Assetization)**：支持游戏发行商将游戏画面拆解为底层资产导入：纯净战场背景 (Background)、透明通道的角色骨骼动画 (Sprite WebM/PNG)、独立的全屏特效 (VFX)。
 - [ ] **动态阵型与数量枚举 (Dynamic Formations)**：在底层 FFmpeg 的 `overlay` 滤镜中引入数组与阵型逻辑。当 Story DSL 接收到“全出弓箭手”的指令时，引擎能自动将单一的“透明弓箭手”素材，通过代码复制 (Duplicate) 50 次，并以随机或特定阵型排布在 Y 轴的二维坐标系中，生成极其逼真的游戏战斗画面。
 - [ ] **神评响应自动化 (Comment-Driven Generation)**：无缝对接 [10.6 众包式剧情生成]。当 NeuroFlow 抓取到“网友嘲笑”时，自动抽取原视频的评论截图作为画中画 (PiP) 开场，紧接着无缝拼接由参数化引擎秒级生成的“伪实机回应画面”，形成极具爽文打脸感的买量素材闭环。
+
+#### 9.5 互动广告的情绪行为探针 (Interactive Emotion Tracking) 🕹️
+> **设计原则**：在 H5 Playable 广告中，追踪用户的“指尖情绪”，提供比视频点击更深维度的归因数据。
+- [ ] **微操情绪映射 (Micro-Interaction Mapping)**：在打包导出的 H5 无头游戏引擎中埋点，记录用户的交互特征。将“疯狂连击屏幕”打标为 `狂躁/兴奋`，将“平缓拖拽”打标为 `解压/沉浸`。
+- [ ] **决策耗时归因**：精确记录用户在触发 CTA 按钮前的犹豫时长，将数据回传云端大脑，反哺前端 15 秒视频的 Hook 情绪阈值设定。
 
 ---
 
@@ -577,6 +589,13 @@ workflow_def = {
 - [ ] **云端 Prompt 资产库 (PostgreSQL)**：在云端数据库中建立 `prompt_templates` 资产表，对 System Prompt 进行版本控制 (Versioning) 与业务线隔离 (Content vs. UA)。
 - [ ] **零代码热更新 (Zero-Code OTA)**：运营总监在 GrowthOS 网页后台修改 Prompt 后，客户端引擎在下一次渲染时自动拉取最新指令。彻底实现业务策略更新与客户端发版的物理剥离。
 - [ ] **Prompt A/B 测试引擎**：系统按预设概率（如 50/50）下发 Version A 和 Version B 的指令给大模型。结合达尔文归因闭环，自动淘汰低转化率的提示词，实现大模型指导话术的自我进化。
+
+#### 10.8 全域情绪归因与特征向量化 (Omnichannel Emotion Vector) 🧬
+> **设计原则**：将视频的视、听、剪辑节奏与外部控评彻底量化，融合为可供大模型机器学习的“情绪特征向量”。
+- [ ] **听觉潜意识埋点 (Sonic Tracking)**：为 DAM 库中的所有 BGM/SFX 建立“BPM + 频段”的自动分析计算。如：BPM > 120 的重低音打标为 `皮质醇-焦虑`；ASMR 白噪音打标为 `内啡肽-解压`，并纳入最终成片归因。
+- [ ] **剪辑心流埋点 (Kinetic Rhythm)**：在 `CompositorNode` 编译时，自动计算视频的“切镜率 (Cuts Per Minute, CPM)”。将高频快切（引发焦虑/冲动）与一镜到底（建立信任/叙事）作为独立情绪因子写入归因表单。
+- [ ] **社群情绪锚点植入 (Comment Seeding Hooks)**：打包交付 ZIP 时，由大模型同步生成 3 条“引战/共鸣神评”。为置顶评论与视频描述分配不同的短链接，精准追踪“正文转化”与“评论带节奏转化”的比例差异。
+- [ ] **变体情绪 DNA 化 (Emotion Vectorization)**：将 CSV 交付清单彻底进化为高维向量：`[视觉: 梗图] + [听觉: 重低音(焦虑)] + [节奏: 极快] + [控评: 恐吓型]`。将此特征向量存入 PostgreSQL `pgvector` 库，作为预测未来爆款的核心算力依据。
 
 ---
 

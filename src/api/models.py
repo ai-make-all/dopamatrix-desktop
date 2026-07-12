@@ -11,10 +11,11 @@ SQLAlchemy ORM 数据表定义。
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, ForeignKey, Text, Boolean, JSON,
-    UniqueConstraint,
+    Enum as SAEnum, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
+from .approval_types import VariantStatus
 from .database import Base
 
 
@@ -140,7 +141,7 @@ class TaskHistory(Base):
     batch_size     = Column(Integer, nullable=False, default=1)
     duration       = Column(Float, nullable=False, default=0.0) # 总耗时（秒）
     output_assets  = Column(JSON, nullable=False)          # 生成的资产列表 [{"path": "...", "hash": "..."}]
-    prompt_details = Column(Text, nullable=True)           # beats JSON（含 script_text），供前端台词回显
+    prompt_details = Column(Text, nullable=True)           # {"meta": ..., "timeline": ...} JSON，供归因与台词回显
     created_at     = Column(DateTime(timezone=True), nullable=False, default=_now)
 
     def __repr__(self) -> str:
@@ -158,8 +159,8 @@ class VariantApproval(Base):
       task_id   : 对应 TaskHistory.task_id（session UUID hex）
       asset_hash: 视频文件 MD5（TaskHistory.output_assets[].hash）
 
-    status 生命周期：PENDING → APPROVED | REJECTED
-      支持撤销：APPROVED → PENDING，REJECTED → PENDING
+    status 生命周期：PROCESSING → PENDING → APPROVED | REJECTED → DELETED
+      支持人工恢复：REJECTED → PENDING | APPROVED
     """
     __tablename__ = "variant_approvals"
     __table_args__ = (
@@ -171,20 +172,48 @@ class VariantApproval(Base):
     asset_hash  = Column(String(64),  nullable=False, index=True)  # 视频 MD5
     file_path   = Column(String(512), nullable=False)              # 视频物理路径
     cover_path  = Column(String(512), nullable=True,  default="")  # 封面帧路径
-    status      = Column(String(20),  nullable=False, default="PENDING")
-                                                                   # PENDING|APPROVED|REJECTED
+    status      = Column(
+        SAEnum(
+            VariantStatus,
+            name="variant_status",
+            native_enum=False,
+            validate_strings=True,
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+        default=VariantStatus.PENDING,
+        index=True,
+    )
     # ── Phase 9.12 社交媒体归因字段（从 TaskHistory.prompt_details["meta"] 回填）── #
     social_title    = Column(String(512), nullable=True)           # 极具网感短标题
     social_caption  = Column(Text,        nullable=True)           # 含 {TRACKING_LINK} 的情绪化文案
     social_hashtags = Column(String(512), nullable=True)           # 空格分隔的话题标签
+    human_drive     = Column(String(64),  nullable=True)           # 核心利用的人性本能/七宗罪
     emotional_tag   = Column(String(64),  nullable=True)           # 情绪微标（Phase 9.13 扁平化命名）
+    tracking_link   = Column(String(512), nullable=True)           # 已持久化的专属 CF 追踪短链
+    exported_at     = Column(DateTime(timezone=True), nullable=True)  # 首次成功生成交付包的时间
 
+    operator    = Column(String(128), nullable=False, default="system")
     created_at  = Column(DateTime(timezone=True), nullable=False, default=_now)
-    updated_at  = Column(DateTime(timezone=True), nullable=True)
+    updated_at  = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     def __repr__(self) -> str:
         return (
             f"<VariantApproval id={self.id} task={self.task_id[:8]} "
             f"hash={self.asset_hash[:8]} status={self.status}>"
         )
+
+
+class VariantStatusAudit(Base):
+    """Append-only audit trail for every variant status transition."""
+
+    __tablename__ = "variant_status_audits"
+
+    id          = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    task_id     = Column(String(64), nullable=False, index=True)
+    asset_hash  = Column(String(64), nullable=False, index=True)
+    from_status = Column(String(20), nullable=True)
+    to_status   = Column(String(20), nullable=False)
+    operator    = Column(String(128), nullable=False, default="system")
+    created_at  = Column(DateTime(timezone=True), nullable=False, default=_now, index=True)
 

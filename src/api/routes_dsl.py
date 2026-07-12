@@ -221,7 +221,11 @@ def render_worker(
                 )
                 return []
 
-            dsl_payload = StoryDSLPayload(engine_type=engine_type, timeline=beat_nodes)
+            dsl_payload = StoryDSLPayload(
+                engine_type=engine_type,
+                timeline=beat_nodes,
+                meta=bp.get("meta") or None,
+            )
             working_plan = _parse_plan_from_db(tenant_id, dsl_payload)
             logger.info(
                 "[render_worker] task_id=%s blind_dsl 解析 resolved=%d/%d unresolved=%s",
@@ -468,6 +472,19 @@ def render_worker(
             _cover_path = ""
 
         # ── 6. 收集输出资产 ─────────────────────────────────────────────
+        # 提取社交元数据，随资产一并写入 WS payload，前端无需二次 API 请求即可渲染 HUD
+        _social_fields: dict = {}
+        if dsl_payload is not None and dsl_payload.meta is not None:
+            try:
+                _meta_dump = dsl_payload.meta.model_dump()
+                _social_fields = {
+                    k: _meta_dump[k]
+                    for k in ("social_title", "social_caption", "social_hashtags")
+                    if _meta_dump.get(k)
+                }
+            except Exception:
+                pass
+
         if render_ok:
             for _variant_assets in context.variants.values():
                 _fp = _variant_assets.get("final_video", "")
@@ -482,13 +499,18 @@ def render_worker(
                         "file_path": _fp,
                         "file_hash": _h.hexdigest(),
                         "cover_path": _cover_path,  # ← CoverNode 执行完毕后才填入，时序正确
+                        **_social_fields,
                     })
 
         # ── 6b. WS 最终 completed 推送（CoverNode 已执行完毕，封面路径已就绪）──
         # suppress_completed_ws=True 时由 render_batch_worker 统一推送，此处跳过。
         if render_ok and not suppress_completed_ws:
             _ws_status = "completed" if collected_assets else "failed"
-            _ws_payload: dict = {"taskId": task_id, "status": _ws_status}
+            _ws_payload: dict = {
+                "taskId": task_id,
+                "status": _ws_status,
+                "generation_mode": director_mode,
+            }
             if collected_assets:
                 _ws_payload["assets"] = collected_assets
             try:
@@ -509,8 +531,18 @@ def render_worker(
         if render_ok and collected_assets:
             try:
                 _elapsed = round(time.time() - _start_time, 1)
-                _beats_json: str = json.dumps(
-                    [b.model_dump() for b in (working_plan.beats if working_plan else [])],
+                _prompt_details: dict[str, Any] = {
+                    "meta": (
+                        dsl_payload.meta.model_dump()
+                        if dsl_payload is not None and dsl_payload.meta is not None
+                        else None
+                    ),
+                    "timeline": [
+                        b.model_dump() for b in (working_plan.beats if working_plan else [])
+                    ],
+                }
+                _details_json: str = json.dumps(
+                    _prompt_details,
                     ensure_ascii=False,
                 )
                 _history_prompt = prompt or ""
@@ -520,7 +552,7 @@ def render_worker(
                     batch_size=batch_size,
                     duration=_elapsed,
                     output_assets=collected_assets,
-                    prompt_details=_beats_json,
+                    prompt_details=_details_json,
                     created_at=datetime.utcnow(),
                 )
                 _hist_engine = get_tenant_engine(tenant_id)
@@ -605,6 +637,7 @@ def render_batch_worker(
     director_mode: str = "auto",
     enable_tts: bool = True,
     enable_subtitles: bool = True,
+    resolved_plan: Optional[CompilationPlan] = None,
 ) -> None:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
@@ -629,7 +662,7 @@ def render_batch_worker(
         future_map = {
             pool.submit(
                 render_worker,
-                None,    # plan：由 render_worker 内部动态解析，此处不固化蓝图
+                None if blind_dsl else resolved_plan,
                 task_id,
                 aspect_ratio, target_duration, tenant_id,
                 prompt, batch_size, test_language,
@@ -673,6 +706,7 @@ def render_batch_worker(
                 "payload": {
                     "taskId": task_id,
                     "status": final_status,
+                    "generation_mode": director_mode,
                     **({"assets": all_assets} if all_assets else {}),
                 },
             },
@@ -898,6 +932,7 @@ def submit_dsl(
             dsl_payload = StoryDSLPayload(
                 engine_type=payload.engine_type,
                 timeline=payload.timeline,
+                meta=payload.meta,
                 user_hard_tags=payload.user_hard_tags,
             )
             parser = DSLParserNode(db)
@@ -936,6 +971,7 @@ def submit_dsl(
     dsl_payload_for_worker: Optional[StoryDSLPayload] = None if is_blind else StoryDSLPayload(
         engine_type=payload.engine_type,
         timeline=payload.timeline,
+        meta=payload.meta,
         user_hard_tags=payload.user_hard_tags,
     )
 
@@ -992,6 +1028,117 @@ def submit_dsl(
 # POST /tasks/render-dsl  — 纯渲染触发端点  (Phase 5.1，保持不变)    #
 # ================================================================== #
 
+# ================================================================== #
+# POST /tasks/submit-manual  - pure manual DSL submit endpoint
+# ================================================================== #
+
+@router.post(
+    "/submit-manual",
+    response_model=DSLSubmitResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Story DSL 手工编排渲染入口",
+    description=(
+        "接收前端手工编排好的 RenderDSLRequest，直接通过 DSLParserNode "
+        "解析 CompilationPlan 并下发后台渲染。该端点不执行 blind fission "
+        "判断，也不依赖 DirectorNode。"
+    ),
+)
+def submit_manual(
+    payload: RenderDSLRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> DSLSubmitResponse:
+    logger.info(
+        "[routes_dsl] submit-manual request engine=%s beats=%d aspect=%s duration=%ds",
+        payload.engine_type,
+        len(payload.timeline),
+        payload.aspect_ratio,
+        payload.target_duration,
+    )
+
+    if not payload.timeline:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="timeline cannot be empty for manual submit.",
+        )
+
+    try:
+        dsl_payload = StoryDSLPayload(
+            engine_type=payload.engine_type,
+            timeline=payload.timeline,
+            meta=payload.meta,
+            user_hard_tags=payload.user_hard_tags,
+        )
+        parser = DSLParserNode(db)
+        plan = parser.parse_and_resolve(dsl_payload)
+    except Exception as exc:
+        logger.exception("[routes_dsl] submit-manual DSLParserNode failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"DSL parser failed: {exc}",
+        ) from exc
+
+    if plan.summary.resolved_beats == 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "No renderable beats were resolved. "
+                f"Unresolved beats: {plan.unresolved_beats}"
+            ),
+        )
+
+    task_id = payload.session_id or str(uuid.uuid4())
+    batch_size = payload.batch_size
+    worker_kwargs: dict[str, Any] = {
+        "blind_dsl": False,
+        "engine_type": payload.engine_type,
+        "director_mode": payload.mode,
+        "enable_tts": payload.enable_tts,
+        "enable_subtitles": payload.enable_subtitles,
+    }
+
+    if batch_size > 1:
+        background_tasks.add_task(
+            render_batch_worker,
+            dsl_payload,
+            task_id,
+            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+            None, batch_size, payload.test_language,
+            **{**worker_kwargs, "resolved_plan": plan},
+        )
+    else:
+        background_tasks.add_task(
+            render_worker,
+            plan,
+            task_id,
+            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+            None, 1, payload.test_language,
+            None,
+            False,
+            **worker_kwargs,
+            dsl_payload=dsl_payload,
+        )
+
+    logger.info(
+        "[routes_dsl] submit-manual dispatched task_id=%s batch=%d resolved=%d/%d",
+        task_id,
+        batch_size,
+        plan.summary.resolved_beats,
+        plan.summary.total_beats,
+    )
+
+    return DSLSubmitResponse(
+        **plan.model_dump(),
+        task_id=task_id,
+        task_ids=[task_id],
+        render_status="rendering",
+        message=(
+            f"Manual render task dispatched (task_id={task_id[:8]}, "
+            f"batch={batch_size})."
+        ),
+    )
+
+
 @router.post(
     "/render-dsl",
     response_model=RenderDSLAck,
@@ -1047,6 +1194,7 @@ def render_dsl(
             dsl_payload = StoryDSLPayload(
                 engine_type=payload.engine_type,
                 timeline=payload.timeline,
+                meta=payload.meta,
                 user_hard_tags=payload.user_hard_tags,
             )
             parser = DSLParserNode(db)
@@ -1076,6 +1224,7 @@ def render_dsl(
     dsl_payload_for_worker: Optional[StoryDSLPayload] = None if is_blind else StoryDSLPayload(
         engine_type=payload.engine_type,
         timeline=payload.timeline,
+        meta=payload.meta,
         user_hard_tags=payload.user_hard_tags,
     )
 
