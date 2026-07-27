@@ -21,6 +21,7 @@ tests/assets/
 logs/
 
 # ── 4. Python & 虚拟环境 ──
+.pytest_cache/
 __pycache__/
 *.py[cod]
 *$py.class
