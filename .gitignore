@@ -5,8 +5,19 @@
 # ── 1. 敏感数据与环境配置 (Zero Trust) ──
 .env
 .env.*
-clipflow.db
-clipflow.db-journal
+# Local SQLite databases
+/clipflow*.db
+/clipflow*.db-*
+/dopamatrix*.db
+/dopamatrix*.db-*
+/data/dopamatrix*.db
+/data/dopamatrix*.db-*
+
+# Local Python environment
+venv_build/
+
+# Keep the safe environment template trackable
+!.env.example
 
 # ── 2. 媒体资产与输出产物 ──
 assets/matrix_pool/
