@@ -1,4 +1,4 @@
-你好！这是我们智链 AI (ClipFlow) 项目的最新的《架构级共识文档》以及底层的 API Schema 契约。
+你好！这是我们智链 AI (dopamatrix) 项目的最新的《架构级共识文档》以及底层的 API Schema 契约。
 
 目前，我们面向 B 端的桌面渲染引擎（FastAPI + FFmpeg）已经 v1.0 封板。它支持纯异步排队渲染、X/Y轴物理隔离、单语种极速测试，并会通过 Webhook 异步发送完成通知。
 

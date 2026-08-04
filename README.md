@@ -1,4 +1,4 @@
-# 🧬 DopaMatrix (Formerly ClipFlow)
+# 🧬 DopaMatrix (Formerly dopamatrix)
 
 > **Next-Gen AI Infrastructure for UA & Content**
 > Powered by **NeuroFlow™** Affective Computing Engine
@@ -45,8 +45,7 @@
 ### 2. 数据库与配置层 (The Bridge) —— 【平滑过渡】
 * **规范**：暂时保留现有物理文件名，在配置逻辑中解耦。
 * **执行**：
-  * 现有的 `.env` 环境变量键名、SQLite 物理文件名（如 `clipflow.db`）**暂时不动**，避免现有环境丢失数据。
-  * 后续通过环境变量映射，平滑迁移到 `dopamatrix.db`。
+  * 历史版本曾使用 clipflow.db，目前已迁移至 DopaMatrix 数据库命名规范。
 
 ### 3. 底层渲染引擎 (The Core) —— 【绝对静止，严禁重命名】
 * **规范**：**绝对不要**在 IDE 里对根目录的 `ClipFlow` 文件夹或深层 Python 模块进行“全局查找替换”。

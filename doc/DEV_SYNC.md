@@ -23,7 +23,7 @@
 - [x] 数据库迁移: 执行 `db_migrate_v1.py` 强行追加字段。
 
 ### 2. 前端 UI 升级 (听觉资产大盘) - [进行中]
-- [ ] 侧边栏/顶部 Navbar: 全局品牌重命名 `ClipFlow` -> `DopaMatrix`。
+- [ ] 侧边栏/顶部 Navbar: 全局品牌重命名`DopaMatrix`。
 - [ ] `AssetLibrary`: 新增 [🎵 听觉资产] Tab，区分 BGM 与 SFX。
 - [ ] `AudioAssetCard.vue`: 新增声波纹卡片，支持疲劳度显示与情绪打标 (如 `asmr`, `epic`)。
 - [ ] `TaskSubmitBar.vue`: 新增“声音情绪”下拉框，并实现 JSON payload 的 `audio_scape` 正确拼接。
