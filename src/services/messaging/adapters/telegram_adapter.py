@@ -20,7 +20,7 @@ Telegram Update 结构参考（仅解析最常用的 message 和 callback_query�
       "message_id": 1,
       "from": {"id": 987654321, "first_name": "Alice"},
       "chat": {"id": -1001234567890, "type": "group"},
-      "text": "Hello ClipFlow"
+      "text": "Hello DopaMatrix"
     }
   }
 """

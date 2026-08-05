@@ -1,7 +1,7 @@
 """
 src/api/routes_history.py
 ———————————————————
-ClipFlow — 历史记录查询 API。
+DopaMatrix — 历史记录查询 API。
 
 端点列表：
   GET /history/          → 全量历史（倒序）

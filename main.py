@@ -1,5 +1,5 @@
 """
-main.py  —  ClipFlow FastAPI 应用入口
+main.py  —  DopaMatrix FastAPI 应用入口
 —————————————————————————————————————
 职责：
   1. 初始化 FastAPI 实例（含 lifespan 生命周期管理）
@@ -20,7 +20,7 @@ from typing import AsyncIterator
 
 # ── 生产环境（PyInstaller 打包）：将工作目录切换到可执行文件所在目录 ──────────
 # 必须在所有其他代码之前执行，确保 dopamatrix.db / .env / output/ 等相对路径
-# 全部解析到安装目录（如 C:\ClipFlow\），而非系统默认工作目录。
+# 全部解析到安装目录（如 C:\DopaMatrix\），而非系统默认工作目录。
 if getattr(sys, "frozen", False):
     os.chdir(os.path.dirname(sys.executable))
 
@@ -75,17 +75,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 logger.warning(f"[Zero Trust] 尝试销毁 .env 时出现异常（已忽略）: {_e}")
 
     # ---- 启动阶段 ---- #
-    logger.info("[ClipFlow] 正在初始化数据库表结构…")
+    logger.info("[DopaMatrix] 正在初始化数据库表结构…")
     Base.metadata.create_all(bind=engine)
     evolve_schema(engine)
-    logger.info("[ClipFlow] 数据库就绪 ✓")
+    logger.info("[DopaMatrix] 数据库就绪 ✓")
 
     # ---- 注入事件循环到 WebSocket 广播中枢 ---- #
     # asyncio.get_running_loop() 在 lifespan（async 上下文）中安全可用。
     # 注入后，运行于 ThreadPoolExecutor 的渲染任务可通过 ws_manager.broadcast_sync()
     # 跨线程安全地向前端推送实时进度。
     ws_manager.set_event_loop(asyncio.get_running_loop())
-    logger.info("[ClipFlow] WebSocket 事件总线事件循环已注入 ✓")
+    logger.info("[DopaMatrix] WebSocket 事件总线事件循环已注入 ✓")
 
     # ---- Ngrok 内网穿透 ---- #
     # ngrok.connect 是同步调用，在 lifespan 启动阶段（服务器尚未接受请求时）
@@ -113,14 +113,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("[内网穿透] Ngrok 隧道已断开，进程已清理。")
         except Exception as exc:
             logger.warning(f"[内网穿透] Ngrok 关闭时出现异常（可忽略）: {exc}")
-    logger.info("[ClipFlow] 应用已关闭。")
+    logger.info("[DopaMatrix] 应用已关闭。")
 
 
 # ================================================================== #
 # FastAPI 实例                                                          #
 # ================================================================== #
 app = FastAPI(
-    title="ClipFlow — Headless Render Engine",
+    title="DopaMatrix — Headless Render Engine",
     description=(
         "纯粹的高并发音视频渲染引擎，通过标准化 Headless API 向外暴露能力，"
         "供 GrowthOS 等上层业务系统无缝接入。"
@@ -159,7 +159,7 @@ async def health_check() -> HealthResponse:
     GrowthOS / 监控系统可定期 ping 此接口确认服务存活。
     """
     return HealthResponse(
-        status="ClipFlow Engine is running",
+        status="DopaMatrix Engine is running",
         version="0.5.0",
         db="connected",
     )

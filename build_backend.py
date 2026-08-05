@@ -54,7 +54,7 @@ def move_with_retry(src: str, dst: str, retries: int = 5, delay: float = 2.0):
 
     raise PermissionError(
         f"移动 {src} -> {dst} 失败（已重试 {retries} 次）：{last_exc}\n"
-        "请确保 ClipFlow 应用已完全关闭后重试。"
+        "请确保 DopaMatrix 应用已完全关闭后重试。"
     ) from last_exc
 
 
@@ -184,7 +184,7 @@ def get_sidecar_filename():
 
 def build():
     # ── Step 0: 释放文件锁（关闭正在运行的旧版本） ──────────────────────────
-    print("==> [0/4] 终止正在运行的 ClipFlow 进程（释放文件锁）...")
+    print("==> [0/4] 终止正在运行的 DopaMatrix 进程（释放文件锁）...")
     kill_backend_processes()
     # 稍等片刻，让 Windows 完成句柄回收
     time.sleep(1)

@@ -1,5 +1,5 @@
 """
-run_matrix_factory.py — ClipFlow 高并发矩阵裂变入口
+run_matrix_factory.py — DopaMatrix 高并发矩阵裂变入口
 
 架构：
   使用 Python concurrent.futures.ThreadPoolExecutor 实现多线程并发，
@@ -407,7 +407,7 @@ def _print_summary(results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ClipFlow 高并发矩阵裂变工厂",
+        description="DopaMatrix 高并发矩阵裂变工厂",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
