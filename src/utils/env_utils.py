@@ -28,7 +28,7 @@ def load_env() -> None:
 
     查找顺序：
       生产环境（PyInstaller frozen）：
-        1. <sys.executable 所在目录>/.env   （安装目录，例：C:\\ClipFlow\\.env）
+        1. <sys.executable 所在目录>/.env   （安装目录，例：C:\\DopaMatrix\\.env）
         2. 若不存在，调用无参 load_dotenv() 按 CWD → 祖先目录继续向上搜索
 
       开发环境：
