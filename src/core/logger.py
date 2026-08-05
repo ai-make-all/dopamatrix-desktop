@@ -1,7 +1,7 @@
 """
 src/core/logger.py
 ——————————————————
-ClipFlow 生产级日志系统。
+DopaMatrix 生产级日志系统。
 
 设计要点：
   - 按日期自动滚动（rotation="00:00"），保留最近 7 天
@@ -10,9 +10,9 @@ ClipFlow 生产级日志系统。
   - LOG_DIR 通过 appdirs.user_log_dir 定位系统标准日志路径，跨平台可靠
 
 日志目录（示例）：
-  Windows : C:/Users/<user>/AppData/Local/ClipFlowOrg/ClipFlow/Logs/
-  macOS   : ~/Library/Logs/ClipFlow/
-  Linux   : ~/.cache/ClipFlow/log/
+  Windows : C:/Users/<user>/AppData/Local/DopaMatrixOrg/DopaMatrix/Logs/
+  macOS   : ~/Library/Logs/DopaMatrix/
+  Linux   : ~/.cache/DopaMatrix/log/
 """
 
 import os
@@ -23,7 +23,7 @@ from appdirs import user_log_dir
 from loguru import logger
 
 # ── 全局日志目录 ─────────────────────────────────────────────────
-LOG_DIR: str = user_log_dir("ClipFlow", "ClipFlowOrg")
+LOG_DIR: str = user_log_dir("DopaMatrix", "DopaMatrixOrg")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -46,7 +46,7 @@ def setup_logger() -> None:
       )
 
     logger.add(
-        os.path.join(LOG_DIR, "clipflow_{time:YYYY-MM-DD}.log"),
+        os.path.join(LOG_DIR, "dopamatrix_{time:YYYY-MM-DD}.log"),
         rotation="00:00",
         retention="7 days",
         level="INFO",
