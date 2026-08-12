@@ -221,7 +221,7 @@ function getCarousel(taskId: string): CarouselState {
   return carouselMap.get(taskId)!
 }
 
-const PAGE_SIZE = 3
+const PAGE_SIZE = 8
 
 function carouselPrev(taskId: string, total: number, e: Event) {
   e.stopPropagation()
@@ -1176,15 +1176,16 @@ const triggerRealWsFlood = async () => {
   display:     flex;
   gap:         0.4rem;
   align-items: flex-start;
+  justify-content: center;
   height:      100%;
   overflow:    hidden;
 }
 .carousel-viewport--few {
-  flex:            0 0 auto;
-  justify-content: flex-start;
+  flex:            1 1 0;
+  justify-content: center;
 }
 .row-carousel--few {
-  justify-content: flex-start;
+  justify-content: center;
 }
 /* 每个 asset 的外层列容器（卡片 + 标题纵向排列） */
 .carousel-item-wrapper {
@@ -1197,9 +1198,9 @@ const triggerRealWsFlood = async () => {
   cursor:        pointer;
 }
 .carousel-item-wrapper--fixed {
-  flex:      0 0 auto;
-  width:     96px;
-  max-width: 96px;
+  flex:      1 1 0;
+  min-width: 86px;
+  max-width: 128px;
 }
 
 /* 1:1 卡片容器（纯方形，overflow:hidden 保证 border-radius 裁剪生效） */
