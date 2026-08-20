@@ -63,6 +63,34 @@ class FFmpegCompositorNode(BaseNode):
             return (720, 1280)
         return _MAP[key]
 
+    @staticmethod
+    def _resolve_file_sid(context: WorkflowContext) -> str:
+        """Resolve the short output token without reusing the batch task identity."""
+        file_sid = context.config.get("file_sid")
+        if file_sid:
+            return str(file_sid)
+
+        if "child_index" in context.config or "execution_id" in context.config:
+            raise RuntimeError(
+                "[FFmpegCompositorNode] child context is missing file_sid"
+            )
+
+        # LEGACY FALLBACK: run_matrix_factory still publishes its historical
+        # short token through config["session_id"]. New API code uses file_sid.
+        return str(context.config.get("session_id") or "")
+
+    @classmethod
+    def _master_output_path(cls, context: WorkflowContext) -> str:
+        file_sid = cls._resolve_file_sid(context)
+        sid_suffix = f"_{file_sid}" if file_sid else ""
+        return f"output/master_video{sid_suffix}.mp4"
+
+    @classmethod
+    def _final_output_path(cls, context: WorkflowContext, language: str) -> str:
+        file_sid = cls._resolve_file_sid(context)
+        sid_suffix = f"_{file_sid}" if file_sid else ""
+        return f"output/final_{language}{sid_suffix}.mp4"
+
     # ------------------------------------------------------------------
     # 事件总线辅助工具
     # ------------------------------------------------------------------
@@ -658,9 +686,14 @@ class FFmpegCompositorNode(BaseNode):
         # 4. 组装完整 FFmpeg 命令（无音频流：生成静音母带）
         task_id:   str = context.session_id   # WS 任务 ID，与前端 queueWorker 对齐
         user_id:   str = context.tenant_id    # 定向推送目标，防止多租户数据串流
-        session_id: str = context.config.get("session_id", "")
-        sid_suffix = f"_{session_id}" if session_id else ""
-        output_path = f"output/master_video{sid_suffix}.mp4"
+        file_sid = self._resolve_file_sid(context)
+        output_path = self._master_output_path(context)
+        logger.info(
+            f"[FFmpegCompositorNode] master output task_id={task_id} "
+            f"execution_id={context.config.get('execution_id')} "
+            f"child_index={context.config.get('child_index')} "
+            f"file_sid={file_sid} path={output_path}"
+        )
         ffmpeg_bin = get_ffmpeg_path("ffmpeg.exe")
 
         map_args = ["-map", "[outv]", "-an"]   # -an: 无音频轨道
@@ -829,9 +862,14 @@ class FFmpegCompositorNode(BaseNode):
         for lang, assets in context.variants.items():
             ass_path: str = assets.get("subtitle_ass", "")
             voice_path: str = assets.get("voice_audio", "")
-            session_id: str = context.config.get("session_id", "")
-            sid_suffix = f"_{session_id}" if session_id else ""
-            final_path = f"output/final_{lang}{sid_suffix}.mp4"
+            file_sid = self._resolve_file_sid(context)
+            final_path = self._final_output_path(context, lang)
+            logger.info(
+                f"[FFmpegCompositorNode] final output task_id={task_id} "
+                f"execution_id={context.config.get('execution_id')} "
+                f"child_index={context.config.get('child_index')} "
+                f"file_sid={file_sid} lang={lang} path={final_path}"
+            )
 
             has_sub   = bool(ass_path   and os.path.exists(ass_path))
             has_voice = bool(voice_path and os.path.exists(voice_path))

@@ -50,8 +50,13 @@ class CoverNode(BaseNode):
         # ── 渗透级启动日志 ─────────────────────────────────────────────
         logger.info("=" * 60)
         logger.info("[CoverNode] 🚀 封面抽帧节点已激活 (Phase 9.8.2)")
-        logger.info("[CoverNode] session_id=%s  tenant_id=%s",
-                    context.session_id, context.tenant_id)
+        logger.info(
+            f"[CoverNode] task_id={context.session_id} "
+            f"execution_id={context.config.get('execution_id')} "
+            f"child_index={context.config.get('child_index')} "
+            f"file_sid={self._resolve_file_sid(context)} "
+            f"tenant_id={context.tenant_id}"
+        )
 
         # 1. 寻找第一个可用的最终变体视频
         video_path = self._resolve_video_path(context)
@@ -76,10 +81,8 @@ class CoverNode(BaseNode):
         logger.info("[CoverNode] 截帧时间戳: %s", timestamp)
 
         # 3. 构造封面输出路径
-        session_id: str = context.config.get("session_id", context.session_id)
-        output_dir = os.path.dirname(video_path) or "output"
-        cover_path = os.path.join(output_dir, f"cover_{session_id}.jpg")
-        logger.info("[CoverNode] 封面输出路径: %s", cover_path)
+        cover_path = self._cover_output_path(context, video_path)
+        logger.info(f"[CoverNode] 封面输出路径: {cover_path}")
 
         # 4. 执行抽帧
         success = self._extract_frame(video_path, timestamp, cover_path)
@@ -116,6 +119,29 @@ class CoverNode(BaseNode):
     # ------------------------------------------------------------------
     # 私有辅助方法
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_file_sid(context: WorkflowContext) -> str:
+        file_sid = context.config.get("file_sid")
+        if file_sid:
+            return str(file_sid)
+
+        if "child_index" in context.config or "execution_id" in context.config:
+            raise RuntimeError("[CoverNode] child context is missing file_sid")
+
+        # LEGACY FALLBACK: an explicitly configured alias remains authoritative,
+        # including the historical empty-string value.
+        if "session_id" in context.config:
+            return str(context.config["session_id"])
+        return str(context.session_id)
+
+    @classmethod
+    def _cover_output_path(cls, context: WorkflowContext, video_path: str) -> str:
+        output_dir = os.path.dirname(video_path) or "output"
+        return os.path.join(
+            output_dir,
+            f"cover_{cls._resolve_file_sid(context)}.jpg",
+        )
 
     @staticmethod
     def _resolve_video_path(context: WorkflowContext) -> str:

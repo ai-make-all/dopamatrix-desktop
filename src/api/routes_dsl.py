@@ -38,6 +38,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -125,6 +126,75 @@ def _is_blind_fission(payload: RenderDSLRequest) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _ChildExecution:
+    """Internal identity envelope for one submitted render execution."""
+
+    child_index: int
+    execution_id: str
+    file_sid: str
+
+
+def _create_child_executions(task_id: str, child_count: int) -> list[_ChildExecution]:
+    """Create child identities while keeping ``task_id`` as the batch identity."""
+    if child_count < 1:
+        raise ValueError("child_count must be at least 1")
+
+    children: list[_ChildExecution] = []
+    used_execution_ids: set[str] = set()
+    used_file_sids: set[str] = set()
+
+    for child_index in range(child_count):
+        for _attempt in range(100):
+            execution_uuid = uuid.uuid4()
+            execution_id = str(execution_uuid)
+            file_sid = execution_uuid.hex[:8]
+            if (
+                execution_id != task_id
+                and execution_id not in used_execution_ids
+                and file_sid not in used_file_sids
+            ):
+                break
+        else:
+            raise RuntimeError("unable to allocate a unique child execution identity")
+
+        used_execution_ids.add(execution_id)
+        used_file_sids.add(file_sid)
+        children.append(
+            _ChildExecution(
+                child_index=child_index,
+                execution_id=execution_id,
+                file_sid=file_sid,
+            )
+        )
+
+    return children
+
+
+def _validate_child_execution(
+    *,
+    task_id: str,
+    execution_id: str,
+    file_sid: Optional[str],
+    child_index: int,
+) -> str:
+    """Validate the explicit child identity contract at worker entry."""
+    if child_index < 0:
+        raise ValueError("child_index must be non-negative")
+    if not execution_id or execution_id == task_id:
+        raise ValueError("execution_id must be present and differ from task_id")
+
+    try:
+        execution_uuid = uuid.UUID(execution_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("execution_id must be a full UUID") from exc
+
+    expected_file_sid = execution_uuid.hex[:8]
+    if file_sid != expected_file_sid:
+        raise ValueError("file_sid must be derived from execution_id")
+    return expected_file_sid
+
+
 # ================================================================== #
 # 后台渲染 Worker  (Phase 5.2)                                        #
 # ================================================================== #
@@ -141,6 +211,8 @@ def render_worker(
     file_sid: Optional[str] = None,
     suppress_completed_ws: bool = False,
     *,
+    execution_id: str,
+    child_index: int,
     blind_dsl: bool = False,
     engine_type: str = "content",
     director_mode: str = "auto",
@@ -162,9 +234,17 @@ def render_worker(
 
     纯积木模式（prompt 为空）：注入 default 变体，仅合流 BGM/SFX。
     """
+    resolved_file_sid = _validate_child_execution(
+        task_id=task_id,
+        execution_id=execution_id,
+        file_sid=file_sid,
+        child_index=child_index,
+    )
     logger.info(
-        "[render_worker] 开始渲染 task_id=%s aspect=%s duration=%ds tenant=%s mode=%s",
-        task_id, aspect_ratio, target_duration, tenant_id,
+        "[render_worker] child 开始 task_id=%s execution_id=%s child_index=%d "
+        "file_sid=%s aspect=%s duration=%ds tenant=%s mode=%s",
+        task_id, execution_id, child_index, resolved_file_sid,
+        aspect_ratio, target_duration, tenant_id,
         "hybrid" if prompt else "dsl-only",
     )
 
@@ -304,13 +384,12 @@ def render_worker(
         )
         context.set_asset("timeline", timeline)
 
-        # ── 3. 指纹隔离：对齐 run_matrix_factory 命名约定 ────────────────
-        # compositor.py 读取 context.config["session_id"] 作为文件名后缀：
-        #   master_video_{sid}.mp4  /  final_{lang}_{sid}.mp4
-        # file_sid 由 render_batch_worker 传入（确保批量子任务文件名唯一），
-        # 单任务模式下 file_sid=None，回退到 task_id[:8]。
-        sid8 = file_sid or task_id[:8]
-        context.config["session_id"] = sid8
+        # ── 3. 显式 child execution identity ───────────────────────────
+        # context.session_id 保持 shared task/UI/WS identity；写路径与短输出名
+        # 分别使用 execution_id / file_sid，不再复用语义含混的 config session_id。
+        context.config["execution_id"] = execution_id
+        context.config["file_sid"] = resolved_file_sid
+        context.config["child_index"] = child_index
         context.config["enable_tts"] = enable_tts
         context.config["enable_subtitles"] = enable_subtitles
         if suppress_completed_ws:
@@ -616,7 +695,16 @@ def render_worker(
 
     except Exception:
         logger.exception(
-            "[render_worker] 渲染任务异常 task_id=%s", task_id
+            "[render_worker] child 异常 task_id=%s execution_id=%s "
+            "child_index=%d file_sid=%s",
+            task_id, execution_id, child_index, resolved_file_sid,
+        )
+    finally:
+        logger.info(
+            "[render_worker] child 结束 task_id=%s execution_id=%s "
+            "child_index=%d file_sid=%s assets=%d elapsed=%.1fs",
+            task_id, execution_id, child_index, resolved_file_sid,
+            len(collected_assets), time.time() - _start_time,
         )
 
     return collected_assets
@@ -643,7 +731,7 @@ def render_batch_worker(
     批量矩阵渲染 Worker（Phase 5.9）。
 
     在 ThreadPoolExecutor 内并行运行 `batch_size` 个 `render_worker` 子任务，
-    每个子任务分配唯一的 file_sid（文件名指纹），但全部共用同一 task_id 作为
+    每个子任务分配唯一的 execution_id 和派生 file_sid，但全部共用同一 task_id 作为
     WS 事件标识，使前端队列只产生一张卡片。
 
     子任务均设置 suppress_completed_ws=True，不单独发送 completed 事件；
@@ -655,7 +743,7 @@ def render_batch_worker(
         task_id, batch_size,
     )
 
-    sub_sids = [uuid.uuid4().hex[:8] for _ in range(batch_size)]
+    child_executions = _create_child_executions(task_id, batch_size)
     all_assets: list[dict] = []
 
     with ThreadPoolExecutor(max_workers=batch_size) as pool:
@@ -666,35 +754,45 @@ def render_batch_worker(
                 task_id,
                 aspect_ratio, target_duration, tenant_id,
                 prompt, batch_size, test_language,
-                sid,   # file_sid: 唯一文件名后缀
+                child.file_sid,
                 True,  # suppress_completed_ws
+                execution_id=child.execution_id,
+                child_index=child.child_index,
                 blind_dsl=blind_dsl,
                 engine_type=engine_type,
                 director_mode=director_mode,
                 dsl_payload=None if blind_dsl else dsl_payload,
                 enable_tts=enable_tts,
                 enable_subtitles=enable_subtitles,
-            ): sid
-            for sid in sub_sids
+            ): child
+            for child in child_executions
         }
 
         for future in as_completed(future_map):
-            sid = future_map[future]
+            child = future_map[future]
             try:
                 assets = future.result()
                 if assets:
                     all_assets.extend(assets)
                     logger.info(
-                        "[render_batch_worker] 子任务完成 sid=%s assets=%d",
-                        sid, len(assets),
+                        "[render_batch_worker] child 完成 task_id=%s execution_id=%s "
+                        "child_index=%d file_sid=%s assets=%d",
+                        task_id, child.execution_id, child.child_index,
+                        child.file_sid, len(assets),
                     )
                 else:
                     logger.warning(
-                        "[render_batch_worker] 子任务无产出 sid=%s", sid,
+                        "[render_batch_worker] child 无产出 task_id=%s execution_id=%s "
+                        "child_index=%d file_sid=%s",
+                        task_id, child.execution_id, child.child_index,
+                        child.file_sid,
                     )
             except Exception:
                 logger.exception(
-                    "[render_batch_worker] 子任务异常 sid=%s", sid,
+                    "[render_batch_worker] child 异常 task_id=%s execution_id=%s "
+                    "child_index=%d file_sid=%s",
+                    task_id, child.execution_id, child.child_index,
+                    child.file_sid,
                 )
 
     # 所有子任务完成 → 推送一次 completed 事件，携带全部资产
@@ -741,7 +839,12 @@ def _run_compositor(
         return True
     except Exception:
         logger.exception(
-            "[_run_compositor] FFmpeg 渲染失败 session_id=%s", context.session_id
+            "[_run_compositor] FFmpeg 渲染失败 task_id=%s execution_id=%s "
+            "child_index=%s file_sid=%s",
+            context.session_id,
+            context.config.get("execution_id"),
+            context.config.get("child_index"),
+            context.config.get("file_sid"),
         )
         return False
 
@@ -760,8 +863,12 @@ def _run_cover_node(cover: CoverNode, context: WorkflowContext) -> bool:
         return bool(context.get_asset("cover_path"))
     except Exception:
         logger.exception(
-            "[_run_cover_node] CoverNode 异常（不阻断主流程） session_id=%s",
+            "[_run_cover_node] CoverNode 异常（不阻断主流程） task_id=%s "
+            "execution_id=%s child_index=%s file_sid=%s",
             context.session_id,
+            context.config.get("execution_id"),
+            context.config.get("child_index"),
+            context.config.get("file_sid"),
         )
         return False
 
@@ -868,7 +975,8 @@ def enhance_prompt_endpoint(body: EnhancePromptRequest) -> dict[str, str]:
         "3. **后台渲染**：通过 `BackgroundTasks` 异步触发 FFmpegCompositorNode\n\n"
         "接口立即返回 **202 Accepted**，响应体包含：\n"
         "- 完整的 `CompilationPlan` 蓝图（供前端核对寻址结果）\n"
-        "- `task_id`：渲染任务 UUID，同步作为 WS `taskId` 和输出文件名后缀\n"
+        "- `task_id`：submitted task / batch UUID，同步作为 WS `taskId`\n"
+        "- 每个 child 使用内部 `execution_id`，并以其派生的 `file_sid` 作为输出文件名后缀\n"
         "- `render_status: \"rendering\"`\n\n"
         "渲染进度通过 **WebSocket 事件总线**（`WS_UPDATE`）实时推送。\n\n"
         "**容错策略**：若所有 Beat 均寻址失败，返回 `422` 并给出具体原因，"
@@ -993,15 +1101,21 @@ def submit_dsl(
             **_worker_kw,
         )
     else:
+        child_execution = _create_child_executions(task_id, 1)[0]
         background_tasks.add_task(
             render_worker,
             None,
             task_id,
             payload.aspect_ratio, payload.target_duration, payload.tenant_id,
             payload.prompt, 1, payload.test_language,
-            None,
+            child_execution.file_sid,
             False,
-            **{**_worker_kw, "dsl_payload": dsl_payload_for_worker},
+            **{
+                **_worker_kw,
+                "dsl_payload": dsl_payload_for_worker,
+                "execution_id": child_execution.execution_id,
+                "child_index": child_execution.child_index,
+            },
         )
 
     logger.info(
@@ -1107,16 +1221,19 @@ def submit_manual(
             **{**worker_kwargs, "resolved_plan": plan},
         )
     else:
+        child_execution = _create_child_executions(task_id, 1)[0]
         background_tasks.add_task(
             render_worker,
             plan,
             task_id,
             payload.aspect_ratio, payload.target_duration, payload.tenant_id,
             None, 1, payload.test_language,
-            None,
+            child_execution.file_sid,
             False,
             **worker_kwargs,
             dsl_payload=dsl_payload,
+            execution_id=child_execution.execution_id,
+            child_index=child_execution.child_index,
         )
 
     logger.info(
@@ -1246,15 +1363,21 @@ def render_dsl(
             **_worker_kw,
         )
     else:
+        child_execution = _create_child_executions(task_id, 1)[0]
         background_tasks.add_task(
             render_worker,
             None,
             task_id,
             payload.aspect_ratio, payload.target_duration, payload.tenant_id,
             payload.prompt, 1, payload.test_language,
-            None,
+            child_execution.file_sid,
             False,
-            **{**_worker_kw, "dsl_payload": dsl_payload_for_worker},
+            **{
+                **_worker_kw,
+                "dsl_payload": dsl_payload_for_worker,
+                "execution_id": child_execution.execution_id,
+                "child_index": child_execution.child_index,
+            },
         )
 
     logger.info(

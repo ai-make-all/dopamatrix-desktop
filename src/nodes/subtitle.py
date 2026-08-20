@@ -37,6 +37,30 @@ from src.core.context import WorkflowContext
 from src.core.logger import logger
 
 
+def _resolve_execution_namespace(context: WorkflowContext) -> str:
+    """Return the child namespace, retaining only the legacy direct-call fallback."""
+    execution_id = context.config.get("execution_id")
+    if execution_id:
+        return str(execution_id)
+
+    # New API child contexts carry child_index/file_sid and may not fall back
+    # to their shared task_id for a writable subtitle path.
+    if "child_index" in context.config or "file_sid" in context.config:
+        raise RuntimeError("[SubtitleNode] child context is missing execution_id")
+
+    # LEGACY DIRECT-CALL FALLBACK: older factory pipelines use a per-run
+    # context.session_id but do not yet populate config["execution_id"].
+    legacy_id = (
+        getattr(context, "session_id", None)
+        or context.config.get("session_id")
+        or "default"
+    )
+    logger.warning(
+        f"[SubtitleNode] execution_id missing; using legacy direct-call namespace={legacy_id}"
+    )
+    return str(legacy_id)
+
+
 class SubtitleNode(BaseNode):
     """
     多语言字幕生成节点（精准重构版）。
@@ -394,8 +418,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         target_lang = getattr(context, "test_language", "en") or "en"
         self.log(f"[Test-First] 字幕仅生成语言 '{target_lang}'")
 
-        session_id = getattr(context, "session_id", context.config.get("session_id", "default"))
-        ass_path = str(output_dir / f"sub_{session_id}_{target_lang}.ass")
         vtt_path: str = (context.variants.get(target_lang) or {}).get("vtt_path", "")
 
         # ── 精准模式：VTT → 聚合短句 → 多行 Dialogue ─────────────────
@@ -403,6 +425,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.log(f"[{target_lang}] 精准模式: 解析 VTT '{vtt_path}'")
             cues = self._parse_vtt(vtt_path)
             if cues:
+                execution_id = _resolve_execution_namespace(context)
+                ass_path = str(output_dir / f"sub_{execution_id}_{target_lang}.ass")
+                self.log(
+                    f"[{target_lang}] task_id={context.session_id} "
+                    f"execution_id={execution_id} "
+                    f"child_index={context.config.get('child_index')} "
+                    f"file_sid={context.config.get('file_sid')} ASS={ass_path}"
+                )
                 chunks = self._chunk_cues(cues, max_chars=25)
                 ass_content = self._build_ass_from_cues(
                     cues=chunks, lang=target_lang,
@@ -430,6 +460,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.log(f"[{target_lang}] 无可用文本，跳过字幕生成。")
             return context
 
+        execution_id = _resolve_execution_namespace(context)
+        ass_path = str(output_dir / f"sub_{execution_id}_{target_lang}.ass")
+        self.log(
+            f"[{target_lang}] task_id={context.session_id} execution_id={execution_id} "
+            f"child_index={context.config.get('child_index')} "
+            f"file_sid={context.config.get('file_sid')} ASS={ass_path}"
+        )
         t_start = float(context.config.get("subtitle_start", 0.0))
         t_end   = float(context.config.get("subtitle_end",   5.0))
         self.log(f"[{target_lang}] 降级模式: 单 Dialogue ({t_start:.1f}s → {t_end:.1f}s)")

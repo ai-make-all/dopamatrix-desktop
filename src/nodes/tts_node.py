@@ -39,6 +39,31 @@ VOICE_MAP: Dict[str, str] = {
 }
 
 
+def _resolve_execution_namespace(context: WorkflowContext) -> str:
+    """Return the authoritative child namespace, with a legacy direct-call fallback."""
+    execution_id = context.config.get("execution_id")
+    if execution_id:
+        return str(execution_id)
+
+    # A context carrying any new child marker belongs to the execution
+    # contract and must never fall back to the shared task_id namespace.
+    if "child_index" in context.config or "file_sid" in context.config:
+        raise RuntimeError("[TTSNode] child context is missing execution_id")
+
+    # LEGACY DIRECT-CALL FALLBACK: run_factory/run_matrix_factory contexts do
+    # not yet carry execution_id. Their context.session_id remains their
+    # historical per-run namespace.
+    legacy_id = (
+        getattr(context, "session_id", None)
+        or context.config.get("session_id")
+        or "default"
+    )
+    logger.warning(
+        f"[TTSNode] execution_id missing; using legacy direct-call namespace={legacy_id}"
+    )
+    return str(legacy_id)
+
+
 class TTSNode(BaseNode):
     """
     多语言文字转语音节点（单轨线性架构，Phase 9.11.2）。
@@ -185,13 +210,15 @@ class TTSNode(BaseNode):
             )
             return context
 
-        session_id = getattr(context, "session_id", context.config.get("session_id", "default"))
-        output_path = self._output_dir / f"voice_{session_id}_{target_lang}.mp3"
-        vtt_path    = self._output_dir / f"voice_{session_id}_{target_lang}.vtt"
+        execution_id = _resolve_execution_namespace(context)
+        output_path = self._output_dir / f"voice_{execution_id}_{target_lang}.mp3"
+        vtt_path    = self._output_dir / f"voice_{execution_id}_{target_lang}.vtt"
 
         self.log(
-            f"[{target_lang}] voice={voice} | "
-            f"text_length={len(text)} chars → {output_path}"
+            f"[{target_lang}] task_id={context.session_id} execution_id={execution_id} "
+            f"child_index={context.config.get('child_index')} "
+            f"file_sid={context.config.get('file_sid')} voice={voice} | "
+            f"text_length={len(text)} chars → MP3={output_path} VTT={vtt_path}"
         )
 
         max_retries = 3
