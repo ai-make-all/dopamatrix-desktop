@@ -108,6 +108,8 @@ function extractHardTags(rawText) {
 // ── Omnibox form state ──────────────────────────────────────────────────────
 const omniPrompt      = ref('')
 const scriptMode      = ref('auto')
+const LEGACY_VARIANT_PLANNING_POLICY = 'legacy'
+const EXACT_MAIN_VISUAL_PLANNING_POLICY = 'exact_main_visual'
 const omniPlaceholder = computed(() =>
   scriptMode.value === 'rewrite'
     ? '粘贴您的核心营销文案全文。AI 将在保持卖点绝对不变的前提下，为您裂变出 N 个语气不同的变体文案，完美规避 TikTok 音频查重...'
@@ -174,8 +176,23 @@ const draftMeta = ref(null)
 
 // ── 抽屉控制 ────────────────────────────────────────────────────────────────
 const showOrchestrator = ref(false)
+const orchestratorDirectRender = ref(false)
+const orchestratorVariantPlanningPolicy = ref(LEGACY_VARIANT_PLANNING_POLICY)
 
-function onOrchestratorConfirm({ tracks, template, directRender, params, meta }) {
+function openManualOrchestrator() {
+  orchestratorDirectRender.value = false
+  orchestratorVariantPlanningPolicy.value = LEGACY_VARIANT_PLANNING_POLICY
+  showOrchestrator.value = true
+}
+
+function onOrchestratorConfirm({
+  tracks,
+  template,
+  directRender,
+  params,
+  meta,
+  variantPlanningPolicy = LEGACY_VARIANT_PLANNING_POLICY,
+}) {
   dslTracks.value = tracks
   currentTemplate.value = template
   draftMeta.value = meta ?? draftMeta.value
@@ -191,7 +208,11 @@ function onOrchestratorConfirm({ tracks, template, directRender, params, meta })
 
   if (directRender) {
     import('vue').then(({ nextTick }) => {
-      nextTick(() => { blindFission() })
+      nextTick(() => {
+        blindFission({
+          variantPlanningPolicy,
+        })
+      })
     })
   }
 }
@@ -315,6 +336,8 @@ async function draftBlueprint() {
     applyBlueprintTimelineToTracks(data.timeline)
     // 等待 Vue 完成本轮响应式更新，确保抽屉 watch 读到已含 items 的 dslTracks
     await nextTick()
+    orchestratorDirectRender.value = true
+    orchestratorVariantPlanningPolicy.value = EXACT_MAIN_VISUAL_PLANNING_POLICY
     showOrchestrator.value = true
     store.showToast('✨ 蓝图已生成，请在战术板验收语义标签')
   } catch (err) {
@@ -356,7 +379,9 @@ function buildTimelineFromTracks() {
 }
 
 /** 极速裂变：timeline 为空 + 有 prompt → 后端盲裂变；战术板有装填 → 完整 timeline + script_text */
-async function blindFission() {
+async function blindFission(options = {}) {
+  const variantPlanningPolicy = options.variantPlanningPolicy
+    ?? LEGACY_VARIANT_PLANNING_POLICY
   const rawPrompt = omniPrompt.value.trim()
   const hasPrompt = rawPrompt.length > 0
   const hasBlocks = dslTracks.value.some(t => t.items.length > 0)
@@ -393,6 +418,7 @@ async function blindFission() {
       test_language:    testLanguage.value,
       tenant_id:        store.loggedInUser || 'default',
       mode:             scriptMode.value,
+      variant_planning_policy: variantPlanningPolicy,
       user_hard_tags:   hardTags,
       meta:             draftMeta.value,
       enable_tts:       enableTts.value,
@@ -489,7 +515,7 @@ async function blindFission() {
             @input="handleInput"
             @keyup="handleInput"
             @click="handleInput"
-            @keydown.enter.ctrl.prevent="blindFission"
+            @keydown.enter.ctrl.prevent="blindFission()"
             :placeholder="omniPlaceholder"
             class="omni-textarea"
             rows="2"
@@ -512,7 +538,7 @@ async function blindFission() {
               type="button"
               class="ammo-load-btn ghost-btn"
               title="打开手动战术板"
-              @click="showOrchestrator = true"
+              @click="openManualOrchestrator"
             >
               <span class="ammo-icon">🛠️</span>
               <span v-if="stagedBlockCount > 0" class="ammo-badge">{{ stagedBlockCount }}</span>
@@ -604,7 +630,7 @@ async function blindFission() {
               class="fission-btn"
               :class="{ 'fission-btn--locked': lockedAssetHashes.length > 0 }"
               :disabled="!canFission"
-              @click="blindFission"
+              @click="blindFission()"
             >
               {{
                 isSubmitting
@@ -635,6 +661,8 @@ async function blindFission() {
       :default-enable-tts="enableTts"
       :default-enable-subtitles="enableSubtitles"
       :tenant-id="store.loggedInUser || 'default'"
+      :direct-render="orchestratorDirectRender"
+      :variant-planning-policy="orchestratorVariantPlanningPolicy"
       @confirm="onOrchestratorConfirm"
     />
 

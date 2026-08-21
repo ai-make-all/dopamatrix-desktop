@@ -25,6 +25,8 @@ const props = defineProps({
   defaultEnableTts:       { type: Boolean,  default: true },
   defaultEnableSubtitles: { type: Boolean,  default: true },
   tenantId:               { type: String,   default: 'default' },
+  directRender:           { type: Boolean,  default: false },
+  variantPlanningPolicy:  { type: String,   default: 'legacy' },
 })
 
 const emit = defineEmits(['update:modelValue', 'confirm'])
@@ -361,10 +363,6 @@ const totalStaged = computed(() =>
   localTracks.value.reduce((s, t) => s + t.items.length, 0)
 )
 
-const isAiDraftMode = computed(() =>
-  initialTracksCache.value.some(t => t.items.length > 0)
-)
-
 function buildMasterTrackPlan() {
   const masterItem = masterDropList.value[0] ?? null
   return masterItem ? {
@@ -424,12 +422,13 @@ function buildTimelineFromLocalTracks() {
 async function submitRenderTask() {
   if (isRenderSubmitting.value) return
 
-  if (isAiDraftMode.value) {
+  if (props.directRender) {
     emit('confirm', {
       tracks:       JSON.parse(JSON.stringify(localTracks.value)),
       template:     localTemplate.value,
       master_track: buildMasterTrackPlan(),
-      directRender: true,
+      directRender: props.directRender,
+      variantPlanningPolicy: props.variantPlanningPolicy,
       params: { ...localParams },
       meta: localMeta.value,
     })
@@ -467,6 +466,7 @@ async function submitRenderTask() {
       template:     localTemplate.value,
       master_track: buildMasterTrackPlan(),
       directRender: false,
+      variantPlanningPolicy: 'legacy',
       params: { ...localParams },
       meta: localMeta.value,
     })

@@ -126,6 +126,50 @@ def _is_blind_fission(payload: RenderDSLRequest) -> bool:
     )
 
 
+def _requests_exact_main_visual(payload: RenderDSLRequest) -> bool:
+    """Return the explicit request policy; never infer it from mode or timeline."""
+    return payload.variant_planning_policy == "exact_main_visual"
+
+
+def _guard_pre_planner_policy(
+    payload: RenderDSLRequest,
+    *,
+    flow: str,
+    is_blind: bool = False,
+) -> None:
+    """Reject exact planning until its implementation is available.
+
+    Phase 3A-0 only establishes intent plumbing.  Falling through to the
+    legacy resolver would falsely claim an exact-diversity guarantee.
+    """
+    if not _requests_exact_main_visual(payload):
+        return
+    if is_blind:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "EXACT_MAIN_VISUAL_UNSUPPORTED_FOR_BLIND: "
+                "Blind planning is not implemented in INV-001 Phase 3A."
+            ),
+        )
+    if flow == "submit_dsl":
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "EXACT_MAIN_VISUAL_PLANNER_NOT_IMPLEMENTED: "
+                "The planning policy was recognized, but the planner core "
+                "is not available until INV-001 Phase 3A."
+            ),
+        )
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            f"EXACT_MAIN_VISUAL_UNSUPPORTED_FOR_{flow.upper().replace('-', '_')}: "
+            "this endpoint preserves its legacy planning semantics."
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class _ChildExecution:
     """Internal identity envelope for one submitted render execution."""
@@ -1110,6 +1154,11 @@ def submit_dsl(
       8. WS 事件总线推送 running / progress / completed / failed
     """
     is_blind = _is_blind_fission(payload)
+    _guard_pre_planner_policy(
+        payload,
+        flow="submit_dsl",
+        is_blind=is_blind,
+    )
 
     logger.info(
         "[routes_dsl] submit-dsl 请求 engine=%s beats=%d blind=%s aspect=%s duration=%ds",
@@ -1250,6 +1299,7 @@ def submit_manual(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> DSLSubmitResponse:
+    _guard_pre_planner_policy(payload, flow="submit_manual")
     logger.info(
         "[routes_dsl] submit-manual request engine=%s beats=%d aspect=%s duration=%ds",
         payload.engine_type,
@@ -1349,6 +1399,11 @@ def render_dsl(
     Story DSL 纯渲染触发端点（共用 render_worker，与 submit-dsl 渲染逻辑一致）。
     """
     is_blind = _is_blind_fission(payload)
+    _guard_pre_planner_policy(
+        payload,
+        flow="render_dsl",
+        is_blind=is_blind,
+    )
 
     logger.info(
         "[routes_dsl] render-dsl 请求 engine=%s beats=%d blind=%s aspect=%s duration=%ds",

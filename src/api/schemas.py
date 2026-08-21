@@ -399,6 +399,13 @@ class RenderDSLRequest(BaseModel):
         default="auto",
         description="导演节点模式：'auto' | 'rewrite'，透传 DirectorNode / draft-blueprint。",
     )
+    variant_planning_policy: Literal["legacy", "exact_main_visual"] = Field(
+        default="legacy",
+        description=(
+            "批次变体规划策略。legacy 保持既有 worker-local resolution；"
+            "exact_main_visual 请求精确主视觉组合唯一性规划。"
+        ),
+    )
     user_hard_tags:  List[str]        = Field(
         default_factory=list,
         description="前端剥离的硬约束标签，透传至 DSLParserNode 寻址引擎做一票否决过滤。",
