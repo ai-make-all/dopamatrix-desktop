@@ -72,11 +72,11 @@ def _request(*, task_id: str, timeline: list[DSLBeatNode]) -> RenderDSLRequest:
     )
 
 
-def _scheduled_worker_arguments(background_tasks: BackgroundTasks) -> dict:
+def _scheduled_coordinator_arguments(background_tasks: BackgroundTasks) -> dict:
     assert len(background_tasks.tasks) == 1
     scheduled = background_tasks.tasks[0]
-    assert scheduled.func is routes_dsl.render_worker
-    bound = inspect.signature(routes_dsl.render_worker).bind_partial(
+    assert scheduled.func is routes_dsl.render_batch_worker
+    bound = inspect.signature(routes_dsl.render_batch_worker).bind_partial(
         *scheduled.args,
         **scheduled.kwargs,
     )
@@ -123,7 +123,7 @@ class ChildIdentityTests(unittest.TestCase):
             ["aaaaaaaa", "bbbbbbbb"],
         )
 
-    def test_single_submit_paths_bind_new_child_identity_each_time(self):
+    def test_single_submit_paths_use_coordinator_and_create_new_child_identity(self):
         task_id = "shared-ui-task"
         beat = DSLBeatNode(
             beat="Hook",
@@ -150,12 +150,60 @@ class ChildIdentityTests(unittest.TestCase):
                 with self.subTest(path=label):
                     background = BackgroundTasks()
                     endpoint(payload, background, db=object())
-                    arguments = _scheduled_worker_arguments(background)
-                    execution_id = arguments["execution_id"]
-                    file_sid = arguments["file_sid"]
+                    arguments = _scheduled_coordinator_arguments(background)
+                    captured: list[dict] = []
+
+                    def fake_render_worker(
+                        _plan,
+                        received_task_id,
+                        _aspect_ratio,
+                        _target_duration,
+                        _tenant_id,
+                        _prompt,
+                        _batch_size,
+                        _test_language,
+                        file_sid,
+                        **kwargs,
+                    ):
+                        captured.append(
+                            {
+                                "task_id": received_task_id,
+                                "execution_id": kwargs["execution_id"],
+                                "file_sid": file_sid,
+                                "child_index": kwargs["child_index"],
+                            }
+                        )
+                        return routes_dsl._ChildResult(
+                            child_index=kwargs["child_index"],
+                            execution_id=kwargs["execution_id"],
+                            file_sid=file_sid,
+                            outcome="succeeded",
+                            assets=[{"file_path": f"final_{file_sid}.mp4"}],
+                            elapsed=0.1,
+                            error_code=None,
+                            error_message=None,
+                            prompt_details={"meta": None, "timeline": []},
+                        )
+
+                    with (
+                        patch.object(routes_dsl, "render_worker", side_effect=fake_render_worker),
+                        patch.object(routes_dsl, "_persist_task_history"),
+                        patch.object(routes_dsl.ws_manager, "broadcast_sync"),
+                    ):
+                        background.tasks[0].func(
+                            *background.tasks[0].args,
+                            **background.tasks[0].kwargs,
+                        )
+
+                    self.assertEqual(len(captured), 1)
+                    child = captured[0]
+                    execution_id = child["execution_id"]
+                    file_sid = child["file_sid"]
 
                     self.assertEqual(arguments["task_id"], task_id)
-                    self.assertEqual(arguments["child_index"], 0)
+                    self.assertEqual(arguments["batch_size"], 1)
+                    self.assertEqual(child["task_id"], task_id)
+                    self.assertEqual(child["child_index"], 0)
                     self.assertNotEqual(execution_id, task_id)
                     self.assertEqual(file_sid, uuid.UUID(execution_id).hex[:8])
                     execution_ids.append(execution_id)
@@ -177,7 +225,6 @@ class ChildIdentityTests(unittest.TestCase):
             batch_size,
             test_language,
             file_sid,
-            suppress_completed_ws,
             **kwargs,
         ):
             with calls_lock:
@@ -187,12 +234,21 @@ class ChildIdentityTests(unittest.TestCase):
                         "execution_id": kwargs["execution_id"],
                         "child_index": kwargs["child_index"],
                         "file_sid": file_sid,
-                        "suppress_completed_ws": suppress_completed_ws,
                         "enable_tts": kwargs["enable_tts"],
                         "enable_subtitles": kwargs["enable_subtitles"],
                     }
                 )
-            return []
+            return routes_dsl._ChildResult(
+                child_index=kwargs["child_index"],
+                execution_id=kwargs["execution_id"],
+                file_sid=file_sid,
+                outcome="failed",
+                assets=[],
+                elapsed=0.1,
+                error_code="TEST_NO_OUTPUT",
+                error_message="test",
+                prompt_details={"meta": None, "timeline": []},
+            )
 
         with (
             patch.object(routes_dsl, "render_worker", side_effect=fake_render_worker),
@@ -211,7 +267,6 @@ class ChildIdentityTests(unittest.TestCase):
         self.assertEqual({call["child_index"] for call in calls}, {0, 1, 2, 3})
         self.assertEqual(len({call["execution_id"] for call in calls}), 4)
         self.assertEqual(len({call["file_sid"] for call in calls}), 4)
-        self.assertTrue(all(call["suppress_completed_ws"] for call in calls))
         self.assertTrue(all(not call["enable_tts"] for call in calls))
         self.assertTrue(all(not call["enable_subtitles"] for call in calls))
         for call in calls:
@@ -254,6 +309,7 @@ class WorkerContextTests(unittest.TestCase):
         self.assertEqual(context.config["execution_id"], child.execution_id)
         self.assertEqual(context.config["file_sid"], child.file_sid)
         self.assertEqual(context.config["child_index"], 0)
+        self.assertTrue(context.config["ws_terminal_managed_by_coordinator"])
         self.assertNotIn("session_id", context.config)
 
     def test_disabled_tts_and_subtitle_nodes_are_not_invoked(self):

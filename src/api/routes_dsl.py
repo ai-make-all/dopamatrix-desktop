@@ -135,6 +135,25 @@ class _ChildExecution:
     file_sid: str
 
 
+@dataclass(frozen=True)
+class _ChildResult:
+    """Internal result envelope returned by one child render execution."""
+
+    child_index: int
+    execution_id: str
+    file_sid: str
+    outcome: str
+    assets: list[dict]
+    elapsed: float
+    error_code: Optional[str]
+    error_message: Optional[str]
+    prompt_details: dict[str, Any]
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome == "succeeded" and bool(self.assets)
+
+
 def _create_child_executions(task_id: str, child_count: int) -> list[_ChildExecution]:
     """Create child identities while keeping ``task_id`` as the batch identity."""
     if child_count < 1:
@@ -195,6 +214,24 @@ def _validate_child_execution(
     return expected_file_sid
 
 
+def _child_prompt_details(
+    dsl_payload: Optional[StoryDSLPayload],
+    working_plan: Optional[CompilationPlan],
+) -> dict[str, Any]:
+    """Capture the legacy history fields from execution-local worker state."""
+    meta: Optional[dict[str, Any]] = None
+    if dsl_payload is not None and dsl_payload.meta is not None:
+        meta = dsl_payload.meta.model_dump()
+
+    return {
+        "meta": meta,
+        "timeline": [
+            beat.model_dump()
+            for beat in (working_plan.beats if working_plan is not None else [])
+        ],
+    }
+
+
 # ================================================================== #
 # 后台渲染 Worker  (Phase 5.2)                                        #
 # ================================================================== #
@@ -209,7 +246,6 @@ def render_worker(
     batch_size: int = 1,
     test_language: str = "en",
     file_sid: Optional[str] = None,
-    suppress_completed_ws: bool = False,
     *,
     execution_id: str,
     child_index: int,
@@ -219,7 +255,7 @@ def render_worker(
     dsl_payload: Optional[StoryDSLPayload] = None,
     enable_tts: bool = True,
     enable_subtitles: bool = True,
-) -> list[dict]:
+) -> _ChildResult:
     """
     后台渲染主 Worker（Phase 9.11.2 单轨线性架构）。
 
@@ -250,16 +286,32 @@ def render_worker(
 
     collected_assets: list[dict] = []
     _start_time: float = time.time()
+    working_plan: Optional[CompilationPlan] = plan
+
+    def _result(
+        outcome: str,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> _ChildResult:
+        return _ChildResult(
+            child_index=child_index,
+            execution_id=execution_id,
+            file_sid=resolved_file_sid,
+            outcome=outcome,
+            assets=[dict(asset) for asset in collected_assets],
+            elapsed=round(time.time() - _start_time, 3),
+            error_code=error_code,
+            error_message=(error_message[:500] if error_message else None),
+            prompt_details=_child_prompt_details(dsl_payload, working_plan),
+        )
 
     try:
-        working_plan: Optional[CompilationPlan] = plan
-
         if blind_dsl:
             if not prompt or not str(prompt).strip():
                 logger.error(
                     "[render_worker] blind_dsl 需要非空 prompt，task_id=%s", task_id,
                 )
-                return []
+                return _result("failed", "BLIND_PROMPT_MISSING", "blind_dsl requires prompt")
             langs = [test_language] if test_language else ["en"]
             director = DirectorNode()
 
@@ -299,7 +351,7 @@ def render_worker(
                 logger.error(
                     "[render_worker] task_id=%s blind_dsl 无有效 Beat，终止。", task_id,
                 )
-                return []
+                return _result("failed", "BLIND_TIMELINE_EMPTY", "blind_dsl produced no beats")
 
             dsl_payload = StoryDSLPayload(
                 engine_type=engine_type,
@@ -320,7 +372,7 @@ def render_worker(
                     task_id,
                     working_plan.unresolved_beats,
                 )
-                return []
+                return _result("failed", "PLAN_UNRESOLVED", "blind_dsl resolved no beats")
         else:
             if dsl_payload is not None:
                 # 动态运行时寻址：Worker 线程内独立重新执行资产抽卡，
@@ -336,7 +388,7 @@ def render_worker(
                     logger.error(
                         "[render_worker] task_id=%s 动态寻址无可渲染 Beat，终止。", task_id,
                     )
-                    return []
+                    return _result("failed", "PLAN_UNRESOLVED", "DSL resolved no beats")
             elif plan is not None:
                 working_plan = plan
             else:
@@ -344,7 +396,7 @@ def render_worker(
                     "[render_worker] task_id=%s 缺少 CompilationPlan 或 StoryDSLPayload（非 blind_dsl）",
                     task_id,
                 )
-                return []
+                return _result("failed", "PLAN_MISSING", "no CompilationPlan or DSL payload")
 
         # ── 1. CompilationPlan → Timeline ─────────────────────────────
         assert working_plan is not None, "working_plan must be resolved before this point"
@@ -357,21 +409,11 @@ def render_worker(
                 "[render_worker] task_id=%s Timeline 主视频轨为空，终止渲染。",
                 task_id,
             )
-            try:
-                ws_manager.broadcast_sync(
-                    {
-                        "type": "WS_UPDATE",
-                        "payload": {
-                            "taskId": task_id,
-                            "status": "failed",
-                            "error": "主视频轨为空：beat 无视频素材或 semantic_tags 未命中库内视频，请检查战术板装填。",
-                        },
-                    },
-                    user_id=tenant_id,
-                )
-            except Exception:
-                logger.warning("[render_worker] WS failed 广播异常 task_id=%s", task_id)
-            return []
+            return _result(
+                "failed",
+                "TIMELINE_EMPTY",
+                "main video timeline is empty",
+            )
 
         # ── 2. 初始化 WorkflowContext，将 Timeline 注入数据总线 ─────────
         context = WorkflowContext(
@@ -392,8 +434,9 @@ def render_worker(
         context.config["child_index"] = child_index
         context.config["enable_tts"] = enable_tts
         context.config["enable_subtitles"] = enable_subtitles
-        if suppress_completed_ws:
-            context.config["ws_suppress_completed"] = True
+        # render_worker is always a child execution.  The submitted-task
+        # terminal event belongs exclusively to render_batch_worker.
+        context.config["ws_terminal_managed_by_coordinator"] = True
         os.makedirs("output", exist_ok=True)
 
         # ── 4. 动态模态路由 ────────────────────────────────────────────
@@ -503,26 +546,11 @@ def render_worker(
                 "❌ 任务 %s 缺乏主视觉素材，触发安全熔断！引擎拦截渲染，不调用 FFmpeg。",
                 task_id,
             )
-            try:
-                ws_manager.broadcast_sync(
-                    {
-                        "type": "WS_UPDATE",
-                        "payload": {
-                            "taskId": task_id,
-                            "status": "failed",
-                            "error": (
-                                "严重缺料：未找到匹配的主视觉视频。"
-                                "请检查素材库标签覆盖，或向素材库添加「通用空镜」兜底素材。"
-                            ),
-                        },
-                    },
-                    user_id=tenant_id,
-                )
-            except Exception:
-                logger.warning(
-                    "[render_worker] 熔断 WS failed 广播异常 task_id=%s", task_id
-                )
-            return []
+            return _result(
+                "failed",
+                "MAIN_VISUAL_MISSING",
+                "no valid layer-0 main visual clips",
+            )
 
         # ── 5b. 引擎点火 ───────────────────────────────────────────────
         render_ok = _run_compositor(FFmpegCompositorNode(), context)
@@ -581,77 +609,7 @@ def render_worker(
                         **_social_fields,
                     })
 
-        # ── 6b. WS 最终 completed 推送（CoverNode 已执行完毕，封面路径已就绪）──
-        # suppress_completed_ws=True 时由 render_batch_worker 统一推送，此处跳过。
-        if render_ok and not suppress_completed_ws:
-            _ws_status = "completed" if collected_assets else "failed"
-            _ws_payload: dict = {
-                "taskId": task_id,
-                "status": _ws_status,
-                "generation_mode": director_mode,
-            }
-            if collected_assets:
-                _ws_payload["assets"] = collected_assets
-            try:
-                ws_manager.broadcast_sync(
-                    {"type": "WS_UPDATE", "payload": _ws_payload},
-                    user_id=tenant_id,
-                )
-                logger.info(
-                    "[render_worker] ✅ WS completed 推送完成 task_id=%s assets=%d cover=%s",
-                    task_id, len(collected_assets), bool(_cover_path),
-                )
-            except Exception as _ws_exc:
-                logger.warning(
-                    "[render_worker] WS completed 广播异常（不阻断主流程）: %r", _ws_exc
-                )
-
-        # ── 6c. 历史记录写入 TaskHistory ──────────────────────────────────
-        if render_ok and collected_assets:
-            try:
-                _elapsed = round(time.time() - _start_time, 1)
-                _prompt_details: dict[str, Any] = {
-                    "meta": (
-                        dsl_payload.meta.model_dump()
-                        if dsl_payload is not None and dsl_payload.meta is not None
-                        else None
-                    ),
-                    "timeline": [
-                        b.model_dump() for b in (working_plan.beats if working_plan else [])
-                    ],
-                }
-                _details_json: str = json.dumps(
-                    _prompt_details,
-                    ensure_ascii=False,
-                )
-                _history_prompt = prompt or ""
-                _history_record = TaskHistory(
-                    task_id=task_id,
-                    prompt=_history_prompt,
-                    batch_size=batch_size,
-                    duration=_elapsed,
-                    output_assets=collected_assets,
-                    prompt_details=_details_json,
-                    created_at=datetime.utcnow(),
-                )
-                _hist_engine = get_tenant_engine(tenant_id)
-                _HistSession = sessionmaker(
-                    autocommit=False, autoflush=False, bind=_hist_engine
-                )
-                with _HistSession() as _db:
-                    _db.add(_history_record)
-                    _db.commit()
-                logger.info(
-                    "[render_worker] ✅ 历史记录写入成功: task_id=%s duration=%.1fs",
-                    task_id, _elapsed,
-                )
-            except Exception as e:
-                logger.error(
-                    "[render_worker] ❌ 历史记录写入数据库失败: task_id=%s error=%s",
-                    task_id, str(e), exc_info=True,
-                )
-
-        # ── 6d. 疲劳值回写 ────────────────────────────────────────────────
+        # ── 6b. 疲劳值回写 ────────────────────────────────────────────────
         if render_ok and working_plan:
             try:
                 used_asset_ids: set[int] = set()
@@ -693,12 +651,19 @@ def render_worker(
                     "[render_worker] task_id=%s 疲劳值回写失败，请排查事务。", task_id
                 )
 
-    except Exception:
+        if render_ok and collected_assets:
+            return _result("succeeded")
+        if not render_ok:
+            return _result("failed", "RENDER_FAILED", "compositor did not complete")
+        return _result("failed", "NO_FINAL_OUTPUT", "render produced no final output")
+
+    except Exception as exc:
         logger.exception(
             "[render_worker] child 异常 task_id=%s execution_id=%s "
             "child_index=%d file_sid=%s",
             task_id, execution_id, child_index, resolved_file_sid,
         )
+        return _result("failed", "CHILD_EXCEPTION", str(exc))
     finally:
         logger.info(
             "[render_worker] child 结束 task_id=%s execution_id=%s "
@@ -707,7 +672,82 @@ def render_worker(
             len(collected_assets), time.time() - _start_time,
         )
 
-    return collected_assets
+
+def _failed_child_result(
+    child: _ChildExecution,
+    error_code: str,
+    error_message: str,
+    elapsed: float = 0.0,
+) -> _ChildResult:
+    return _ChildResult(
+        child_index=child.child_index,
+        execution_id=child.execution_id,
+        file_sid=child.file_sid,
+        outcome="failed",
+        assets=[],
+        elapsed=round(elapsed, 3),
+        error_code=error_code,
+        error_message=error_message[:500],
+        prompt_details={"meta": None, "timeline": []},
+    )
+
+
+def _persist_task_history(
+    *,
+    task_id: str,
+    tenant_id: str,
+    prompt: Optional[str],
+    batch_size: int,
+    elapsed: float,
+    child_results: list[_ChildResult],
+    output_assets: list[dict],
+    warning_codes: list[str],
+) -> None:
+    """Persist the single completed-result row owned by the coordinator."""
+    first_success = next(result for result in child_results if result.succeeded)
+    legacy_details = first_success.prompt_details
+    prompt_details: dict[str, Any] = {
+        "meta": legacy_details.get("meta"),
+        "timeline": legacy_details.get("timeline") or [],
+        "planning_summary": {
+            "requested_count": batch_size,
+            "planned_count": len(child_results),
+            "succeeded_count": sum(result.succeeded for result in child_results),
+            "failed_count": sum(not result.succeeded for result in child_results),
+            "warning_codes": list(warning_codes),
+        },
+        "children": [
+            {
+                "child_index": result.child_index,
+                "execution_id": result.execution_id,
+                "file_sid": result.file_sid,
+                "outcome": "succeeded" if result.succeeded else "failed",
+                "elapsed": result.elapsed,
+                "error_code": result.error_code,
+                "output_assets": [dict(asset) for asset in result.assets],
+                "timeline": result.prompt_details.get("timeline") or [],
+            }
+            for result in child_results
+        ],
+    }
+    history_record = TaskHistory(
+        task_id=task_id,
+        prompt=prompt or "",
+        batch_size=batch_size,
+        duration=round(elapsed, 1),
+        output_assets=output_assets,
+        prompt_details=json.dumps(prompt_details, ensure_ascii=False),
+        created_at=datetime.utcnow(),
+    )
+    history_engine = get_tenant_engine(tenant_id)
+    HistorySession = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=history_engine,
+    )
+    with HistorySession() as db:
+        db.add(history_record)
+        db.commit()
 
 
 def render_batch_worker(
@@ -726,36 +766,31 @@ def render_batch_worker(
     enable_tts: bool = True,
     enable_subtitles: bool = True,
     resolved_plan: Optional[CompilationPlan] = None,
-) -> None:
+) -> dict[str, Any]:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
 
-    在 ThreadPoolExecutor 内并行运行 `batch_size` 个 `render_worker` 子任务，
-    每个子任务分配唯一的 execution_id 和派生 file_sid，但全部共用同一 task_id 作为
-    WS 事件标识，使前端队列只产生一张卡片。
-
-    子任务均设置 suppress_completed_ws=True，不单独发送 completed 事件；
-    所有子任务完成后，本函数统一向 task_id 推送一次含全部资产的 completed 事件，
-    QueueView 的轮播逻辑随即展示 batch_size 个视频。
+    所有 batch size 都经过本 coordinator。每个 child 仅返回 execution-local
+    result；本函数稳定聚合、写入一条 TaskHistory，并发送唯一 terminal WS。
     """
+    batch_start = time.time()
     logger.info(
         "[render_batch_worker] 批量渲染启动 task_id=%s batch=%d",
         task_id, batch_size,
     )
 
     child_executions = _create_child_executions(task_id, batch_size)
-    all_assets: list[dict] = []
+    child_results: list[_ChildResult] = []
 
-    with ThreadPoolExecutor(max_workers=batch_size) as pool:
-        future_map = {
-            pool.submit(
-                render_worker,
+    def _execute_child(child: _ChildExecution) -> _ChildResult:
+        child_start = time.time()
+        try:
+            result = render_worker(
                 None if blind_dsl else resolved_plan,
                 task_id,
                 aspect_ratio, target_duration, tenant_id,
                 prompt, batch_size, test_language,
                 child.file_sid,
-                True,  # suppress_completed_ws
                 execution_id=child.execution_id,
                 child_index=child.child_index,
                 blind_dsl=blind_dsl,
@@ -764,60 +799,131 @@ def render_batch_worker(
                 dsl_payload=None if blind_dsl else dsl_payload,
                 enable_tts=enable_tts,
                 enable_subtitles=enable_subtitles,
-            ): child
-            for child in child_executions
-        }
+            )
+            if not isinstance(result, _ChildResult):
+                raise TypeError("render_worker must return _ChildResult")
+            if (
+                result.child_index != child.child_index
+                or result.execution_id != child.execution_id
+                or result.file_sid != child.file_sid
+            ):
+                raise ValueError("render_worker returned mismatched child identity")
+            return result
+        except Exception as exc:
+            logger.exception(
+                "[render_batch_worker] child 异常 task_id=%s execution_id=%s "
+                "child_index=%d file_sid=%s",
+                task_id, child.execution_id, child.child_index, child.file_sid,
+            )
+            return _failed_child_result(
+                child,
+                "CHILD_EXCEPTION",
+                str(exc),
+                time.time() - child_start,
+            )
 
-        for future in as_completed(future_map):
-            child = future_map[future]
-            try:
-                assets = future.result()
-                if assets:
-                    all_assets.extend(assets)
-                    logger.info(
-                        "[render_batch_worker] child 完成 task_id=%s execution_id=%s "
-                        "child_index=%d file_sid=%s assets=%d",
-                        task_id, child.execution_id, child.child_index,
-                        child.file_sid, len(assets),
-                    )
-                else:
-                    logger.warning(
-                        "[render_batch_worker] child 无产出 task_id=%s execution_id=%s "
+    if batch_size == 1:
+        child_results.append(_execute_child(child_executions[0]))
+    else:
+        with ThreadPoolExecutor(max_workers=batch_size) as pool:
+            future_map = {
+                pool.submit(_execute_child, child): child
+                for child in child_executions
+            }
+            for future in as_completed(future_map):
+                child = future_map[future]
+                try:
+                    child_results.append(future.result())
+                except Exception as exc:
+                    logger.exception(
+                        "[render_batch_worker] future 收口异常 task_id=%s execution_id=%s "
                         "child_index=%d file_sid=%s",
-                        task_id, child.execution_id, child.child_index,
-                        child.file_sid,
+                        task_id, child.execution_id, child.child_index, child.file_sid,
                     )
-            except Exception:
-                logger.exception(
-                    "[render_batch_worker] child 异常 task_id=%s execution_id=%s "
-                    "child_index=%d file_sid=%s",
-                    task_id, child.execution_id, child.child_index,
-                    child.file_sid,
-                )
+                    child_results.append(
+                        _failed_child_result(child, "CHILD_FUTURE_FAILED", str(exc))
+                    )
 
-    # 所有子任务完成 → 推送一次 completed 事件，携带全部资产
-    final_status = "completed" if all_assets else "failed"
+    child_results.sort(key=lambda result: result.child_index)
+    for result in child_results:
+        log_method = logger.info if result.succeeded else logger.warning
+        log_method(
+            "[render_batch_worker] child 收口 task_id=%s execution_id=%s "
+            "child_index=%d file_sid=%s outcome=%s assets=%d error_code=%s",
+            task_id, result.execution_id, result.child_index, result.file_sid,
+            "succeeded" if result.succeeded else "failed",
+            len(result.assets), result.error_code,
+        )
+    successful_results = [result for result in child_results if result.succeeded]
+    all_assets = [
+        dict(asset)
+        for result in successful_results
+        for asset in result.assets
+    ]
+    succeeded_count = len(successful_results)
+    failed_count = len(child_results) - succeeded_count
+    partial = 0 < succeeded_count < len(child_results)
+    warning_codes = ["CHILD_EXECUTION_FAILED"] if failed_count else []
+
+    history_persisted = False
+    elapsed = time.time() - batch_start
+    if succeeded_count:
+        try:
+            _persist_task_history(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                prompt=prompt,
+                batch_size=batch_size,
+                elapsed=elapsed,
+                child_results=child_results,
+                output_assets=all_assets,
+                warning_codes=warning_codes,
+            )
+            history_persisted = True
+            logger.info(
+                "[render_batch_worker] 历史记录写入成功 task_id=%s outputs=%d",
+                task_id, len(all_assets),
+            )
+        except Exception:
+            warning_codes.append("HISTORY_PERSIST_FAILED")
+            logger.exception(
+                "[render_batch_worker] 历史记录写入失败 task_id=%s；保留渲染结果",
+                task_id,
+            )
+
+    final_status = "completed" if succeeded_count else "failed"
+    terminal_payload: dict[str, Any] = {
+        "taskId": task_id,
+        "status": final_status,
+        "generation_mode": director_mode,
+        "partial": partial,
+        "requestedCount": batch_size,
+        "plannedCount": len(child_results),
+        "succeededCount": succeeded_count,
+        "failedCount": failed_count,
+        "historyPersisted": history_persisted,
+        "warningCodes": warning_codes,
+    }
+    if all_assets:
+        terminal_payload["assets"] = all_assets
+
     try:
         ws_manager.broadcast_sync(
-            {
-                "type": "WS_UPDATE",
-                "payload": {
-                    "taskId": task_id,
-                    "status": final_status,
-                    "generation_mode": director_mode,
-                    **({"assets": all_assets} if all_assets else {}),
-                },
-            },
+            {"type": "WS_UPDATE", "payload": terminal_payload},
             user_id=tenant_id,
         )
         logger.info(
-            "[render_batch_worker] task_id=%s %s，共 %d 个资产。",
-            task_id, final_status, len(all_assets),
+            "[render_batch_worker] task_id=%s status=%s partial=%s "
+            "succeeded=%d failed=%d assets=%d history_persisted=%s",
+            task_id, final_status, partial, succeeded_count, failed_count,
+            len(all_assets), history_persisted,
         )
     except Exception:
         logger.exception(
             "[render_batch_worker] WS 广播失败 task_id=%s", task_id,
         )
+
+    return terminal_payload
 
 
 def _run_compositor(
@@ -1091,32 +1197,14 @@ def submit_dsl(
         "enable_subtitles": payload.enable_subtitles,
     }
 
-    if batch_size > 1:
-        background_tasks.add_task(
-            render_batch_worker,
-            dsl_payload_for_worker,
-            task_id,
-            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
-            payload.prompt, batch_size, payload.test_language,
-            **_worker_kw,
-        )
-    else:
-        child_execution = _create_child_executions(task_id, 1)[0]
-        background_tasks.add_task(
-            render_worker,
-            None,
-            task_id,
-            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
-            payload.prompt, 1, payload.test_language,
-            child_execution.file_sid,
-            False,
-            **{
-                **_worker_kw,
-                "dsl_payload": dsl_payload_for_worker,
-                "execution_id": child_execution.execution_id,
-                "child_index": child_execution.child_index,
-            },
-        )
+    background_tasks.add_task(
+        render_batch_worker,
+        dsl_payload_for_worker,
+        task_id,
+        payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+        payload.prompt, batch_size, payload.test_language,
+        **_worker_kw,
+    )
 
     logger.info(
         "[routes_dsl] 渲染任务已下发 task_id=%s batch=%d blind=%s resolved=%d/%d",
@@ -1211,30 +1299,14 @@ def submit_manual(
         "enable_subtitles": payload.enable_subtitles,
     }
 
-    if batch_size > 1:
-        background_tasks.add_task(
-            render_batch_worker,
-            dsl_payload,
-            task_id,
-            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
-            None, batch_size, payload.test_language,
-            **{**worker_kwargs, "resolved_plan": plan},
-        )
-    else:
-        child_execution = _create_child_executions(task_id, 1)[0]
-        background_tasks.add_task(
-            render_worker,
-            plan,
-            task_id,
-            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
-            None, 1, payload.test_language,
-            child_execution.file_sid,
-            False,
-            **worker_kwargs,
-            dsl_payload=dsl_payload,
-            execution_id=child_execution.execution_id,
-            child_index=child_execution.child_index,
-        )
+    background_tasks.add_task(
+        render_batch_worker,
+        dsl_payload,
+        task_id,
+        payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+        None, batch_size, payload.test_language,
+        **{**worker_kwargs, "resolved_plan": plan},
+    )
 
     logger.info(
         "[routes_dsl] submit-manual dispatched task_id=%s batch=%d resolved=%d/%d",
@@ -1353,32 +1425,14 @@ def render_dsl(
         "enable_subtitles": payload.enable_subtitles,
     }
 
-    if batch_size > 1:
-        background_tasks.add_task(
-            render_batch_worker,
-            dsl_payload_for_worker,
-            task_id,
-            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
-            payload.prompt, batch_size, payload.test_language,
-            **_worker_kw,
-        )
-    else:
-        child_execution = _create_child_executions(task_id, 1)[0]
-        background_tasks.add_task(
-            render_worker,
-            None,
-            task_id,
-            payload.aspect_ratio, payload.target_duration, payload.tenant_id,
-            payload.prompt, 1, payload.test_language,
-            child_execution.file_sid,
-            False,
-            **{
-                **_worker_kw,
-                "dsl_payload": dsl_payload_for_worker,
-                "execution_id": child_execution.execution_id,
-                "child_index": child_execution.child_index,
-            },
-        )
+    background_tasks.add_task(
+        render_batch_worker,
+        dsl_payload_for_worker,
+        task_id,
+        payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+        payload.prompt, batch_size, payload.test_language,
+        **_worker_kw,
+    )
 
     logger.info(
         "[routes_dsl] render-dsl 渲染已下发 task_id=%s batch=%d blind=%s resolved=%d/%d",

@@ -135,6 +135,11 @@ class FFmpegCompositorNode(BaseNode):
         except Exception as exc:
             logger.warning("[FFmpegCompositorNode] WS 广播异常（不阻断渲染流程）: %r", exc)
 
+    @staticmethod
+    def _coordinator_owns_terminal(context: WorkflowContext) -> bool:
+        """True for routes_dsl children whose task terminal is finalized upstream."""
+        return context.config.get("ws_terminal_managed_by_coordinator") is True
+
     # ------------------------------------------------------------------
     # 核心编译器：Timeline → (input_args, video_filtergraph, audio_filtergraph)
     # ------------------------------------------------------------------
@@ -767,7 +772,7 @@ class FFmpegCompositorNode(BaseNode):
                 except ValueError:
                     continue
 
-                pct = min(int(elapsed_us * 100 / total_us), 99)  # 99 封顶；completed 由 render_worker 推送
+                pct = min(int(elapsed_us * 100 / total_us), 99)  # 99 封顶；completed 由 coordinator 推送
                 now = time.monotonic()
                 # 限速规则：两次广播间隔 ≥ 1s，或进度跳变 ≥ 5%（防止高频刷屏）
                 if now - _last_ws_time >= 1.0 or pct - _last_pct >= 5:
@@ -787,7 +792,8 @@ class FFmpegCompositorNode(BaseNode):
             self.log("[OK] FFmpeg master render completed successfully.")
 
         except FileNotFoundError:
-            self._ws_broadcast(task_id, user_id, {"status": "failed"})
+            if not self._coordinator_owns_terminal(context):
+                self._ws_broadcast(task_id, user_id, {"status": "failed"})
             self.log(
                 f"[ERROR] ffmpeg binary not found at '{ffmpeg_bin}'. "
                 "In production, ensure ffmpeg.exe is in the same directory as backend.exe. "
@@ -795,7 +801,8 @@ class FFmpegCompositorNode(BaseNode):
             )
             return context
         except subprocess.CalledProcessError as exc:
-            self._ws_broadcast(task_id, user_id, {"status": "failed"})
+            if not self._coordinator_owns_terminal(context):
+                self._ws_broadcast(task_id, user_id, {"status": "failed"})
             self.log(
                 f"[ERROR] FFmpeg exited with code {exc.returncode}. stderr:\n{exc.stderr}"
             )
@@ -806,14 +813,15 @@ class FFmpegCompositorNode(BaseNode):
         self.log(f"Master video path '{output_path}' written to Context.")
 
         # 8. 逐语言生成最终变体视频（配音 + 字幕 + 画面合并）
-        # 任何变体渲染失败均向前端推送 failed，再向上抛出异常保持原有错误传播链
+        # Legacy direct calls retain failed WS; coordinator children only re-raise.
         try:
             self._render_variant(context, output_path, ffmpeg_bin)
         except Exception:
-            self._ws_broadcast(task_id, user_id, {"status": "failed"})
+            if not self._coordinator_owns_terminal(context):
+                self._ws_broadcast(task_id, user_id, {"status": "failed"})
             raise
 
-        # WS completed 推送职责已移交给 render_worker（routes_dsl.py），
+        # WS completed 推送职责已移交给 render_batch_worker（routes_dsl.py），
         # 确保在 CoverNode 抽帧完成后才推送，cover_path 才能包含在 payload 中。
         return context
 
