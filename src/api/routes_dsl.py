@@ -40,7 +40,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from itertools import product
+from math import prod
+from typing import Any, Optional, Sequence
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session, sessionmaker
@@ -48,7 +50,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from .database import get_db, get_tenant_engine
 from .dsl_adapter import compile_plan_to_timeline
 from src.api.ws_manager import manager as ws_manager
-from .dsl_parser import DSLParserNode
+from .dsl_parser import (
+    DSLParserNode,
+    MainVisualCandidate,
+    MainVisualSelectionMismatch,
+    is_main_visual_asset_type,
+    normalize_file_hash,
+)
 from .models import LocalAsset, TaskHistory
 from .schemas import (
     CompilationPlan,
@@ -137,11 +145,7 @@ def _guard_pre_planner_policy(
     flow: str,
     is_blind: bool = False,
 ) -> None:
-    """Reject exact planning until its implementation is available.
-
-    Phase 3A-0 only establishes intent plumbing.  Falling through to the
-    legacy resolver would falsely claim an exact-diversity guarantee.
-    """
+    """Keep exact planning confined to populated ``submit-dsl`` requests."""
     if not _requests_exact_main_visual(payload):
         return
     if is_blind:
@@ -153,14 +157,7 @@ def _guard_pre_planner_policy(
             ),
         )
     if flow == "submit_dsl":
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail=(
-                "EXACT_MAIN_VISUAL_PLANNER_NOT_IMPLEMENTED: "
-                "The planning policy was recognized, but the planner core "
-                "is not available until INV-001 Phase 3A."
-            ),
-        )
+        return
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail=(
@@ -177,6 +174,242 @@ class _ChildExecution:
     child_index: int
     execution_id: str
     file_sid: str
+
+
+_MainVisualFingerprint = tuple[tuple[int, str, int, str], ...]
+
+_PLANNING_REQUEST_SATISFIED = "REQUEST_SATISFIED"
+_PLANNING_TRUE_SPACE_EXHAUSTED = "TRUE_SPACE_EXHAUSTED"
+_PLANNING_SEARCH_LIMIT_REACHED = "PLANNING_SEARCH_LIMIT_REACHED"
+_EXACT_MAIN_VISUAL_SEARCH_BUDGET = 4096
+
+
+@dataclass(frozen=True)
+class _VariantPlanningResult:
+    plans: tuple[CompilationPlan, ...]
+    fingerprints: tuple[_MainVisualFingerprint, ...]
+    examined_combinations: int
+    candidate_space_size: int
+    termination_reason: str
+    warning_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ChildWork:
+    execution: _ChildExecution
+    authoritative_plan: Optional[CompilationPlan] = None
+    visual_fingerprint: Optional[_MainVisualFingerprint] = None
+
+
+def _exact_main_visual_fingerprint(
+    plan: CompilationPlan,
+) -> _MainVisualFingerprint:
+    """Validate and fingerprint the ordered layer-0 main visual sequence."""
+    if not plan.beats:
+        raise ValueError("MAIN_VISUAL_PLAN_INVALID: plan has no Beats")
+
+    fingerprint: list[tuple[int, str, int, str]] = []
+    for beat_index, beat in enumerate(plan.beats):
+        main_layers = [layer for layer in beat.layers if layer.layer_index == 0]
+        if len(main_layers) != 1:
+            raise ValueError(
+                "MAIN_VISUAL_PLAN_INVALID: Beat "
+                f"{beat.beat!r} has {len(main_layers)} layer-0 assets"
+            )
+        main_layer = main_layers[0]
+        if not is_main_visual_asset_type(main_layer.asset_type):
+            raise ValueError(
+                "MAIN_VISUAL_PLAN_INVALID: Beat "
+                f"{beat.beat!r} layer 0 is not a main-X asset"
+            )
+        normalized_hash = normalize_file_hash(main_layer.file_hash)
+        if not normalized_hash:
+            raise ValueError(
+                f"MAIN_VISUAL_PLAN_INVALID: Beat {beat.beat!r} has no stable file_hash"
+            )
+        beat_identity = str(beat.beat).strip()
+        if not beat_identity:
+            raise ValueError("MAIN_VISUAL_PLAN_INVALID: Beat identity is empty")
+        fingerprint.append((beat_index, beat_identity, 0, normalized_hash))
+
+    return tuple(fingerprint)
+
+
+def _selection_key(
+    selections: Sequence[MainVisualCandidate],
+) -> tuple[tuple[int, str], ...]:
+    return tuple((selection.asset_id, selection.file_hash) for selection in selections)
+
+
+def _preview_selection(
+    preview_plan: Optional[CompilationPlan],
+    dsl_payload: StoryDSLPayload,
+    candidate_pools: Sequence[Sequence[MainVisualCandidate]],
+) -> Optional[tuple[MainVisualCandidate, ...]]:
+    """Map a preview plan back to the current resolver-valid candidate space."""
+    if preview_plan is None or len(preview_plan.beats) != len(dsl_payload.timeline):
+        return None
+    try:
+        _exact_main_visual_fingerprint(preview_plan)
+    except ValueError:
+        return None
+
+    selections: list[MainVisualCandidate] = []
+    for beat_index, (beat, node, pool) in enumerate(
+        zip(preview_plan.beats, dsl_payload.timeline, candidate_pools)
+    ):
+        if beat.beat != node.beat:
+            return None
+        main_layer = next(layer for layer in beat.layers if layer.layer_index == 0)
+        normalized_hash = normalize_file_hash(main_layer.file_hash)
+        match = next(
+            (
+                candidate
+                for candidate in pool
+                if candidate.asset_id == main_layer.asset_id
+                and candidate.file_hash == normalized_hash
+            ),
+            None,
+        )
+        if match is None:
+            logger.info(
+                "[variant_planner] preview seed stale/invalid beat_index=%d beat=%s",
+                beat_index,
+                node.beat,
+            )
+            return None
+        selections.append(match)
+    return tuple(selections)
+
+
+def _plan_exact_main_visual_variants(
+    parser: DSLParserNode,
+    dsl_payload: StoryDSLPayload,
+    requested_count: int,
+    *,
+    preview_plan: Optional[CompilationPlan] = None,
+    search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
+) -> _VariantPlanningResult:
+    """Lazily enumerate finite resolver-valid main-X combinations."""
+    if requested_count < 1:
+        raise ValueError("requested_count must be at least 1")
+    if search_budget < 1:
+        raise ValueError("search_budget must be at least 1")
+
+    candidate_pools = parser.discover_main_visual_candidates(dsl_payload)
+    if len(candidate_pools) != len(dsl_payload.timeline):
+        raise ValueError(
+            "PLANNER_CANDIDATE_CONTRACT_INVALID: candidate pool count "
+            "does not match Beat count"
+        )
+    candidate_space_size = (
+        prod(len(pool) for pool in candidate_pools)
+        if candidate_pools and all(candidate_pools)
+        else 0
+    )
+    accepted_plans: list[CompilationPlan] = []
+    accepted_fingerprints: list[_MainVisualFingerprint] = []
+    used_fingerprints: set[_MainVisualFingerprint] = set()
+    examined_keys: set[tuple[tuple[int, str], ...]] = set()
+    selection_mismatch_seen = False
+
+    preview_selections = _preview_selection(
+        preview_plan,
+        dsl_payload,
+        candidate_pools,
+    )
+    if preview_selections is not None and candidate_space_size:
+        preview_key = _selection_key(preview_selections)
+        preview_fingerprint = _exact_main_visual_fingerprint(preview_plan)
+        examined_keys.add(preview_key)
+        accepted_plans.append(preview_plan)
+        accepted_fingerprints.append(preview_fingerprint)
+        used_fingerprints.add(preview_fingerprint)
+
+    if len(accepted_plans) < requested_count and candidate_space_size:
+        for combination in product(*candidate_pools):
+            combination_key = _selection_key(combination)
+            if combination_key in examined_keys:
+                continue
+            if len(examined_keys) >= search_budget:
+                break
+            examined_keys.add(combination_key)
+            try:
+                materialized = parser.materialize_with_main_selections(
+                    dsl_payload,
+                    combination,
+                )
+                fingerprint = _exact_main_visual_fingerprint(materialized)
+                selected_hashes = tuple(candidate.file_hash for candidate in combination)
+                materialized_hashes = tuple(row[3] for row in fingerprint)
+                if selected_hashes != materialized_hashes:
+                    raise MainVisualSelectionMismatch(
+                        "PLANNER_SELECTION_MISMATCH: selected and materialized hashes differ"
+                    )
+            except MainVisualSelectionMismatch:
+                selection_mismatch_seen = True
+                logger.exception(
+                    "[variant_planner] explicit selection materialization mismatch"
+                )
+                continue
+            except ValueError:
+                logger.warning(
+                    "[variant_planner] rejected invalid materialized main-visual plan",
+                    exc_info=True,
+                )
+                continue
+
+            if fingerprint in used_fingerprints:
+                continue
+            accepted_plans.append(materialized)
+            accepted_fingerprints.append(fingerprint)
+            used_fingerprints.add(fingerprint)
+            if len(accepted_plans) >= requested_count:
+                break
+
+    if len(accepted_plans) >= requested_count:
+        termination_reason = _PLANNING_REQUEST_SATISFIED
+        warning_codes: list[str] = []
+    elif len(examined_keys) >= candidate_space_size:
+        termination_reason = _PLANNING_TRUE_SPACE_EXHAUSTED
+        warning_codes = ["INSUFFICIENT_UNIQUE_CAPACITY"]
+    else:
+        termination_reason = _PLANNING_SEARCH_LIMIT_REACHED
+        warning_codes = ["PLANNING_SEARCH_LIMIT_REACHED"]
+    if selection_mismatch_seen:
+        warning_codes.append("PLANNER_SELECTION_MISMATCH")
+
+    return _VariantPlanningResult(
+        plans=tuple(accepted_plans),
+        fingerprints=tuple(accepted_fingerprints),
+        examined_combinations=len(examined_keys),
+        candidate_space_size=candidate_space_size,
+        termination_reason=termination_reason,
+        warning_codes=tuple(warning_codes),
+    )
+
+
+def _plan_exact_main_visual_variants_from_db(
+    tenant_id: str,
+    dsl_payload: StoryDSLPayload,
+    requested_count: int,
+    *,
+    preview_plan: Optional[CompilationPlan] = None,
+) -> _VariantPlanningResult:
+    """Run discovery and materialization inside one tenant DB session."""
+    tenant_engine = get_tenant_engine(tenant_id)
+    SessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=tenant_engine,
+    )
+    with SessionLocal() as db:
+        return _plan_exact_main_visual_variants(
+            DSLParserNode(db),
+            dsl_payload,
+            requested_count,
+            preview_plan=preview_plan,
+        )
 
 
 @dataclass(frozen=True)
@@ -297,6 +530,7 @@ def render_worker(
     engine_type: str = "content",
     director_mode: str = "auto",
     dsl_payload: Optional[StoryDSLPayload] = None,
+    plan_is_authoritative: bool = False,
     enable_tts: bool = True,
     enable_subtitles: bool = True,
 ) -> _ChildResult:
@@ -418,7 +652,20 @@ def render_worker(
                 )
                 return _result("failed", "PLAN_UNRESOLVED", "blind_dsl resolved no beats")
         else:
-            if dsl_payload is not None:
+            if plan_is_authoritative:
+                if plan is None:
+                    logger.error(
+                        "[render_worker] task_id=%s authoritative plan missing", task_id,
+                    )
+                    return _result(
+                        "failed",
+                        "AUTHORITATIVE_PLAN_MISSING",
+                        "authoritative child requires CompilationPlan",
+                    )
+                # Exact-policy children retain raw DSL for script/meta only.
+                # Their accepted visual plan must never be silently re-resolved.
+                working_plan = plan
+            elif dsl_payload is not None:
                 # 动态运行时寻址：Worker 线程内独立重新执行资产抽卡，
                 # 确保批量并发时各子任务命中不同素材（_score_candidates + random.choice）
                 working_plan = _parse_plan_from_db(tenant_id, dsl_payload)
@@ -810,6 +1057,7 @@ def render_batch_worker(
     enable_tts: bool = True,
     enable_subtitles: bool = True,
     resolved_plan: Optional[CompilationPlan] = None,
+    variant_planning_policy: str = "legacy",
 ) -> dict[str, Any]:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
@@ -823,14 +1071,88 @@ def render_batch_worker(
         task_id, batch_size,
     )
 
-    child_executions = _create_child_executions(task_id, batch_size)
+    planning_warning_codes: list[str] = []
+    child_work: list[_ChildWork] = []
+    if variant_planning_policy == "exact_main_visual":
+        if blind_dsl or dsl_payload is None:
+            logger.error(
+                "[render_batch_worker] exact planning received unsupported/missing DSL "
+                "task_id=%s blind=%s",
+                task_id,
+                blind_dsl,
+            )
+            planning_warning_codes.append("VARIANT_PLANNING_FAILED")
+        else:
+            try:
+                planning_result = _plan_exact_main_visual_variants_from_db(
+                    tenant_id,
+                    dsl_payload,
+                    batch_size,
+                    preview_plan=resolved_plan,
+                )
+                computed_fingerprints = tuple(
+                    _exact_main_visual_fingerprint(plan)
+                    for plan in planning_result.plans
+                )
+                if (
+                    computed_fingerprints != planning_result.fingerprints
+                    or len(set(computed_fingerprints)) != len(computed_fingerprints)
+                ):
+                    raise ValueError(
+                        "PLANNER_RESULT_INVALID: authoritative plans/fingerprints mismatch"
+                    )
+                planning_warning_codes.extend(planning_result.warning_codes)
+                identities = (
+                    _create_child_executions(task_id, len(planning_result.plans))
+                    if planning_result.plans
+                    else []
+                )
+                child_work = [
+                    _ChildWork(
+                        execution=identity,
+                        authoritative_plan=plan,
+                        visual_fingerprint=fingerprint,
+                    )
+                    for identity, plan, fingerprint in zip(
+                        identities,
+                        planning_result.plans,
+                        planning_result.fingerprints,
+                    )
+                ]
+                logger.info(
+                    "[render_batch_worker] exact planning task_id=%s requested=%d "
+                    "planned=%d examined=%d space=%d reason=%s warnings=%s",
+                    task_id,
+                    batch_size,
+                    len(child_work),
+                    planning_result.examined_combinations,
+                    planning_result.candidate_space_size,
+                    planning_result.termination_reason,
+                    planning_warning_codes,
+                )
+            except Exception:
+                logger.exception(
+                    "[render_batch_worker] exact planning failed task_id=%s", task_id,
+                )
+                planning_warning_codes.append("VARIANT_PLANNING_FAILED")
+    else:
+        child_work = [
+            _ChildWork(execution=child)
+            for child in _create_child_executions(task_id, batch_size)
+        ]
+
     child_results: list[_ChildResult] = []
 
-    def _execute_child(child: _ChildExecution) -> _ChildResult:
+    def _execute_child(work: _ChildWork) -> _ChildResult:
+        child = work.execution
         child_start = time.time()
         try:
             result = render_worker(
-                None if blind_dsl else resolved_plan,
+                (
+                    work.authoritative_plan
+                    if work.authoritative_plan is not None
+                    else (None if blind_dsl else resolved_plan)
+                ),
                 task_id,
                 aspect_ratio, target_duration, tenant_id,
                 prompt, batch_size, test_language,
@@ -841,6 +1163,7 @@ def render_batch_worker(
                 engine_type=engine_type,
                 director_mode=director_mode,
                 dsl_payload=None if blind_dsl else dsl_payload,
+                plan_is_authoritative=work.authoritative_plan is not None,
                 enable_tts=enable_tts,
                 enable_subtitles=enable_subtitles,
             )
@@ -866,13 +1189,13 @@ def render_batch_worker(
                 time.time() - child_start,
             )
 
-    if batch_size == 1:
-        child_results.append(_execute_child(child_executions[0]))
-    else:
-        with ThreadPoolExecutor(max_workers=batch_size) as pool:
+    if len(child_work) == 1:
+        child_results.append(_execute_child(child_work[0]))
+    elif len(child_work) > 1:
+        with ThreadPoolExecutor(max_workers=len(child_work)) as pool:
             future_map = {
-                pool.submit(_execute_child, child): child
-                for child in child_executions
+                pool.submit(_execute_child, work): work.execution
+                for work in child_work
             }
             for future in as_completed(future_map):
                 child = future_map[future]
@@ -906,8 +1229,13 @@ def render_batch_worker(
     ]
     succeeded_count = len(successful_results)
     failed_count = len(child_results) - succeeded_count
-    partial = 0 < succeeded_count < len(child_results)
-    warning_codes = ["CHILD_EXECUTION_FAILED"] if failed_count else []
+    planned_count = len(child_results)
+    partial = succeeded_count > 0 and (
+        failed_count > 0 or planned_count < batch_size
+    )
+    warning_codes = list(dict.fromkeys(planning_warning_codes))
+    if failed_count and "CHILD_EXECUTION_FAILED" not in warning_codes:
+        warning_codes.append("CHILD_EXECUTION_FAILED")
 
     history_persisted = False
     elapsed = time.time() - batch_start
@@ -942,7 +1270,7 @@ def render_batch_worker(
         "generation_mode": director_mode,
         "partial": partial,
         "requestedCount": batch_size,
-        "plannedCount": len(child_results),
+        "plannedCount": planned_count,
         "succeededCount": succeeded_count,
         "failedCount": failed_count,
         "historyPersisted": history_persisted,
@@ -1244,7 +1572,12 @@ def submit_dsl(
         "director_mode": payload.mode,
         "enable_tts": payload.enable_tts,
         "enable_subtitles": payload.enable_subtitles,
+        "variant_planning_policy": payload.variant_planning_policy,
     }
+    if _requests_exact_main_visual(payload):
+        # Request-time preview is only a validated seed; the coordinator still
+        # owns bounded batch planning before any child identity is allocated.
+        _worker_kw["resolved_plan"] = plan
 
     background_tasks.add_task(
         render_batch_worker,

@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import List, Optional, Tuple, cast
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple, cast
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -56,6 +57,31 @@ ASSET_REGISTRY = {
     # 渲染阶段由 compositor 从 manifest.content_matrix 提取文本并注入 drawtext 滤镜
     "text_template": {"axis_type": "Y_LAYER"},
 }
+
+
+def normalize_file_hash(value: object) -> str:
+    """Return the stable exact-content key used by INV-001 planning."""
+    return str(value or "").strip().lower()
+
+
+def is_main_visual_asset_type(asset_type: str) -> bool:
+    """Whether an asset type is eligible for the layer-0 main visual."""
+    return ASSET_REGISTRY.get(str(asset_type), {}).get("axis_type") in (
+        "X_BASE",
+        "X_STRUCTURE",
+    )
+
+
+@dataclass(frozen=True)
+class MainVisualCandidate:
+    """Session-independent reference to one resolver-valid main-X asset."""
+
+    asset_id: int
+    file_hash: str
+
+
+class MainVisualSelectionMismatch(ValueError):
+    """An explicit planner selection is no longer resolver-valid."""
 
 
 def _y_layer_asset_types() -> List[str]:
@@ -91,14 +117,71 @@ class DSLParserNode:
         """
         遍历 payload.timeline，对每个 Beat 执行寻址，返回 CompilationPlan。
         """
-        # 缓存全局硬约束标签（规范化），供 _resolve_smart 内 _score_candidates 消费
-        self._user_hard_tags: List[str] = list(getattr(payload, "user_hard_tags", None) or [])
+        self._prepare_payload(payload)
+        return self._compile_plan(payload)
+
+    def discover_main_visual_candidates(
+        self,
+        payload: StoryDSLPayload,
+    ) -> List[List[MainVisualCandidate]]:
+        """Return every resolver-valid main-X candidate for each ordered Beat.
+
+        Candidate eligibility and ordering come from the same private helpers
+        consumed by legacy resolution.  Exact planning only deduplicates equal
+        normalized hashes; it does not introduce a second resolver policy.
+        """
+        self._prepare_payload(payload)
+        pools: List[List[MainVisualCandidate]] = []
+
+        for node in payload.timeline:
+            candidates = self._discover_main_visual_assets(node)
+            seen_hashes: set[str] = set()
+            pool: List[MainVisualCandidate] = []
+            for asset, _matched in candidates:
+                normalized_hash = normalize_file_hash(getattr(asset, "file_hash", ""))
+                if not normalized_hash or normalized_hash in seen_hashes:
+                    continue
+                seen_hashes.add(normalized_hash)
+                pool.append(
+                    MainVisualCandidate(
+                        asset_id=cast(int, asset.id),
+                        file_hash=normalized_hash,
+                    )
+                )
+            pools.append(pool)
+
+        return pools
+
+    def materialize_with_main_selections(
+        self,
+        payload: StoryDSLPayload,
+        selections: Sequence[MainVisualCandidate],
+    ) -> CompilationPlan:
+        """Resolve a plan while locking each Beat to an explicit main-X asset."""
+        if len(selections) != len(payload.timeline):
+            raise MainVisualSelectionMismatch(
+                "PLANNER_SELECTION_MISMATCH: selection count does not match Beat count"
+            )
+        self._prepare_payload(payload)
+        return self._compile_plan(payload, selections=selections)
+
+    def _prepare_payload(self, payload: StoryDSLPayload) -> None:
+        # Shared state for legacy resolution and exact candidate discovery.
+        self._user_hard_tags = list(getattr(payload, "user_hard_tags", None) or [])
+
+    def _compile_plan(
+        self,
+        payload: StoryDSLPayload,
+        *,
+        selections: Optional[Sequence[MainVisualCandidate]] = None,
+    ) -> CompilationPlan:
 
         beat_results: List[BeatCompilationResult] = []
         unresolved: List[str] = []
 
-        for beat_node in payload.timeline:
-            result = self._resolve_beat(beat_node)
+        for beat_index, beat_node in enumerate(payload.timeline):
+            explicit_main = selections[beat_index] if selections is not None else None
+            result = self._resolve_beat(beat_node, explicit_main=explicit_main)
             beat_results.append(result)
             if not result.resolved:
                 unresolved.append(beat_node.beat)
@@ -120,7 +203,12 @@ class DSLParserNode:
     # Beat 级别分发                                                      #
     # ================================================================ #
 
-    def _resolve_beat(self, node: DSLBeatNode) -> BeatCompilationResult:
+    def _resolve_beat(
+        self,
+        node: DSLBeatNode,
+        *,
+        explicit_main: Optional[MainVisualCandidate] = None,
+    ) -> BeatCompilationResult:
         """根据 address_mode 分发到对应寻址策略。"""
         logger.info(
             "[DSLParser] 解析入参 Beat=%s mode=%s hashes=%d tags=%s",
@@ -131,10 +219,15 @@ class DSLParserNode:
         )
 
         if node.address_mode == "locked":
-            return self._resolve_locked(node)
+            return self._resolve_locked(node, explicit_main=explicit_main)
         elif node.address_mode == "smart":
-            return self._resolve_smart(node)
+            return self._resolve_smart(node, explicit_main=explicit_main)
         else:
+            if explicit_main is not None:
+                raise MainVisualSelectionMismatch(
+                    "PLANNER_SELECTION_MISMATCH: unsupported address_mode "
+                    f"{node.address_mode!r} for Beat {node.beat!r}"
+                )
             return BeatCompilationResult(
                 beat=node.beat,
                 role=node.role,
@@ -152,146 +245,190 @@ class DSLParserNode:
     # 模式 A：locked — 精确锁定寻址                                      #
     # ================================================================ #
 
-    def _resolve_locked(self, node: DSLBeatNode) -> BeatCompilationResult:
-        """
-        按 asset_hashes 列表精确锁定 X 轴主视频。
-        若同时携带 semantic_tags，则并发查询 Y 轴叠加素材（由 ASSET_REGISTRY 动态界定）。
+    def _load_locked_hash_assets(
+        self,
+        node: DSLBeatNode,
+    ) -> tuple[
+        List[LocalAsset],
+        List[Tuple[LocalAsset, List[str]]],
+        List[Tuple[LocalAsset, List[str]]],
+        List[str],
+    ]:
+        """Load and classify locked hashes once for legacy and exact planning."""
+        if not node.asset_hashes:
+            return [], [], [], []
 
-        多候选随机抽取：当 asset_hashes 携带多个 X 轴候选（备选池）时，
-        使用 random.choice() 随机抽取一个作为本次变体的唯一主轴，
-        避免并发变体因确定性排序而克隆到同一素材。
-        """
+        assets: List[LocalAsset] = (
+            self._db.query(LocalAsset)
+            .filter(
+                LocalAsset.file_hash.in_(node.asset_hashes),
+                LocalAsset.is_deleted.is_(False),
+            )
+            .all()
+        )
+        hash_order = {h: i for i, h in enumerate(node.asset_hashes)}
+        assets.sort(
+            key=lambda asset: hash_order.get(
+                str(getattr(asset, "file_hash", "") or ""), 999
+            )
+        )
+
+        x_track: List[Tuple[LocalAsset, List[str]]] = []
+        y_from_hash: List[Tuple[LocalAsset, List[str]]] = []
+        warnings: List[str] = []
+        for asset in assets:
+            axis_type = _axis_type_for_asset(asset)
+            matched = _intersect_tags(asset, node.semantic_tags)
+            if axis_type in ("X_BASE", "X_STRUCTURE"):
+                x_track.append((asset, matched))
+            elif axis_type == "Y_LAYER":
+                y_from_hash.append((asset, matched))
+            else:
+                warnings.append(
+                    "locked 模式：hash 命中素材 "
+                    f"id={asset.id} type={asset.asset_type!r} "
+                    "未在 ASSET_REGISTRY 中定义 axis_type，已跳过。"
+                )
+        return assets, x_track, y_from_hash, warnings
+
+    def _locked_main_candidate_assets(
+        self,
+        node: DSLBeatNode,
+        *,
+        hash_assets: Optional[List[LocalAsset]] = None,
+        x_track: Optional[List[Tuple[LocalAsset, List[str]]]] = None,
+    ) -> List[Tuple[LocalAsset, List[str]]]:
+        if hash_assets is None or x_track is None:
+            hash_assets, x_track, _y_from_hash, _warnings = (
+                self._load_locked_hash_assets(node)
+            )
+        if x_track:
+            return list(x_track)
+
+        # Preserve legacy parity: semantic fallback only runs when at least one
+        # locked hash resolved (for example a physical BGM) but none was main-X.
+        if not hash_assets or not node.semantic_tags:
+            return []
+        x_video_types = [
+            asset_type
+            for asset_type, registry in ASSET_REGISTRY.items()
+            if registry.get("axis_type") in ("X_BASE", "X_STRUCTURE")
+        ]
+        fallback = self._query_by_tags(
+            tags=node.semantic_tags,
+            asset_types=x_video_types,
+            limit=5,
+        )
+        return _score_candidates(
+            fallback,
+            user_hard_tags=self._user_hard_tags,
+            request_tags=node.semantic_tags,
+        )
+
+    def _match_explicit_main(
+        self,
+        candidates: List[Tuple[LocalAsset, List[str]]],
+        selection: MainVisualCandidate,
+        node: DSLBeatNode,
+    ) -> Tuple[LocalAsset, List[str]]:
+        matches = [
+            pair
+            for pair in candidates
+            if cast(int, pair[0].id) == selection.asset_id
+            and normalize_file_hash(getattr(pair[0], "file_hash", ""))
+            == selection.file_hash
+        ]
+        if len(matches) != 1:
+            raise MainVisualSelectionMismatch(
+                "PLANNER_SELECTION_MISMATCH: Beat "
+                f"{node.beat!r} candidate asset_id={selection.asset_id} "
+                f"hash={selection.file_hash!r} is not uniquely resolver-valid"
+            )
+        return matches[0]
+
+    def _discover_main_visual_assets(
+        self,
+        node: DSLBeatNode,
+    ) -> List[Tuple[LocalAsset, List[str]]]:
+        if node.address_mode == "locked":
+            hash_assets, x_track, _y_from_hash, _warnings = (
+                self._load_locked_hash_assets(node)
+            )
+            return self._locked_main_candidate_assets(
+                node,
+                hash_assets=hash_assets,
+                x_track=x_track,
+            )
+        if node.address_mode == "smart" and node.semantic_tags:
+            _ranked, main_candidates, _is_fallback = self._smart_candidate_assets(
+                node,
+                enumerate_fallback=True,
+            )
+            return main_candidates
+        return []
+
+    def _resolve_locked(
+        self,
+        node: DSLBeatNode,
+        *,
+        explicit_main: Optional[MainVisualCandidate] = None,
+    ) -> BeatCompilationResult:
+        """Resolve locked layers, optionally forcing one discovered main-X asset."""
         warnings: List[str] = []
         layers: List[ResolvedLayer] = []
         next_layer_idx = 0
 
-        # ── 按 hash 命中：按 axis_type 分拨 X / Y ──────────────────── #
         if node.asset_hashes:
-            x_assets = (
-                self._db.query(LocalAsset)
-                .filter(
-                    LocalAsset.file_hash.in_(node.asset_hashes),
-                    LocalAsset.is_deleted.is_(False),
-                )
-                .all()
+            hash_assets, x_track, y_from_hash, partition_warnings = (
+                self._load_locked_hash_assets(node)
             )
-            if not x_assets:
+            warnings.extend(partition_warnings)
+            if not hash_assets:
+                if explicit_main is not None:
+                    raise MainVisualSelectionMismatch(
+                        "PLANNER_SELECTION_MISMATCH: Beat "
+                        f"{node.beat!r} locked selection is no longer resolver-valid"
+                    )
                 warnings.append(
                     f"locked 模式：asset_hashes={node.asset_hashes} 在素材库中无匹配记录。"
                 )
             else:
-                hash_order = {h: i for i, h in enumerate(node.asset_hashes)}
-                x_assets.sort(
-                    key=lambda a: hash_order.get(
-                        str(getattr(a, "file_hash", "") or ""), 999
-                    )
+                main_candidates = self._locked_main_candidate_assets(
+                    node,
+                    hash_assets=hash_assets,
+                    x_track=x_track,
                 )
+                chosen: Optional[Tuple[LocalAsset, List[str]]] = None
+                if explicit_main is not None:
+                    chosen = self._match_explicit_main(main_candidates, explicit_main, node)
+                elif x_track:
+                    chosen = random.choice(x_track) if len(x_track) > 1 else x_track[0]
+                elif main_candidates:
+                    chosen = main_candidates[0]
 
-                x_track: List[Tuple[LocalAsset, List[str]]] = []
-                y_from_hash: List[Tuple[LocalAsset, List[str]]] = []
-
-                for asset in x_assets:
-                    axis_type = _axis_type_for_asset(asset)
-                    matched = _intersect_tags(asset, node.semantic_tags)
-                    if axis_type in ("X_BASE", "X_STRUCTURE"):
-                        x_track.append((asset, matched))
-                    elif axis_type == "Y_LAYER":
-                        y_from_hash.append((asset, matched))
-                    else:
-                        warnings.append(
-                            "locked 模式：hash 命中素材 "
-                            f"id={asset.id} type={asset.asset_type!r} "
-                            "未在 ASSET_REGISTRY 中定义 axis_type，已跳过。"
-                        )
-
-                # 多候选备选池：随机抽取一个 X 轴主素材，打破并发克隆
-                if len(x_track) > 1:
-                    chosen_x = random.choice(x_track)
-                    logger.info(
-                        "[DSLParser] locked X轴备选池 %d 个候选，随机抽取 asset_id=%d",
-                        len(x_track),
-                        chosen_x[0].id,
-                    )
-                    x_track = [chosen_x]
-
-                for asset, matched in x_track:
-                    x_axis = _axis_type_for_asset(asset)
+                if chosen is not None:
+                    asset, matched = chosen
                     layers.append(
-                        _make_layer(
-                            layer_index=next_layer_idx,
-                            asset=asset,
-                            matched_tags=matched,
-                        )
+                        _make_layer(layer_index=0, asset=asset, matched_tags=matched)
                     )
+                    next_layer_idx = 1
                     logger.info(
-                        "[DSLParser] locked X轴锁定命中 layer=%d asset_id=%d "
+                        "[DSLParser] locked X轴%s命中 layer=0 asset_id=%d "
                         "axis_type=%s hash=%s…",
-                        next_layer_idx,
+                        "显式" if explicit_main is not None else "锁定",
                         asset.id,
-                        x_axis,
-                        (str(getattr(asset, "file_hash", "") or ""))[:8],
+                        _axis_type_for_asset(asset),
+                        normalize_file_hash(getattr(asset, "file_hash", ""))[:8],
                     )
-                    next_layer_idx += 1
-
-                # ── X 轴兜底：hash 列表里无视频素材时，用 semantic_tags 查 video ──
-                # 场景：用户在战术板只把 BGM/SFX 锁定到 beat，导致 asset_hashes
-                # 全部解析为 Y_LAYER；此时若携带 semantic_tags，则尝试以"智能模式"
-                # 补全 X 轴视频，避免主视频轨为空。
-                if next_layer_idx == 0 and node.semantic_tags:
-                    x_video_types = [
-                        t for t, v in ASSET_REGISTRY.items()
-                        if v.get("axis_type") in ("X_BASE", "X_STRUCTURE")
-                    ]
-                    x_fallback = self._query_by_tags(
-                        tags=node.semantic_tags,
-                        asset_types=x_video_types,
-                        limit=5,
+                elif not x_track and node.semantic_tags:
+                    warnings.append(
+                        f"locked 模式：asset_hashes 中无视频素材，"
+                        f"且 semantic_tags={node.semantic_tags} "
+                        "也未在素材库命中可用视频，主视频轨将为空。"
                     )
-                    if x_fallback:
-                        scored_fb = _score_candidates(
-                            x_fallback,
-                            user_hard_tags=self._user_hard_tags,
-                            request_tags=node.semantic_tags,
-                        )
-                        # 硬约束一票否决可能清空 scored_fb；此时降级为无兜底，
-                        # 避免 IndexError，交由下方 else 分支输出警告。
-                        if not scored_fb:
-                            logger.warning(
-                                "[DSLParser] locked X轴兜底：_score_candidates 硬约束"
-                                " veto 后候选池为空（hard_tags=%s semantic_tags=%s），"
-                                "跳过 X 轴兜底。",
-                                self._user_hard_tags,
-                                node.semantic_tags,
-                            )
-                            x_fallback = []  # 触发下方 else 警告分支
-                    if x_fallback and scored_fb:
-                        fb_asset, fb_matched = scored_fb[0]
-                        layers.insert(
-                            0,
-                            _make_layer(
-                                layer_index=0,
-                                asset=fb_asset,
-                                matched_tags=fb_matched,
-                            ),
-                        )
-                        next_layer_idx = 1
-                        logger.info(
-                            "[DSLParser] locked X轴兜底命中 layer=0 asset_id=%d "
-                            "axis_type=%s tags=%s（hashes 中无 X 轴视频）",
-                            fb_asset.id,
-                            _axis_type_for_asset(fb_asset),
-                            fb_matched,
-                        )
-                    else:
-                        warnings.append(
-                            f"locked 模式：asset_hashes 中无视频素材，"
-                            f"且 semantic_tags={node.semantic_tags} "
-                            "也未在素材库命中可用视频，主视频轨将为空。"
-                        )
 
                 if next_layer_idx == 0:
                     next_layer_idx = 1
-
                 for asset, matched in y_from_hash:
                     layers.append(
                         _make_layer(
@@ -300,19 +437,15 @@ class DSLParserNode:
                             matched_tags=matched,
                         )
                     )
-                    logger.info(
-                        "[DSLParser] locked Y轴锁定命中 layer=%d asset_id=%d "
-                        "type=%s tags=%s",
-                        next_layer_idx,
-                        asset.id,
-                        asset.asset_type,
-                        matched,
-                    )
                     next_layer_idx += 1
         else:
+            if explicit_main is not None:
+                raise MainVisualSelectionMismatch(
+                    f"PLANNER_SELECTION_MISMATCH: Beat {node.beat!r} has no locked hashes"
+                )
             warnings.append("locked 模式：asset_hashes 为空，跳过 X 轴锁定。")
 
-        # ── Y 轴：semantic_tags 并发查叠加素材（类型列表来自注册表）── #
+        # Y resolution remains independent of the selected main visual.
         if node.semantic_tags:
             y_assets = self._query_by_tags(
                 tags=node.semantic_tags,
@@ -329,17 +462,10 @@ class DSLParserNode:
                         matched_tags=matched,
                     )
                 )
-                logger.info(
-                    "[DSLParser] locked Y轴锁定命中 layer=%d asset_id=%d tags=%s",
-                    next_layer_idx,
-                    asset.id,
-                    matched,
-                )
                 next_layer_idx += 1
 
         _apply_layout_hints(layers, node)
-        resolved = any(lyr.layer_index == 0 for lyr in layers) or (len(layers) > 0)
-
+        resolved = any(layer.layer_index == 0 for layer in layers) or bool(layers)
         return BeatCompilationResult(
             beat=node.beat,
             role=node.role,
@@ -354,16 +480,86 @@ class DSLParserNode:
     # 模式 B：smart — 智能抽卡寻址                                       #
     # ================================================================ #
 
-    def _resolve_smart(self, node: DSLBeatNode) -> BeatCompilationResult:
-        """
-        按 semantic_tags 匹配素材，执行防疲劳打分逻辑：
-          优先 usage_count 低 + is_exhausted=False 的素材作为 X 轴；
-          其余命中项依次作为 Y 轴叠加层。
-        """
+    def _smart_fallback_query(self):
+        """Build the shared safe-shot eligibility query."""
+        return (
+            self._db.query(LocalAsset)
+            .filter(
+                LocalAsset.asset_type.in_(["video", "scene_master_video"]),
+                or_(
+                    LocalAsset.tags.like("%通用空镜%"),
+                    LocalAsset.tags.like("%B-Roll%"),
+                ),
+                LocalAsset.is_deleted.is_(False),
+                LocalAsset.is_exhausted.is_(False),
+            )
+            .order_by(func.random())
+        )
+
+    def _query_smart_fallback_assets(
+        self,
+        *,
+        enumerate_all: bool,
+    ) -> List[LocalAsset]:
+        """Fetch one legacy fallback or enumerate the exact-planner space."""
+        query = self._smart_fallback_query()
+        if enumerate_all:
+            return query.all()
+        first = query.first()
+        return [first] if first is not None else []
+
+    def _smart_candidate_assets(
+        self,
+        node: DSLBeatNode,
+        *,
+        enumerate_fallback: bool,
+    ) -> tuple[
+        List[Tuple[LocalAsset, List[str]]],
+        List[Tuple[LocalAsset, List[str]]],
+        bool,
+    ]:
+        """Return ranked assets, eligible main-X assets, and fallback state."""
+        tagged = self._query_by_tags(
+            tags=node.semantic_tags,
+            asset_types=None,
+            limit=20,
+        )
+        if tagged:
+            ranked = _score_candidates(
+                tagged,
+                user_hard_tags=self._user_hard_tags,
+                request_tags=node.semantic_tags,
+            )
+            main_candidates = [
+                pair
+                for pair in ranked
+                if _axis_type_for_asset(pair[0]) in ("X_BASE", "X_STRUCTURE")
+            ]
+            return ranked, main_candidates, False
+
+        fallback = [
+            (asset, [])
+            for asset in self._query_smart_fallback_assets(
+                enumerate_all=enumerate_fallback
+            )
+        ]
+        return fallback, fallback, True
+
+    def _resolve_smart(
+        self,
+        node: DSLBeatNode,
+        *,
+        explicit_main: Optional[MainVisualCandidate] = None,
+    ) -> BeatCompilationResult:
+        """Resolve Smart layers, optionally forcing one discovered main-X asset."""
         warnings: List[str] = []
         layers: List[ResolvedLayer] = []
 
         if not node.semantic_tags:
+            if explicit_main is not None:
+                raise MainVisualSelectionMismatch(
+                    f"PLANNER_SELECTION_MISMATCH: Beat {node.beat!r} has no smart tags"
+                )
             warnings.append("smart 模式：semantic_tags 为空，无法执行智能匹配。")
             return BeatCompilationResult(
                 beat=node.beat,
@@ -375,68 +571,44 @@ class DSLParserNode:
                 script_text=node.script_text,
             )
 
-        # ── 查询所有类型素材，Python 侧统一打分 ──────────────────── #
-        all_candidates = self._query_by_tags(
-            tags=node.semantic_tags,
-            asset_types=None,  # 不限类型，打分后再分拨
-            limit=20,
+        ranked, main_candidates, is_fallback = self._smart_candidate_assets(
+            node,
+            enumerate_fallback=explicit_main is not None,
         )
+        chosen: Optional[Tuple[LocalAsset, List[str]]] = None
+        if explicit_main is not None:
+            chosen = self._match_explicit_main(main_candidates, explicit_main, node)
+        elif main_candidates:
+            chosen = main_candidates[0]
 
-        if not all_candidates:
+        if is_fallback:
             warnings.append(
                 f"smart 模式：semantic_tags={node.semantic_tags} 未命中任何素材，"
                 "尝试安全空镜兜底..."
             )
-            # ── 二级防御：安全空镜兜底（受控降级，避免全局盲目随机）────────────── #
-            fallback_asset = (
-                self._db.query(LocalAsset)
-                .filter(
-                    LocalAsset.asset_type.in_(["video", "scene_master_video"]),
-                    or_(
-                        LocalAsset.tags.like("%通用空镜%"),
-                        LocalAsset.tags.like("%B-Roll%"),
-                    ),
-                    LocalAsset.is_deleted.is_(False),
-                    LocalAsset.is_exhausted.is_(False),
-                )
-                .order_by(func.random())
-                .first()
-            )
-
-            if fallback_asset:
-                logger.warning(
-                    "[DSLParser] Beat=%s 标签 %s 脱靶，已兜底安全空镜 asset_id=%d",
-                    node.beat,
-                    node.semantic_tags,
-                    fallback_asset.id,
-                )
+            if chosen is not None:
+                fallback_asset, matched = chosen
                 warnings.append(
                     f"已兜底安全空镜（asset_id={fallback_asset.id}），"
                     "建议补充素材库或校正 semantic_tags。"
                 )
+                layer = _make_layer(
+                    layer_index=0,
+                    asset=fallback_asset,
+                    matched_tags=matched,
+                )
+                layers = [layer]
+                _apply_layout_hints(layers, node)
                 return BeatCompilationResult(
                     beat=node.beat,
                     role=node.role,
                     address_mode="smart",
-                    layers=[
-                        _make_layer(
-                            layer_index=0,
-                            asset=fallback_asset,
-                            matched_tags=[],
-                        )
-                    ],
+                    layers=layers,
                     resolved=True,
                     warnings=warnings,
                     script_text=node.script_text,
                 )
 
-            # ── 三级防御：认怂，让熔断器接管，绝对不随机乱猜 ─────────────────── #
-            logger.error(
-                "[DSLParser] Beat=%s 标签 %s 脱靶，且素材库无通用空镜/B-Roll，"
-                "显式返回 resolved=False。",
-                node.beat,
-                node.semantic_tags,
-            )
             warnings.append(
                 "严重异常：素材库标签未命中，且不存在可用安全空镜（通用空镜/B-Roll）。"
                 "请向素材库添加兜底素材后重试。"
@@ -451,61 +623,43 @@ class DSLParserNode:
                 script_text=node.script_text,
             )
 
-        # ── Smart 2.0：硬约束一票否决 + 4维打分排序 ──────────────── #
-        scored = _score_candidates(
-            all_candidates,
-            user_hard_tags=self._user_hard_tags,
-            request_tags=node.semantic_tags,
-        )
-
-        # ── 分拨 X 轴 / Y 轴（axis_type 来自 ASSET_REGISTRY）────────── #
         x_assigned = False
         y_index = 1
-
-        for asset, matched in scored:
+        chosen_id = cast(int, chosen[0].id) if chosen is not None else None
+        for asset, matched in ranked:
             axis_type = _axis_type_for_asset(asset)
-            if not x_assigned and axis_type in ("X_BASE", "X_STRUCTURE"):
+            if (
+                not x_assigned
+                and axis_type in ("X_BASE", "X_STRUCTURE")
+                and cast(int, asset.id) == chosen_id
+            ):
                 layers.insert(
                     0,
                     _make_layer(layer_index=0, asset=asset, matched_tags=matched),
                 )
                 x_assigned = True
-                logger.info(
-                    "[DSLParser] Smart分发命中 X轴 asset_id=%d axis_type=%s "
-                    "usage=%d tags=%s",
-                    asset.id,
-                    axis_type,
-                    asset.usage_count,
-                    matched,
-                )
             elif axis_type == "Y_LAYER":
                 layers.append(
                     _make_layer(layer_index=y_index, asset=asset, matched_tags=matched)
                 )
-                logger.info(
-                    "[DSLParser] Smart分发命中 Y轴 layer=%d asset_id=%d "
-                    "type=%s tags=%s",
-                    y_index,
-                    asset.id,
-                    asset.asset_type,
-                    matched,
-                )
                 y_index += 1
 
         if not x_assigned:
+            if explicit_main is not None:
+                raise MainVisualSelectionMismatch(
+                    f"PLANNER_SELECTION_MISMATCH: Beat {node.beat!r} main was not materialized"
+                )
             warnings.append(
                 "smart 模式：semantic_tags 命中了素材，但无可用的 X 轴素材（"
                 "ASSET_REGISTRY 中 axis_type 为 X_BASE 或 X_STRUCTURE）。"
                 "已将命中素材全部按序挂载为连续层。"
             )
-            # 将命中的非 X 轴素材兜底挂入，layer_index 重新排序
             layers = [
-                _make_layer(layer_index=i, asset=a, matched_tags=m)
-                for i, (a, m) in enumerate(scored)
+                _make_layer(layer_index=i, asset=asset, matched_tags=matched)
+                for i, (asset, matched) in enumerate(ranked)
             ]
 
         _apply_layout_hints(layers, node)
-
         return BeatCompilationResult(
             beat=node.beat,
             role=node.role,

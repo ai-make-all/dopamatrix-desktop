@@ -89,19 +89,27 @@ class PlanningPolicySchemaTests(unittest.TestCase):
 
 
 class PlanningPolicyRouteTests(unittest.TestCase):
-    def test_ai_draft_exact_policy_is_guarded_until_planner_exists(self):
-        with self.assertRaises(HTTPException) as raised:
-            routes_dsl.submit_dsl(
+    def test_ai_draft_exact_policy_schedules_planner_coordinator(self):
+        parser = Mock()
+        parser.parse_and_resolve.return_value = _plan()
+        background = Mock()
+
+        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+            response = routes_dsl.submit_dsl(
                 _request(variant_planning_policy="exact_main_visual"),
-                BackgroundTasks(),
+                background,
                 db=Mock(),
             )
 
-        self.assertEqual(raised.exception.status_code, 501)
-        self.assertIn(
-            "EXACT_MAIN_VISUAL_PLANNER_NOT_IMPLEMENTED",
-            str(raised.exception.detail),
+        self.assertEqual(response.render_status, "rendering")
+        background.add_task.assert_called_once()
+        scheduled = background.add_task.call_args
+        self.assertIs(scheduled.args[0], routes_dsl.render_batch_worker)
+        self.assertEqual(
+            scheduled.kwargs["variant_planning_policy"],
+            "exact_main_visual",
         )
+        self.assertIs(scheduled.kwargs["resolved_plan"], parser.parse_and_resolve.return_value)
 
     def test_blind_exact_policy_is_explicitly_unsupported(self):
         blind_request = _request(
