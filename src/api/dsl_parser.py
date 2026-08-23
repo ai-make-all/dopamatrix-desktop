@@ -377,6 +377,7 @@ class DSLParserNode:
         warnings: List[str] = []
         layers: List[ResolvedLayer] = []
         next_layer_idx = 0
+        seen_y_identities: set[Tuple[str, str]] = set()
 
         if node.asset_hashes:
             hash_assets, x_track, y_from_hash, partition_warnings = (
@@ -429,15 +430,12 @@ class DSLParserNode:
 
                 if next_layer_idx == 0:
                     next_layer_idx = 1
-                for asset, matched in y_from_hash:
-                    layers.append(
-                        _make_layer(
-                            layer_index=next_layer_idx,
-                            asset=asset,
-                            matched_tags=matched,
-                        )
-                    )
-                    next_layer_idx += 1
+                next_layer_idx = _append_unique_y_layers(
+                    layers,
+                    y_from_hash,
+                    next_layer_idx=next_layer_idx,
+                    seen_identities=seen_y_identities,
+                )
         else:
             if explicit_main is not None:
                 raise MainVisualSelectionMismatch(
@@ -454,15 +452,12 @@ class DSLParserNode:
             )
             if next_layer_idx == 0:
                 next_layer_idx = 1
-            for asset, matched in y_assets:
-                layers.append(
-                    _make_layer(
-                        layer_index=next_layer_idx,
-                        asset=asset,
-                        matched_tags=matched,
-                    )
-                )
-                next_layer_idx += 1
+            next_layer_idx = _append_unique_y_layers(
+                layers,
+                y_assets,
+                next_layer_idx=next_layer_idx,
+                seen_identities=seen_y_identities,
+            )
 
         _apply_layout_hints(layers, node)
         resolved = any(layer.layer_index == 0 for layer in layers) or bool(layers)
@@ -625,6 +620,7 @@ class DSLParserNode:
 
         x_assigned = False
         y_index = 1
+        seen_y_identities: set[Tuple[str, str]] = set()
         chosen_id = cast(int, chosen[0].id) if chosen is not None else None
         for asset, matched in ranked:
             axis_type = _axis_type_for_asset(asset)
@@ -639,10 +635,12 @@ class DSLParserNode:
                 )
                 x_assigned = True
             elif axis_type == "Y_LAYER":
-                layers.append(
-                    _make_layer(layer_index=y_index, asset=asset, matched_tags=matched)
+                y_index = _append_unique_y_layers(
+                    layers,
+                    [(asset, matched)],
+                    next_layer_idx=y_index,
+                    seen_identities=seen_y_identities,
                 )
-                y_index += 1
 
         if not x_assigned:
             if explicit_main is not None:
@@ -654,10 +652,26 @@ class DSLParserNode:
                 "ASSET_REGISTRY 中 axis_type 为 X_BASE 或 X_STRUCTURE）。"
                 "已将命中素材全部按序挂载为连续层。"
             )
-            layers = [
-                _make_layer(layer_index=i, asset=asset, matched_tags=matched)
-                for i, (asset, matched) in enumerate(ranked)
-            ]
+            layers = []
+            next_layer_idx = 0
+            seen_y_identities.clear()
+            for asset, matched in ranked:
+                if _axis_type_for_asset(asset) == "Y_LAYER":
+                    next_layer_idx = _append_unique_y_layers(
+                        layers,
+                        [(asset, matched)],
+                        next_layer_idx=next_layer_idx,
+                        seen_identities=seen_y_identities,
+                    )
+                else:
+                    layers.append(
+                        _make_layer(
+                            layer_index=next_layer_idx,
+                            asset=asset,
+                            matched_tags=matched,
+                        )
+                    )
+                    next_layer_idx += 1
 
         _apply_layout_hints(layers, node)
         return BeatCompilationResult(
@@ -738,6 +752,38 @@ def _make_layer(
         matched_tags=matched_tags,
         manifest=dict(asset.manifest) if getattr(asset, "manifest", None) else None,
     )
+
+
+def _y_asset_identity(asset: LocalAsset) -> Tuple[str, str]:
+    """Return the stable per-Beat identity for one Y-layer media asset."""
+    normalized_hash = normalize_file_hash(getattr(asset, "file_hash", ""))
+    if normalized_hash:
+        return "file_hash", normalized_hash
+    return "asset_id", str(getattr(asset, "id", ""))
+
+
+def _append_unique_y_layers(
+    layers: List[ResolvedLayer],
+    candidates: Sequence[Tuple[LocalAsset, List[str]]],
+    *,
+    next_layer_idx: int,
+    seen_identities: set[Tuple[str, str]],
+) -> int:
+    """Append first-seen Y assets in stable order and keep indexes contiguous."""
+    for asset, matched in candidates:
+        identity = _y_asset_identity(asset)
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        layers.append(
+            _make_layer(
+                layer_index=next_layer_idx,
+                asset=asset,
+                matched_tags=matched,
+            )
+        )
+        next_layer_idx += 1
+    return next_layer_idx
 
 
 def _apply_layout_hints(layers: List[ResolvedLayer], node: DSLBeatNode) -> None:
