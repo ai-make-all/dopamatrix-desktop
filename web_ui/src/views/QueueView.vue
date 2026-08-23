@@ -15,13 +15,23 @@ import { useQueueStore }  from '../stores/useQueueStore'
 import type { QueueTask, QueueTaskAsset } from '../stores/useQueueStore'
 import { useAppStore }    from '../stores/appStore'
 import { updateVideoStatus } from '../api'
+import { deriveRenderOutcomeSummary } from '../utils/renderOutcome'
 import MasterPreviewModal from '../components/MasterPreviewModal.vue'
 import CoverPreviewCard   from '../components/matrix/CoverPreviewCard.vue'
 
 const queueStore = useQueueStore()
 const appStore   = useAppStore()
 
-function parseRecordMeta(record: any): Record<string, any> {
+function getOutcomeSummary(task: QueueTask) {
+  return deriveRenderOutcomeSummary(task)
+}
+
+function completedStatusLabel(task: QueueTask): string {
+  if (!getOutcomeSummary(task)) return '已完成'
+  return task.partial ? '部分完成' : '已完成·注意'
+}
+
+function parseRecordDetails(record: any): Record<string, any> {
   let details = record?.prompt_details || {}
   if (typeof details === 'string') {
     try {
@@ -30,7 +40,30 @@ function parseRecordMeta(record: any): Record<string, any> {
       details = {}
     }
   }
-  return details?.meta || {}
+  return details && typeof details === 'object' ? details : {}
+}
+
+function parseRecordMeta(record: any): Record<string, any> {
+  return parseRecordDetails(record).meta || {}
+}
+
+function parseHistoryOutcome(record: any) {
+  const summary = parseRecordDetails(record).planning_summary
+  if (!summary || typeof summary !== 'object') return {}
+
+  const requestedCount = summary.requested_count
+  const plannedCount = summary.planned_count
+  const succeededCount = summary.succeeded_count
+  const failedCount = summary.failed_count
+  return {
+    partial: succeededCount > 0 && (failedCount > 0 || plannedCount < requestedCount),
+    requestedCount,
+    plannedCount,
+    succeededCount,
+    failedCount,
+    historyPersisted: true,
+    warningCodes: Array.isArray(summary.warning_codes) ? [...summary.warning_codes] : [],
+  }
 }
 
 function normalizeHistoryAsset(asset: any, recordMeta: Record<string, any> = {}) {
@@ -93,6 +126,7 @@ async function fetchTodayTasks(): Promise<Map<string, QueueTask>> {
         duration:  r.duration != null ? `${Number(r.duration).toFixed(1)}s` : '',
         mode:      r.mode || r.generation_mode || recordMeta.mode || 'manual',
         generation_mode: r.generation_mode || r.mode || recordMeta.mode || 'manual',
+        ...parseHistoryOutcome(r),
         assets: (r.output_assets || [])
           .filter((asset: any) => asset.status !== 'DELETED')
           .map((asset: any) => normalizeHistoryAsset(asset, recordMeta)),
@@ -493,7 +527,11 @@ const triggerRealWsFlood = async () => {
             <span :class="['ms-badge', statusClass(item.type)]">{{ statusLabel(item.type) }}</span>
           </div>
 
-          <p class="ms-prompt">{{ item.prompt || '（无描述）' }}</p>
+          <p
+            class="ms-prompt"
+            :class="{ 'ms-prompt--warning': !!getOutcomeSummary(item) }"
+            :title="getOutcomeSummary(item)?.text || item.prompt || ''"
+          >{{ getOutcomeSummary(item)?.text || item.prompt || '（无描述）' }}</p>
 
           <div class="ms-right">
             <template v-if="item.type === 'running'">
@@ -541,7 +579,12 @@ const triggerRealWsFlood = async () => {
               <span class="meta-task-id">#{{ item.id.slice(-8) }}</span>
               <span v-if="item.assets?.length" class="meta-batch">包含 {{ item.assets.length }} 个视频</span>
               <span :class="['mode-badge', getModeClass(item)]">{{ getModeLabel(item) }}</span>
-              <span class="status-badge badge-completed">已完成</span>
+              <span
+                :class="[
+                  'status-badge',
+                  getOutcomeSummary(item) ? 'badge-outcome-warning' : 'badge-completed',
+                ]"
+              >{{ completedStatusLabel(item) }}</span>
             </div>
             <div class="meta-right">
               <span v-if="item.startTs" class="meta-time">
@@ -552,7 +595,15 @@ const triggerRealWsFlood = async () => {
           </div>
 
           <!-- ══ ROW 2: 提示词（可展开）══ -->
-          <div class="row-prompt" :class="{ 'row-prompt--expanded': expandedPrompts.has(item.id) }">
+          <div
+            v-if="getOutcomeSummary(item)"
+            class="row-outcome-warning"
+            :class="`row-outcome-warning--${getOutcomeSummary(item)?.severity}`"
+            :title="getOutcomeSummary(item)?.text"
+          >
+            {{ getOutcomeSummary(item)?.text }}
+          </div>
+          <div v-else class="row-prompt" :class="{ 'row-prompt--expanded': expandedPrompts.has(item.id) }">
             <p class="prompt-text" :class="{ 'prompt-text--clamp': !expandedPrompts.has(item.id) }">
               {{ item.prompt || '（无描述）' }}
             </p>
@@ -947,6 +998,10 @@ const triggerRealWsFlood = async () => {
   text-overflow: ellipsis;
   margin:        0;
 }
+.ms-prompt--warning {
+  color: #fbbf24;
+  font-weight: 600;
+}
 
 /* 右侧状态区 */
 .ms-right {
@@ -1109,6 +1164,31 @@ const triggerRealWsFlood = async () => {
 .badge-running   { background: rgba(56,  189, 248, 0.15); color: #38bdf8; }
 .badge-completed { background: rgba(74,  222, 128, 0.15); color: #4ade80; }
 .badge-failed    { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+.badge-outcome-warning { background: rgba(245, 158, 11, 0.16); color: #fbbf24; }
+
+.row-outcome-warning {
+  flex-shrink: 0;
+  min-height: 36px;
+  max-height: 36px;
+  margin-bottom: 6px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.08);
+  color: #fcd34d;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.row-outcome-warning--error {
+  border-color: rgba(248, 113, 113, 0.3);
+  background: rgba(248, 113, 113, 0.08);
+  color: #fca5a5;
+}
 
 /* ── Row 2: Prompt ───────────────────────────────────────────────────────── */
 .row-prompt {

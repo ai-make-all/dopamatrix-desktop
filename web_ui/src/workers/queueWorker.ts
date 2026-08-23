@@ -49,6 +49,13 @@ export interface QueueTask {
   endTs?: string
   duration?: string
   assets?: QueueTaskAsset[]
+  partial?: boolean
+  requestedCount?: number
+  plannedCount?: number
+  succeededCount?: number
+  failedCount?: number
+  historyPersisted?: boolean
+  warningCodes?: string[]
 }
 
 export interface QueueStats {
@@ -68,6 +75,13 @@ export interface WsUpdatePayload {
   generation_mode?: string
   assets?: QueueTaskAsset[]
   startTime?: number
+  partial?: boolean
+  requestedCount?: number
+  plannedCount?: number
+  succeededCount?: number
+  failedCount?: number
+  historyPersisted?: boolean
+  warningCodes?: string[]
 }
 
 // ── 内部状态 ─────────────────────────────────────────────────────────────────
@@ -215,12 +229,26 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
       startTime: payload.startTime ?? Date.now(),
       startTs:   ts,
       assets:    payload.assets ?? [],
+      partial: payload.partial,
+      requestedCount: payload.requestedCount,
+      plannedCount: payload.plannedCount,
+      succeededCount: payload.succeededCount,
+      failedCount: payload.failedCount,
+      historyPersisted: payload.historyPersisted,
+      warningCodes: Array.isArray(payload.warningCodes) ? [...payload.warningCodes] : undefined,
     })
   } else {
     // ── 更新已有任务 ─────────────────────────────────────────────────────────
     const prevType = existing.type
 
     existing.type = payload.status
+    if (payload.partial !== undefined) existing.partial = payload.partial
+    if (payload.requestedCount !== undefined) existing.requestedCount = payload.requestedCount
+    if (payload.plannedCount !== undefined) existing.plannedCount = payload.plannedCount
+    if (payload.succeededCount !== undefined) existing.succeededCount = payload.succeededCount
+    if (payload.failedCount !== undefined) existing.failedCount = payload.failedCount
+    if (payload.historyPersisted !== undefined) existing.historyPersisted = payload.historyPersisted
+    if (Array.isArray(payload.warningCodes)) existing.warningCodes = [...payload.warningCodes]
     if (payload.mode || payload.generation_mode) {
       existing.mode = payload.mode || payload.generation_mode
       existing.generation_mode = payload.generation_mode || payload.mode

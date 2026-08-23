@@ -138,10 +138,14 @@ export const useQueueStore = defineStore('queue', () => {
         return
       }
 
-      // 将信封直接透传给 Worker — Worker 根据 envelope.type 进行分发。
-      // 此处不再硬编码 type，保证服务端未来新增事件类型（ALERT、COPILOT_PROPOSAL 等）
-      // 能够透明地流经 Store 到达 Worker，无需修改 Store 层代码。
-      _worker?.postMessage(envelope)
+      if (_worker) {
+        // Worker 可用时仍由 Worker 独占分发，避免主线程重复写 task state。
+        _worker.postMessage(envelope)
+      } else if (envelope.type === 'WS_UPDATE') {
+        // Worker 不可用时仅接管现有任务更新；其他事件类型保持原有忽略行为。
+        const payload = envelope.payload as WsUpdatePayload
+        if (payload?.taskId) _fallbackUpdate(payload)
+      }
     }
 
     _ws.onerror = (err: Event) => {
@@ -259,6 +263,13 @@ export const useQueueStore = defineStore('queue', () => {
     if (existing) {
       existing.type = payload.status
       if (payload.assets?.length) existing.assets = payload.assets
+      if (payload.partial !== undefined) existing.partial = payload.partial
+      if (payload.requestedCount !== undefined) existing.requestedCount = payload.requestedCount
+      if (payload.plannedCount !== undefined) existing.plannedCount = payload.plannedCount
+      if (payload.succeededCount !== undefined) existing.succeededCount = payload.succeededCount
+      if (payload.failedCount !== undefined) existing.failedCount = payload.failedCount
+      if (payload.historyPersisted !== undefined) existing.historyPersisted = payload.historyPersisted
+      if (Array.isArray(payload.warningCodes)) existing.warningCodes = [...payload.warningCodes]
     } else {
       const now = new Date()
       const ts  = now.toLocaleTimeString('zh', {
@@ -272,6 +283,13 @@ export const useQueueStore = defineStore('queue', () => {
         startTime: payload.startTime ?? Date.now(),
         startTs:   ts,
         assets:    payload.assets ?? [],
+        partial: payload.partial,
+        requestedCount: payload.requestedCount,
+        plannedCount: payload.plannedCount,
+        succeededCount: payload.succeededCount,
+        failedCount: payload.failedCount,
+        historyPersisted: payload.historyPersisted,
+        warningCodes: Array.isArray(payload.warningCodes) ? [...payload.warningCodes] : undefined,
       })
     }
 
