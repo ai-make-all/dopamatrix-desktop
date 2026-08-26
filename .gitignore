@@ -1,13 +1,11 @@
 # ==========================================
-# ClipFlow V1.1 商业级 .gitignore 配置
+# DopaMatrix V1.1 商业级 .gitignore 配置
 # ==========================================
 
 # ── 1. 敏感数据与环境配置 (Zero Trust) ──
 .env
 .env.*
 # Local SQLite databases
-/clipflow*.db
-/clipflow*.db-*
 /dopamatrix*.db
 /dopamatrix*.db-*
 /data/dopamatrix*.db

@@ -28,7 +28,7 @@ export const useAppStore = defineStore('app', () => {
 
   function handleLogout() {
     localStorage.removeItem('dopamatrix_user')
-    localStorage.removeItem('clipflow_output_dir')
+    localStorage.removeItem('dopamatrix_output_dir')
     loggedInUser.value = ''
     isLoggedIn.value   = false
     delete axios.defaults.headers.common['X-Local-User']
@@ -211,11 +211,11 @@ export const useAppStore = defineStore('app', () => {
   }
 
   // ── Shared state ──────────────────────────────────────────────────────────
-  const globalOutputDir = ref(localStorage.getItem('clipflow_output_dir') || '')
+  const globalOutputDir = ref(localStorage.getItem('dopamatrix_output_dir') || '')
 
   function setGlobalOutputDir(path) {
     globalOutputDir.value = path
-    localStorage.setItem('clipflow_output_dir', path)
+    localStorage.setItem('dopamatrix_output_dir', path)
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

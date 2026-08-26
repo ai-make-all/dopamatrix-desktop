@@ -1,7 +1,7 @@
 """
 src/api/routes.py
 ———————————————————
-ClipFlow — 核心 API 路由。
+DopaMatrix — 核心 API 路由。
 
 端点列表：
   POST   /tasks/submit        提交矩阵生成任务（秒回！返回 202 + queued）

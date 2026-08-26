@@ -2,9 +2,9 @@
 """
 scripts/manage_webhook.py
 ——————————————————————————————————————————————————————————————
-ClipFlow — Telegram Webhook 运维指挥官
+DopaMatrix — Telegram Webhook 运维指挥官
 
-用途：注册、查询、解绑 ClipFlow FastAPI 网关与 Telegram Bot 之间的 Webhook 通道。
+用途：注册、查询、解绑 DopaMatrix FastAPI 网关与 Telegram Bot 之间的 Webhook 通道。
 依赖：httpx（已在项目主依赖中，无需额外安装）、python-dotenv（可选，自动加载 .env）
 
 使用方式
@@ -268,7 +268,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manage_webhook",
         description=(
-            "ClipFlow — Telegram Webhook 运维指挥官\n"
+            "DopaMatrix — Telegram Webhook 运维指挥官\n"
             "管理 FastAPI 全渠道网关与 Telegram Bot 之间的 Webhook 通道。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

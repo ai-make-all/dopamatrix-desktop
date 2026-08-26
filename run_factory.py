@@ -1,5 +1,5 @@
 """
-run_factory.py — ClipFlow 终极印钞机入口
+run_factory.py — DopaMatrix 终极印钞机入口
 
 全自动视频生成流水线：
   ScriptGenNode → TTSNode → AssetSelectNode → TranslationBridgeNode → SubtitleNode
@@ -149,7 +149,7 @@ def build_pipeline() -> tuple[WorkflowEngine, WorkflowContext]:
 
 def main():
     print("=" * 60)
-    print("🎬  ClipFlow 全自动印钞机启动")
+    print("🎬  DopaMatrix 全自动印钞机启动")
     print("=" * 60)
 
     engine, context = build_pipeline()

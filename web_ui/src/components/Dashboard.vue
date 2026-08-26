@@ -54,7 +54,7 @@ const toSvgPath = (pts) => {
       <div class="panel-header">
         <span class="header-dot dot-cyan"></span>
         <span class="panel-title">真实成本测算</span>
-        <span class="panel-subtitle">Real-Time ROI Tracker · ClipFlow Engine</span>
+        <span class="panel-subtitle">Real-Time ROI Tracker · DopaMatrix Engine</span>
       </div>
 
       <!-- Big stat cards -->
@@ -123,7 +123,7 @@ const toSvgPath = (pts) => {
       <!-- Footer note -->
       <div class="panel-footer">
         <span class="footer-dot"></span>
-        数据每次任务完成后自动上报至 ClipFlow Engine DB
+        数据每次任务完成后自动上报至 DopaMatrix Engine DB
       </div>
     </div>
 

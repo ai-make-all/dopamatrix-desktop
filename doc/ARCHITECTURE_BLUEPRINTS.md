@@ -237,11 +237,11 @@ C端低配电脑盲目全并发会导致死机。用户点击渲染后，干等 
 **【背景】**
 非技术运营人员排斥复杂的连线式 Workflow。系统需要“聪明的脑”和“精准的手”。
 **【实施策略】**
-1. **代码联邦制**：ClipFlow 渲染引擎、GrowthOS 爬虫中枢必须分处不同的代码库，保护大模型的上下文窗口免受污染。
+1. **代码联邦制**：dopamatrix 渲染引擎、GrowthOS 爬虫中枢必须分处不同的代码库，保护大模型的上下文窗口免受污染。
 2. **脑手协同 (Skills + Workflow)**：
    - **大脑 (Skills)**：引入 CrewAI (编排) 和 DeerFlow (数据抓取)。根据用户的自然语言对话，动态加载翻译、查库等 Skills。
    - **手脚 (Workflow)**：最终渲染指令抛给底层死板、容错率零的 DAG Workflow 执行。
-3. **Headless API 契约**：编写严谨的 OpenAI Function Calling JSON Schema，让外部任意 Agent 都能看懂并调遣 ClipFlow 这台印钞机。
+3. **Headless API 契约**：编写严谨的 OpenAI Function Calling JSON Schema，让外部任意 Agent 都能看懂并调遣 dopamatrix 这台印钞机。
 
 ---
 
@@ -255,7 +255,7 @@ C端低配电脑盲目全并发会导致死机。用户点击渲染后，干等 
 **【背景】**
 实体生活叙事与游戏心理触发逻辑完全不同。可试玩广告 (Playable Ads) 和休闲 H5 小游戏是出海终极高转化形态。
 **【实施策略】**
-1. **Tauri 多包管理 (Monorepo)**：底层共用 `src/core`，顶层分化为 `ClipFlow Content.exe` 和 `ClipFlow UA.exe` 两个独立安装包，品牌与 UI 彻底物理隔离。
+1. **Tauri 多包管理 (Monorepo)**：底层共用 `src/core`，顶层分化为 `dopamatrix Content.exe` 和 `dopamatrix UA.exe` 两个独立安装包，品牌与 UI 彻底物理隔离。
 2. **Story DSL 双轨解析**：开发针对实体商家的叙事节拍解析器，以及针对游戏 UA 的决策路径（挫败->成功）情绪解析器。
 3. **互动管线 (V3.0)**：在视频渲染底座外，新增无头游戏引擎管线 (Cocos/Phaser headless)。利用 AI 自动替换 (Reskin) 游戏内序列帧美术资产，一键打包导出 HTML5 试玩广告包或互动短剧 `.zip`。
 

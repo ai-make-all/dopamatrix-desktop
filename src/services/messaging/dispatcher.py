@@ -36,9 +36,9 @@ from .contract import MessageType, UniversalMessage, UniversalResponse
 
 # ---- Tier-0 纯文本关键字触发表（无 LLM 成本，无按钮）-------------- #
 _TIER0_PLAIN: dict[str, str] = {
-    "你好"  : "您好！我是 ClipFlow 智能助手，请问有什么可以帮您？",
-    "hello" : "Hello! I'm ClipFlow Assistant. How can I help you today?",
-    "hi"    : "Hello! I'm ClipFlow Assistant. How can I help you today?",
+    "你好"  : "您好！我是 DopaMatrix 智能助手，请问有什么可以帮您？",
+    "hello" : "Hello! I'm DopaMatrix Assistant. How can I help you today?",
+    "hi"    : "Hello! I'm DopaMatrix Assistant. How can I help you today?",
 }
 
 # ---- Tier-0 携带按钮的关键字触发表 -------------------------------- #
@@ -151,7 +151,7 @@ async def _handle_action(msg: UniversalMessage) -> UniversalResponse:
 
     if action_value == "pricing":
         return UniversalResponse(
-            text="ClipFlow 视频生成按以下标准计费：\n• 15s 视频：¥0.5\n• 30s 视频：¥0.9\n• 60s 视频：¥1.6\n\n如需批量定价，请联系客服。",
+            text="DopaMatrix 视频生成按以下标准计费：\n• 15s 视频：¥0.5\n• 30s 视频：¥0.9\n• 60s 视频：¥1.6\n\n如需批量定价，请联系客服。",
             buttons=[{"label": "🎧 联系客服", "value": "escalate"}],
         )
 

@@ -1,4 +1,4 @@
-/// ClipFlow Tauri 应用核心入口
+/// DopaMatrix Tauri 应用核心入口
 ///
 /// 生命周期策略：
 ///   1. 生产模式下通过 tauri-plugin-shell 启动 Python Sidecar（backend.exe）
