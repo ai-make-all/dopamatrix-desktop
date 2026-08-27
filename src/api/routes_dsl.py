@@ -178,6 +178,10 @@ class _ChildExecution:
 
 _MainVisualFingerprint = tuple[tuple[int, str, int, str], ...]
 
+_MAIN_VISUAL_PLANNING_FINGERPRINT_TYPE = "main_visual_planning"
+_MAIN_VISUAL_PLANNING_FINGERPRINT_VERSION = 1
+_MAIN_VISUAL_PLANNING_SOURCE_HASH_ALGORITHM = "md5"
+
 _PLANNING_REQUEST_SATISFIED = "REQUEST_SATISFIED"
 _PLANNING_TRUE_SPACE_EXHAUSTED = "TRUE_SPACE_EXHAUSTED"
 _PLANNING_SEARCH_LIMIT_REACHED = "PLANNING_SEARCH_LIMIT_REACHED"
@@ -199,6 +203,16 @@ class _ChildWork:
     execution: _ChildExecution
     authoritative_plan: Optional[CompilationPlan] = None
     visual_fingerprint: Optional[_MainVisualFingerprint] = None
+
+
+@dataclass(frozen=True)
+class _MainVisualPlanningFingerprintContract:
+    fingerprint_type: str
+    fingerprint_version: int
+    source_hash_algorithm: str
+    fingerprint_digest: str
+    components: _MainVisualFingerprint
+    canonical_bytes: bytes
 
 
 def _exact_main_visual_fingerprint(
@@ -233,6 +247,56 @@ def _exact_main_visual_fingerprint(
         fingerprint.append((beat_index, beat_identity, 0, normalized_hash))
 
     return tuple(fingerprint)
+
+
+def _main_visual_planning_canonical_payload(
+    fingerprint: _MainVisualFingerprint,
+) -> dict[str, Any]:
+    """Return the canonical logical payload for a validated INV fingerprint."""
+    return {
+        "fingerprint_type": _MAIN_VISUAL_PLANNING_FINGERPRINT_TYPE,
+        "fingerprint_version": _MAIN_VISUAL_PLANNING_FINGERPRINT_VERSION,
+        "source_hash_algorithm": _MAIN_VISUAL_PLANNING_SOURCE_HASH_ALGORITHM,
+        "beats": [
+            {
+                "beat_index": beat_index,
+                "beat_identity": beat_identity,
+                "layer_index": layer_index,
+                "normalized_file_hash": normalized_file_hash,
+            }
+            for beat_index, beat_identity, layer_index, normalized_file_hash
+            in fingerprint
+        ],
+    }
+
+
+def _main_visual_planning_canonical_bytes(
+    fingerprint: _MainVisualFingerprint,
+) -> bytes:
+    """Serialize a validated INV fingerprint as deterministic UTF-8 JSON."""
+    payload = _main_visual_planning_canonical_payload(fingerprint)
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _main_visual_planning_fingerprint_contract(
+    fingerprint: _MainVisualFingerprint,
+) -> _MainVisualPlanningFingerprintContract:
+    """Build the additive versioned digest contract for a validated INV tuple."""
+    canonical_bytes = _main_visual_planning_canonical_bytes(fingerprint)
+    return _MainVisualPlanningFingerprintContract(
+        fingerprint_type=_MAIN_VISUAL_PLANNING_FINGERPRINT_TYPE,
+        fingerprint_version=_MAIN_VISUAL_PLANNING_FINGERPRINT_VERSION,
+        source_hash_algorithm=_MAIN_VISUAL_PLANNING_SOURCE_HASH_ALGORITHM,
+        fingerprint_digest=hashlib.sha256(canonical_bytes).hexdigest(),
+        components=fingerprint,
+        canonical_bytes=canonical_bytes,
+    )
 
 
 def _selection_key(
