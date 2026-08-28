@@ -32,6 +32,7 @@ Story DSL 接口集  (Phase 4.1 → Phase 5.2)
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -611,6 +612,313 @@ def _plan_exact_main_visual_variants(
             used_fingerprints.add(fingerprint)
             if len(accepted_plans) >= requested_count:
                 break
+
+    if len(accepted_plans) >= requested_count:
+        termination_reason = _PLANNING_REQUEST_SATISFIED
+        warning_codes: list[str] = []
+    elif len(examined_keys) >= candidate_space_size:
+        termination_reason = _PLANNING_TRUE_SPACE_EXHAUSTED
+        warning_codes = ["INSUFFICIENT_UNIQUE_CAPACITY"]
+    else:
+        termination_reason = _PLANNING_SEARCH_LIMIT_REACHED
+        warning_codes = ["PLANNING_SEARCH_LIMIT_REACHED"]
+    if selection_mismatch_seen:
+        warning_codes.append("PLANNER_SELECTION_MISMATCH")
+
+    return _VariantPlanningResult(
+        plans=tuple(accepted_plans),
+        fingerprints=tuple(accepted_fingerprints),
+        examined_combinations=len(examined_keys),
+        candidate_space_size=candidate_space_size,
+        termination_reason=termination_reason,
+        warning_codes=tuple(warning_codes),
+    )
+
+
+@dataclass(frozen=True)
+class _BalancedCandidateWindowEntry:
+    """One lightweight Cartesian proposal for balanced planning."""
+
+    selections: tuple[MainVisualCandidate, ...]
+    selection_key: tuple[tuple[int, str], ...]
+    cartesian_ordinal: int
+
+
+def _selection_from_cartesian_ordinal(
+    candidate_pools: Sequence[Sequence[MainVisualCandidate]],
+    ordinal: int,
+) -> tuple[MainVisualCandidate, ...]:
+    """Decode a rightmost-fastest flat Cartesian ordinal without materializing it."""
+    if not candidate_pools or any(not pool for pool in candidate_pools):
+        raise ValueError("candidate pools must be non-empty")
+
+    candidate_space_size = prod(len(pool) for pool in candidate_pools)
+    if ordinal < 0 or ordinal >= candidate_space_size:
+        raise ValueError("Cartesian ordinal is outside candidate space")
+
+    remaining = ordinal
+    candidate_indexes = [0] * len(candidate_pools)
+    for beat_index in range(len(candidate_pools) - 1, -1, -1):
+        remaining, candidate_indexes[beat_index] = divmod(
+            remaining,
+            len(candidate_pools[beat_index]),
+        )
+    return tuple(
+        candidate_pools[beat_index][candidate_index]
+        for beat_index, candidate_index in enumerate(candidate_indexes)
+    )
+
+
+def _stratified_cartesian_ordinals(
+    candidate_space_size: int,
+    sample_count: int,
+) -> tuple[int, ...]:
+    """Return deterministic evenly spaced ordinals spanning the full space."""
+    if candidate_space_size < 0:
+        raise ValueError("candidate_space_size must be non-negative")
+    if sample_count < 0:
+        raise ValueError("sample_count must be non-negative")
+    if candidate_space_size == 0 or sample_count == 0:
+        return ()
+    if sample_count >= candidate_space_size:
+        return tuple(range(candidate_space_size))
+    if sample_count == 1:
+        return (0,)
+    return tuple(
+        sample_index * (candidate_space_size - 1) // (sample_count - 1)
+        for sample_index in range(sample_count)
+    )
+
+
+def _balanced_candidate_window(
+    candidate_pools: Sequence[Sequence[MainVisualCandidate]],
+    candidate_space_size: int,
+    max_entries: int,
+    *,
+    excluded_keys: set[tuple[tuple[int, str], ...]],
+) -> tuple[_BalancedCandidateWindowEntry, ...]:
+    """Build a bounded lightweight full-space or stratified proposal window."""
+    if max_entries <= 0 or candidate_space_size <= 0:
+        return ()
+
+    remaining_space_size = max(candidate_space_size - len(excluded_keys), 0)
+    if remaining_space_size <= max_entries:
+        ordinals: Sequence[int] = range(candidate_space_size)
+    else:
+        sample_count = min(
+            candidate_space_size,
+            max_entries + len(excluded_keys),
+        )
+        ordinals = _stratified_cartesian_ordinals(
+            candidate_space_size,
+            sample_count,
+        )
+
+    entries: list[_BalancedCandidateWindowEntry] = []
+    seen_keys = set(excluded_keys)
+    for ordinal in ordinals:
+        selections = _selection_from_cartesian_ordinal(candidate_pools, ordinal)
+        selection_key = _selection_key(selections)
+        if selection_key in seen_keys:
+            continue
+        seen_keys.add(selection_key)
+        entries.append(
+            _BalancedCandidateWindowEntry(
+                selections=selections,
+                selection_key=selection_key,
+                cartesian_ordinal=ordinal,
+            )
+        )
+        if len(entries) >= max_entries:
+            break
+    return tuple(entries)
+
+
+def _initial_main_visual_coverage(
+    candidate_pools: Sequence[Sequence[MainVisualCandidate]],
+) -> list[dict[str, int]]:
+    """Initialize per-Beat normalized source-hash counters, including zeros."""
+    return [
+        {
+            normalize_file_hash(candidate.file_hash): 0
+            for candidate in pool
+        }
+        for pool in candidate_pools
+    ]
+
+
+def _projected_main_visual_coverage_score(
+    entry: _BalancedCandidateWindowEntry,
+    coverage: Sequence[dict[str, int]],
+) -> tuple[
+    int,
+    int,
+    float,
+    int,
+    tuple[tuple[int, str], ...],
+]:
+    """Score one proposal by projected equal-weight per-Beat coverage fairness."""
+    if len(entry.selections) != len(coverage):
+        raise ValueError("coverage axis count does not match candidate selection")
+
+    axis_gaps: list[int] = []
+    axis_mses: list[float] = []
+    for beat_index, (candidate, axis_coverage) in enumerate(
+        zip(entry.selections, coverage)
+    ):
+        if len(axis_coverage) <= 1:
+            continue
+        candidate_hash = normalize_file_hash(candidate.file_hash)
+        if candidate_hash not in axis_coverage:
+            raise ValueError(
+                f"coverage candidate is not present in Beat {beat_index} pool"
+            )
+        projected_counts = list(axis_coverage.values())
+        candidate_position = tuple(axis_coverage).index(candidate_hash)
+        projected_counts[candidate_position] += 1
+        axis_gap = max(projected_counts) - min(projected_counts)
+        target = sum(projected_counts) / len(projected_counts)
+        axis_mse = sum(
+            (count - target) ** 2 for count in projected_counts
+        ) / len(projected_counts)
+        axis_gaps.append(axis_gap)
+        axis_mses.append(axis_mse)
+
+    return (
+        max(axis_gaps, default=0),
+        sum(axis_gaps),
+        sum(axis_mses),
+        entry.cartesian_ordinal,
+        entry.selection_key,
+    )
+
+
+def _update_main_visual_coverage(
+    coverage: Sequence[dict[str, int]],
+    fingerprint: _MainVisualFingerprint,
+) -> None:
+    """Update coverage from one already accepted authoritative fingerprint."""
+    if len(fingerprint) != len(coverage):
+        raise ValueError("accepted fingerprint Beat count does not match coverage")
+    for beat_index, _beat_identity, _layer_index, normalized_file_hash in fingerprint:
+        if beat_index < 0 or beat_index >= len(coverage):
+            raise ValueError("accepted fingerprint Beat index is outside coverage")
+        if normalized_file_hash not in coverage[beat_index]:
+            raise ValueError("accepted fingerprint hash is outside candidate pool")
+        coverage[beat_index][normalized_file_hash] += 1
+
+
+def _plan_exact_main_visual_balanced_variants(
+    parser: DSLParserNode,
+    dsl_payload: StoryDSLPayload,
+    requested_count: int,
+    *,
+    preview_plan: Optional[CompilationPlan] = None,
+    search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
+) -> _VariantPlanningResult:
+    """Select exact unique plans through a bounded greedy coverage window."""
+    if requested_count < 1:
+        raise ValueError("requested_count must be at least 1")
+    if search_budget < 1:
+        raise ValueError("search_budget must be at least 1")
+
+    candidate_pools = parser.discover_main_visual_candidates(dsl_payload)
+    if len(candidate_pools) != len(dsl_payload.timeline):
+        raise ValueError(
+            "PLANNER_CANDIDATE_CONTRACT_INVALID: candidate pool count "
+            "does not match Beat count"
+        )
+    candidate_space_size = (
+        prod(len(pool) for pool in candidate_pools)
+        if candidate_pools and all(candidate_pools)
+        else 0
+    )
+    accepted_plans: list[CompilationPlan] = []
+    accepted_fingerprints: list[_MainVisualFingerprint] = []
+    used_fingerprints: set[_MainVisualFingerprint] = set()
+    examined_keys: set[tuple[tuple[int, str], ...]] = set()
+    selection_mismatch_seen = False
+    coverage = _initial_main_visual_coverage(candidate_pools)
+
+    preview_selections = _preview_selection(
+        preview_plan,
+        dsl_payload,
+        candidate_pools,
+    )
+    if preview_selections is not None and candidate_space_size:
+        preview_key = _selection_key(preview_selections)
+        preview_fingerprint = _exact_main_visual_fingerprint(preview_plan)
+        examined_keys.add(preview_key)
+        accepted_plans.append(preview_plan)
+        accepted_fingerprints.append(preview_fingerprint)
+        used_fingerprints.add(preview_fingerprint)
+        _update_main_visual_coverage(coverage, preview_fingerprint)
+
+    window = _balanced_candidate_window(
+        candidate_pools,
+        candidate_space_size,
+        search_budget - len(examined_keys),
+        excluded_keys=examined_keys,
+    )
+
+    while (
+        len(accepted_plans) < requested_count
+        and len(examined_keys) < search_budget
+    ):
+        remaining_entries = [
+            entry for entry in window if entry.selection_key not in examined_keys
+        ]
+        if not remaining_entries:
+            break
+
+        scored_entries = [
+            (_projected_main_visual_coverage_score(entry, coverage), entry)
+            for entry in remaining_entries
+        ]
+        heapq.heapify(scored_entries)
+        accepted_this_round = False
+
+        while scored_entries and len(examined_keys) < search_budget:
+            _score, proposal = heapq.heappop(scored_entries)
+            examined_keys.add(proposal.selection_key)
+            try:
+                materialized = parser.materialize_with_main_selections(
+                    dsl_payload,
+                    proposal.selections,
+                )
+                fingerprint = _exact_main_visual_fingerprint(materialized)
+                selected_hashes = tuple(
+                    candidate.file_hash for candidate in proposal.selections
+                )
+                materialized_hashes = tuple(row[3] for row in fingerprint)
+                if selected_hashes != materialized_hashes:
+                    raise MainVisualSelectionMismatch(
+                        "PLANNER_SELECTION_MISMATCH: selected and materialized hashes differ"
+                    )
+            except MainVisualSelectionMismatch:
+                selection_mismatch_seen = True
+                logger.exception(
+                    "[variant_planner] explicit balanced selection materialization mismatch"
+                )
+                continue
+            except ValueError:
+                logger.warning(
+                    "[variant_planner] rejected invalid balanced main-visual plan",
+                    exc_info=True,
+                )
+                continue
+
+            if fingerprint in used_fingerprints:
+                continue
+            accepted_plans.append(materialized)
+            accepted_fingerprints.append(fingerprint)
+            used_fingerprints.add(fingerprint)
+            _update_main_visual_coverage(coverage, fingerprint)
+            accepted_this_round = True
+            break
+
+        if not accepted_this_round:
+            break
 
     if len(accepted_plans) >= requested_count:
         termination_reason = _PLANNING_REQUEST_SATISFIED
