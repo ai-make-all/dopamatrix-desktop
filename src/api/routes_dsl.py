@@ -72,6 +72,7 @@ from .schemas import (
 from src.services.llm_provider import OpenAIProvider
 from src.utils.prompt_loader import prompt_loader
 from src.core.context import WorkflowContext
+from src.core.logger import logger as fingerprint_logger
 from src.nodes.compositor import FFmpegCompositorNode
 from src.nodes.cover_node import CoverNode
 from src.nodes.director_node import DirectorNode
@@ -181,6 +182,11 @@ _MainVisualFingerprint = tuple[tuple[int, str, int, str], ...]
 _MAIN_VISUAL_PLANNING_FINGERPRINT_TYPE = "main_visual_planning"
 _MAIN_VISUAL_PLANNING_FINGERPRINT_VERSION = 1
 _MAIN_VISUAL_PLANNING_SOURCE_HASH_ALGORITHM = "md5"
+_VARIANT_FINGERPRINT_EVENT = "VariantFingerprint"
+_VARIANT_FINGERPRINT_PHASE = "authoritative_worker_start"
+_MAX_LOGGED_FINGERPRINT_COMPONENTS = 32
+_MAX_LOGGED_BEAT_IDENTITY_CHARS = 128
+_MAX_LOGGED_SOURCE_HASH_CHARS = 128
 
 _PLANNING_REQUEST_SATISFIED = "REQUEST_SATISFIED"
 _PLANNING_TRUE_SPACE_EXHAUSTED = "TRUE_SPACE_EXHAUSTED"
@@ -297,6 +303,181 @@ def _main_visual_planning_fingerprint_contract(
         components=fingerprint,
         canonical_bytes=canonical_bytes,
     )
+
+
+def _bounded_fingerprint_log_string(
+    value: object,
+    max_chars: int,
+) -> tuple[str, bool]:
+    """Return a deterministic presentation-only string and truncation state."""
+    text = str(value)
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _main_visual_planning_log_components(
+    plan: CompilationPlan,
+    fingerprint: _MainVisualFingerprint,
+    *,
+    max_components: int = _MAX_LOGGED_FINGERPRINT_COMPONENTS,
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Build bounded diagnostics from the authoritative plan and fingerprint."""
+    if len(plan.beats) != len(fingerprint):
+        raise ValueError("FINGERPRINT_OBSERVABILITY_BEAT_COUNT_MISMATCH")
+
+    components: list[dict[str, Any]] = []
+    component_fields_truncated = False
+    for beat, component in zip(plan.beats[:max_components], fingerprint[:max_components]):
+        main_layers = [layer for layer in beat.layers if layer.layer_index == 0]
+        if len(main_layers) != 1:
+            raise ValueError("FINGERPRINT_OBSERVABILITY_MAIN_LAYER_INVALID")
+        beat_index, beat_identity, _layer_index, normalized_file_hash = component
+        displayed_beat_identity, beat_identity_truncated = (
+            _bounded_fingerprint_log_string(
+                beat_identity,
+                _MAX_LOGGED_BEAT_IDENTITY_CHARS,
+            )
+        )
+        displayed_file_hash, file_hash_truncated = _bounded_fingerprint_log_string(
+            normalized_file_hash,
+            _MAX_LOGGED_SOURCE_HASH_CHARS,
+        )
+        component_fields_truncated = (
+            component_fields_truncated
+            or beat_identity_truncated
+            or file_hash_truncated
+        )
+        components.append(
+            {
+                "beat_index": beat_index,
+                "beat_identity": displayed_beat_identity,
+                "asset_id": main_layers[0].asset_id,
+                "normalized_file_hash": displayed_file_hash,
+            }
+        )
+    return (
+        components,
+        len(fingerprint) > max_components,
+        component_fields_truncated,
+    )
+
+
+def _variant_fingerprint_event_payload(
+    plan: CompilationPlan,
+    *,
+    planner_fingerprint: Optional[_MainVisualFingerprint],
+    task_id: str,
+    execution_id: str,
+    child_index: int,
+    file_sid: str,
+) -> dict[str, Any]:
+    """Build the authoritative child-entry fingerprint observability event."""
+    worker_fingerprint = _exact_main_visual_fingerprint(plan)
+    contract = _main_visual_planning_fingerprint_contract(worker_fingerprint)
+    (
+        components,
+        components_truncated,
+        component_fields_truncated,
+    ) = _main_visual_planning_log_components(plan, worker_fingerprint)
+    planner_fingerprint_match = (
+        None
+        if planner_fingerprint is None
+        else planner_fingerprint == worker_fingerprint
+    )
+    return {
+        "event": _VARIANT_FINGERPRINT_EVENT,
+        "phase": _VARIANT_FINGERPRINT_PHASE,
+        "task_id": task_id,
+        "execution_id": execution_id,
+        "child_index": child_index,
+        "file_sid": file_sid,
+        "fingerprint_type": contract.fingerprint_type,
+        "fingerprint_version": contract.fingerprint_version,
+        "source_hash_algorithm": contract.source_hash_algorithm,
+        "fingerprint_digest": contract.fingerprint_digest,
+        "beat_count": len(worker_fingerprint),
+        "planner_fingerprint_match": planner_fingerprint_match,
+        "components": components,
+        "components_truncated": components_truncated,
+        "component_fields_truncated": component_fields_truncated,
+    }
+
+
+def _fingerprint_observability_warning(
+    diagnostic: str,
+    *,
+    task_id: str,
+    execution_id: str,
+    child_index: int,
+    file_sid: str,
+    detail: str,
+) -> None:
+    """Emit a bounded diagnostic without allowing logging to affect rendering."""
+    try:
+        fingerprint_logger.warning(
+            f"[VariantFingerprint] diagnostic={diagnostic} task_id={task_id} "
+            f"execution_id={execution_id} child_index={child_index} "
+            f"file_sid={file_sid} detail={str(detail)[:300]}"
+        )
+    except Exception:
+        pass
+
+
+def _emit_authoritative_variant_fingerprint(
+    plan: CompilationPlan,
+    *,
+    planner_fingerprint: Optional[_MainVisualFingerprint],
+    task_id: str,
+    execution_id: str,
+    child_index: int,
+    file_sid: str,
+) -> None:
+    """Emit one non-blocking authoritative VariantFingerprint INFO event."""
+    try:
+        event = _variant_fingerprint_event_payload(
+            plan,
+            planner_fingerprint=planner_fingerprint,
+            task_id=task_id,
+            execution_id=execution_id,
+            child_index=child_index,
+            file_sid=file_sid,
+        )
+        if event["planner_fingerprint_match"] is None:
+            _fingerprint_observability_warning(
+                "FINGERPRINT_OBSERVABILITY_MISSING",
+                task_id=task_id,
+                execution_id=execution_id,
+                child_index=child_index,
+                file_sid=file_sid,
+                detail="planner-provided fingerprint is missing",
+            )
+        elif not event["planner_fingerprint_match"]:
+            _fingerprint_observability_warning(
+                "FINGERPRINT_OBSERVABILITY_MISMATCH",
+                task_id=task_id,
+                execution_id=execution_id,
+                child_index=child_index,
+                file_sid=file_sid,
+                detail="planner fingerprint differs from authoritative worker plan",
+            )
+        event_json = json.dumps(
+            event,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        fingerprint_logger.info(f"[VariantFingerprint] {event_json}")
+    except Exception as exc:
+        _fingerprint_observability_warning(
+            "FINGERPRINT_OBSERVABILITY_FAILED",
+            task_id=task_id,
+            execution_id=execution_id,
+            child_index=child_index,
+            file_sid=file_sid,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _selection_key(
@@ -595,6 +776,7 @@ def render_worker(
     director_mode: str = "auto",
     dsl_payload: Optional[StoryDSLPayload] = None,
     plan_is_authoritative: bool = False,
+    visual_fingerprint: Optional[_MainVisualFingerprint] = None,
     enable_tts: bool = True,
     enable_subtitles: bool = True,
 ) -> _ChildResult:
@@ -729,6 +911,14 @@ def render_worker(
                 # Exact-policy children retain raw DSL for script/meta only.
                 # Their accepted visual plan must never be silently re-resolved.
                 working_plan = plan
+                _emit_authoritative_variant_fingerprint(
+                    working_plan,
+                    planner_fingerprint=visual_fingerprint,
+                    task_id=task_id,
+                    execution_id=execution_id,
+                    child_index=child_index,
+                    file_sid=resolved_file_sid,
+                )
             elif dsl_payload is not None:
                 # 动态运行时寻址：Worker 线程内独立重新执行资产抽卡，
                 # 确保批量并发时各子任务命中不同素材（_score_candidates + random.choice）
@@ -1228,6 +1418,7 @@ def render_batch_worker(
                 director_mode=director_mode,
                 dsl_payload=None if blind_dsl else dsl_payload,
                 plan_is_authoritative=work.authoritative_plan is not None,
+                visual_fingerprint=work.visual_fingerprint,
                 enable_tts=enable_tts,
                 enable_subtitles=enable_subtitles,
             )
