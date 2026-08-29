@@ -207,6 +207,64 @@ _PLANNING_TRUE_SPACE_EXHAUSTED = "TRUE_SPACE_EXHAUSTED"
 _PLANNING_SEARCH_LIMIT_REACHED = "PLANNING_SEARCH_LIMIT_REACHED"
 _EXACT_MAIN_VISUAL_SEARCH_BUDGET = 4096
 
+_COVERAGE_DIAGNOSTICS_TYPE = "balanced_axis_coverage"
+_COVERAGE_DIAGNOSTICS_VERSION = 1
+_BALANCED_VARIANT_PLANNING_POLICY = "exact_main_visual_balanced"
+_BALANCED_COVERAGE_SUMMARY_EVENT = "BalancedCoverageSummary"
+_COVERAGE_FIXED_BY_CAPACITY = "FIXED_BY_CAPACITY"
+_COVERAGE_VARIABLE_BALANCED = "VARIABLE_BALANCED"
+_COVERAGE_VARIABLE_TARGET_NOT_MET = "VARIABLE_TARGET_NOT_MET"
+
+
+@dataclass(frozen=True)
+class _CoverageHistogramEntryV1:
+    normalized_file_hash: str
+    asset_id: int
+    count: int
+
+
+@dataclass(frozen=True)
+class _CoverageBeatDiagnosticsV1:
+    beat_index: int
+    beat_identity: str
+    role: str
+    pool_size: int
+    selected_histogram: tuple[_CoverageHistogramEntryV1, ...]
+    selected_count: int
+    unique_used: int
+    unused_count: int
+    ideal_floor: Optional[int]
+    ideal_ceil: Optional[int]
+    max_min_gap: Optional[int]
+    classification: Optional[str]
+
+
+@dataclass(frozen=True)
+class _CoverageRejectionCountsV1:
+    materialization_mismatch_count: int
+    invalid_plan_count: int
+    duplicate_fingerprint_reject_count: int
+
+
+@dataclass(frozen=True)
+class _CoverageDiagnosticsV1:
+    diagnostics_type: str
+    version: int
+    variant_planning_policy: str
+    requested_count: int
+    accepted_count: int
+    candidate_space_size: int
+    search_budget: int
+    examined_count: int
+    proposal_attempted_count: int
+    termination_reason: str
+    preview_seeded: bool
+    preview_child_index: Optional[int]
+    preview_fingerprint_digest: Optional[str]
+    accepted_fingerprint_digests: tuple[str, ...]
+    rejection_counts: _CoverageRejectionCountsV1
+    beats: tuple[_CoverageBeatDiagnosticsV1, ...]
+
 
 @dataclass(frozen=True)
 class _VariantPlanningResult:
@@ -216,6 +274,7 @@ class _VariantPlanningResult:
     candidate_space_size: int
     termination_reason: str
     warning_codes: tuple[str, ...]
+    coverage_diagnostics: Optional[_CoverageDiagnosticsV1] = None
 
 
 @dataclass(frozen=True)
@@ -317,6 +376,329 @@ def _main_visual_planning_fingerprint_contract(
         components=fingerprint,
         canonical_bytes=canonical_bytes,
     )
+
+
+def _coverage_diagnostics_v1_payload(
+    diagnostics: _CoverageDiagnosticsV1,
+) -> dict[str, Any]:
+    """Serialize CoverageDiagnosticsV1 without leaking internal representations."""
+    return {
+        "type": diagnostics.diagnostics_type,
+        "version": diagnostics.version,
+        "variant_planning_policy": diagnostics.variant_planning_policy,
+        "requested_count": diagnostics.requested_count,
+        "accepted_count": diagnostics.accepted_count,
+        "candidate_space_size": diagnostics.candidate_space_size,
+        "search_budget": diagnostics.search_budget,
+        "examined_count": diagnostics.examined_count,
+        "proposal_attempted_count": diagnostics.proposal_attempted_count,
+        "termination_reason": diagnostics.termination_reason,
+        "preview_seeded": diagnostics.preview_seeded,
+        "preview_child_index": diagnostics.preview_child_index,
+        "preview_fingerprint_digest": diagnostics.preview_fingerprint_digest,
+        "accepted_fingerprint_digests": list(
+            diagnostics.accepted_fingerprint_digests
+        ),
+        "rejection_counts": {
+            "materialization_mismatch_count": (
+                diagnostics.rejection_counts.materialization_mismatch_count
+            ),
+            "invalid_plan_count": diagnostics.rejection_counts.invalid_plan_count,
+            "duplicate_fingerprint_reject_count": (
+                diagnostics.rejection_counts.duplicate_fingerprint_reject_count
+            ),
+        },
+        "beats": [
+            {
+                "beat_index": beat.beat_index,
+                "beat_identity": beat.beat_identity,
+                "role": beat.role,
+                "pool_size": beat.pool_size,
+                "selected_histogram": [
+                    {
+                        "normalized_file_hash": entry.normalized_file_hash,
+                        "asset_id": entry.asset_id,
+                        "count": entry.count,
+                    }
+                    for entry in beat.selected_histogram
+                ],
+                "selected_count": beat.selected_count,
+                "unique_used": beat.unique_used,
+                "unused_count": beat.unused_count,
+                "ideal_floor": beat.ideal_floor,
+                "ideal_ceil": beat.ideal_ceil,
+                "max_min_gap": beat.max_min_gap,
+                "classification": beat.classification,
+            }
+            for beat in diagnostics.beats
+        ],
+    }
+
+
+def _build_coverage_diagnostics_v1(
+    dsl_payload: StoryDSLPayload,
+    candidate_pools: Sequence[Sequence[MainVisualCandidate]],
+    coverage: Sequence[dict[str, int]],
+    accepted_fingerprints: Sequence[_MainVisualFingerprint],
+    *,
+    requested_count: int,
+    candidate_space_size: int,
+    search_budget: int,
+    examined_count: int,
+    proposal_attempted_count: int,
+    termination_reason: str,
+    preview_seeded: bool,
+    materialization_mismatch_count: int,
+    invalid_plan_count: int,
+    duplicate_fingerprint_reject_count: int,
+) -> _CoverageDiagnosticsV1:
+    """Freeze authoritative completed balanced-planner coverage as V1 diagnostics."""
+    beat_count = len(dsl_payload.timeline)
+    if len(candidate_pools) != beat_count or len(coverage) != beat_count:
+        raise ValueError("COVERAGE_DIAGNOSTICS_BEAT_COUNT_MISMATCH")
+    if any(
+        value < 0
+        for value in (
+            requested_count,
+            candidate_space_size,
+            search_budget,
+            examined_count,
+            proposal_attempted_count,
+            materialization_mismatch_count,
+            invalid_plan_count,
+            duplicate_fingerprint_reject_count,
+        )
+    ):
+        raise ValueError("COVERAGE_DIAGNOSTICS_NEGATIVE_COUNTER")
+
+    expected_space_size = (
+        prod(len(pool) for pool in candidate_pools)
+        if candidate_pools and all(candidate_pools)
+        else 0
+    )
+    if candidate_space_size != expected_space_size:
+        raise ValueError("COVERAGE_DIAGNOSTICS_CANDIDATE_SPACE_MISMATCH")
+
+    accepted_count = len(accepted_fingerprints)
+    preview_count = 1 if preview_seeded else 0
+    if preview_count > accepted_count:
+        raise ValueError("COVERAGE_DIAGNOSTICS_PREVIEW_STATE_INVALID")
+    if examined_count != proposal_attempted_count + preview_count:
+        raise ValueError("COVERAGE_DIAGNOSTICS_EXAMINED_PARTITION_INVALID")
+    non_preview_accepted_count = accepted_count - preview_count
+    if proposal_attempted_count != (
+        non_preview_accepted_count
+        + materialization_mismatch_count
+        + invalid_plan_count
+        + duplicate_fingerprint_reject_count
+    ):
+        raise ValueError("COVERAGE_DIAGNOSTICS_PROPOSAL_PARTITION_INVALID")
+
+    normalized_pools: list[tuple[tuple[str, MainVisualCandidate], ...]] = []
+    for beat_index, pool in enumerate(candidate_pools):
+        normalized_pool: list[tuple[str, MainVisualCandidate]] = []
+        seen_hashes: set[str] = set()
+        for candidate in pool:
+            normalized_hash = normalize_file_hash(candidate.file_hash)
+            if not normalized_hash:
+                raise ValueError(
+                    "COVERAGE_DIAGNOSTICS_CANDIDATE_IDENTITY_INVALID: "
+                    f"Beat {beat_index}"
+                )
+            if normalized_hash in seen_hashes:
+                continue
+            seen_hashes.add(normalized_hash)
+            normalized_pool.append((normalized_hash, candidate))
+        normalized_pools.append(tuple(normalized_pool))
+
+    authoritative_counts = [
+        {normalized_hash: 0 for normalized_hash, _candidate in pool}
+        for pool in normalized_pools
+    ]
+    for fingerprint in accepted_fingerprints:
+        if len(fingerprint) != beat_count:
+            raise ValueError("COVERAGE_DIAGNOSTICS_FINGERPRINT_BEAT_COUNT_MISMATCH")
+        for expected_index, component in enumerate(fingerprint):
+            beat_index, beat_identity, layer_index, normalized_file_hash = component
+            expected_identity = str(dsl_payload.timeline[expected_index].beat).strip()
+            if (
+                beat_index != expected_index
+                or beat_identity != expected_identity
+                or layer_index != 0
+            ):
+                raise ValueError("COVERAGE_DIAGNOSTICS_FINGERPRINT_ORDER_MISMATCH")
+            if normalized_file_hash not in authoritative_counts[beat_index]:
+                raise ValueError("COVERAGE_DIAGNOSTICS_SELECTED_HASH_OUTSIDE_POOL")
+            authoritative_counts[beat_index][normalized_file_hash] += 1
+
+    beat_diagnostics: list[_CoverageBeatDiagnosticsV1] = []
+    for beat_index, (node, normalized_pool, axis_coverage) in enumerate(
+        zip(dsl_payload.timeline, normalized_pools, coverage)
+    ):
+        pool_hashes = tuple(normalized_hash for normalized_hash, _ in normalized_pool)
+        if tuple(axis_coverage) != pool_hashes:
+            raise ValueError("COVERAGE_DIAGNOSTICS_COVERAGE_POOL_MISMATCH")
+        if any(type(count) is not int or count < 0 for count in axis_coverage.values()):
+            raise ValueError("COVERAGE_DIAGNOSTICS_COVERAGE_COUNT_INVALID")
+        if axis_coverage != authoritative_counts[beat_index]:
+            raise ValueError("COVERAGE_DIAGNOSTICS_COVERAGE_AUTHORITY_MISMATCH")
+
+        full_counts = [axis_coverage[normalized_hash] for normalized_hash in pool_hashes]
+        pool_size = len(normalized_pool)
+        selected_count = sum(full_counts)
+        if pool_size and selected_count != accepted_count:
+            raise ValueError("COVERAGE_DIAGNOSTICS_SELECTED_COUNT_MISMATCH")
+        if not pool_size and selected_count != 0:
+            raise ValueError("COVERAGE_DIAGNOSTICS_EMPTY_POOL_HAS_SELECTIONS")
+
+        selected_histogram = tuple(
+            _CoverageHistogramEntryV1(
+                normalized_file_hash=normalized_hash,
+                asset_id=candidate.asset_id,
+                count=axis_coverage[normalized_hash],
+            )
+            for normalized_hash, candidate in normalized_pool
+            if axis_coverage[normalized_hash] > 0
+        )
+        unique_used = len(selected_histogram)
+        unused_count = pool_size - unique_used
+        if unique_used > pool_size or unused_count < 0:
+            raise ValueError("COVERAGE_DIAGNOSTICS_UNIQUE_COUNT_INVALID")
+
+        if pool_size == 0:
+            ideal_floor = None
+            ideal_ceil = None
+            max_min_gap = None
+            classification = None
+        else:
+            ideal_floor, remainder = divmod(accepted_count, pool_size)
+            ideal_ceil = ideal_floor if remainder == 0 else ideal_floor + 1
+            max_min_gap = max(full_counts) - min(full_counts)
+            target_counts = sorted(
+                [ideal_ceil] * remainder
+                + [ideal_floor] * (pool_size - remainder)
+            )
+            target_met = (
+                len(full_counts) == pool_size
+                and all(type(count) is int and count >= 0 for count in full_counts)
+                and sum(full_counts) == accepted_count
+                and sorted(full_counts) == target_counts
+            )
+            if pool_size == 1:
+                classification = _COVERAGE_FIXED_BY_CAPACITY
+            elif target_met:
+                classification = _COVERAGE_VARIABLE_BALANCED
+            else:
+                classification = _COVERAGE_VARIABLE_TARGET_NOT_MET
+
+        beat_diagnostics.append(
+            _CoverageBeatDiagnosticsV1(
+                beat_index=beat_index,
+                beat_identity=str(node.beat),
+                role=str(node.role),
+                pool_size=pool_size,
+                selected_histogram=selected_histogram,
+                selected_count=selected_count,
+                unique_used=unique_used,
+                unused_count=unused_count,
+                ideal_floor=ideal_floor,
+                ideal_ceil=ideal_ceil,
+                max_min_gap=max_min_gap,
+                classification=classification,
+            )
+        )
+
+    accepted_digests = tuple(
+        _main_visual_planning_fingerprint_contract(fingerprint).fingerprint_digest
+        for fingerprint in accepted_fingerprints
+    )
+    if len(accepted_digests) != accepted_count:
+        raise ValueError("COVERAGE_DIAGNOSTICS_DIGEST_COUNT_MISMATCH")
+    preview_digest = accepted_digests[0] if preview_seeded else None
+    diagnostics = _CoverageDiagnosticsV1(
+        diagnostics_type=_COVERAGE_DIAGNOSTICS_TYPE,
+        version=_COVERAGE_DIAGNOSTICS_VERSION,
+        variant_planning_policy=_BALANCED_VARIANT_PLANNING_POLICY,
+        requested_count=requested_count,
+        accepted_count=accepted_count,
+        candidate_space_size=candidate_space_size,
+        search_budget=search_budget,
+        examined_count=examined_count,
+        proposal_attempted_count=proposal_attempted_count,
+        termination_reason=termination_reason,
+        preview_seeded=preview_seeded,
+        preview_child_index=0 if preview_seeded else None,
+        preview_fingerprint_digest=preview_digest,
+        accepted_fingerprint_digests=accepted_digests,
+        rejection_counts=_CoverageRejectionCountsV1(
+            materialization_mismatch_count=materialization_mismatch_count,
+            invalid_plan_count=invalid_plan_count,
+            duplicate_fingerprint_reject_count=duplicate_fingerprint_reject_count,
+        ),
+        beats=tuple(beat_diagnostics),
+    )
+    json.dumps(
+        _coverage_diagnostics_v1_payload(diagnostics),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return diagnostics
+
+
+def _validated_coverage_diagnostics_payload(
+    diagnostics: _CoverageDiagnosticsV1,
+    planning_result: _VariantPlanningResult,
+    computed_fingerprints: Sequence[_MainVisualFingerprint],
+) -> dict[str, Any]:
+    """Validate the balanced diagnostics against coordinator-approved truth."""
+    if (
+        diagnostics.diagnostics_type != _COVERAGE_DIAGNOSTICS_TYPE
+        or diagnostics.version != _COVERAGE_DIAGNOSTICS_VERSION
+        or diagnostics.variant_planning_policy
+        != _BALANCED_VARIANT_PLANNING_POLICY
+    ):
+        raise ValueError("COVERAGE_DIAGNOSTICS_COORDINATOR_CONTRACT_MISMATCH")
+    accepted_count = len(computed_fingerprints)
+    if (
+        diagnostics.accepted_count != accepted_count
+        or len(planning_result.plans) != accepted_count
+        or len(planning_result.fingerprints) != accepted_count
+        or diagnostics.examined_count != planning_result.examined_combinations
+        or diagnostics.candidate_space_size != planning_result.candidate_space_size
+        or diagnostics.termination_reason != planning_result.termination_reason
+    ):
+        raise ValueError("COVERAGE_DIAGNOSTICS_COORDINATOR_COUNT_MISMATCH")
+    coordinator_digests = tuple(
+        _main_visual_planning_fingerprint_contract(fingerprint).fingerprint_digest
+        for fingerprint in computed_fingerprints
+    )
+    if diagnostics.accepted_fingerprint_digests != coordinator_digests:
+        raise ValueError("COVERAGE_DIAGNOSTICS_COORDINATOR_DIGEST_MISMATCH")
+    payload = _coverage_diagnostics_v1_payload(diagnostics)
+    json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    return payload
+
+
+def _emit_balanced_coverage_summary(
+    task_id: str,
+    coverage_diagnostics: dict[str, Any],
+) -> None:
+    """Emit one best-effort batch coverage event through the project Loguru sink."""
+    try:
+        event_json = json.dumps(
+            {
+                "event": _BALANCED_COVERAGE_SUMMARY_EVENT,
+                "task_id": task_id,
+                "coverage_diagnostics": coverage_diagnostics,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        fingerprint_logger.info(f"[BalancedCoverageSummary] {event_json}")
+    except Exception:
+        pass
 
 
 def _bounded_fingerprint_log_string(
@@ -852,6 +1234,11 @@ def _plan_exact_main_visual_balanced_variants(
     examined_keys: set[tuple[tuple[int, str], ...]] = set()
     selection_mismatch_seen = False
     coverage = _initial_main_visual_coverage(candidate_pools)
+    preview_seeded = False
+    proposal_attempted_count = 0
+    materialization_mismatch_count = 0
+    invalid_plan_count = 0
+    duplicate_fingerprint_reject_count = 0
 
     preview_selections = _preview_selection(
         preview_plan,
@@ -866,6 +1253,7 @@ def _plan_exact_main_visual_balanced_variants(
         accepted_fingerprints.append(preview_fingerprint)
         used_fingerprints.add(preview_fingerprint)
         _update_main_visual_coverage(coverage, preview_fingerprint)
+        preview_seeded = True
 
     window = _balanced_candidate_window(
         candidate_pools,
@@ -894,6 +1282,7 @@ def _plan_exact_main_visual_balanced_variants(
         while scored_entries and len(examined_keys) < search_budget:
             _score, proposal = heapq.heappop(scored_entries)
             examined_keys.add(proposal.selection_key)
+            proposal_attempted_count += 1
             try:
                 materialized = parser.materialize_with_main_selections(
                     dsl_payload,
@@ -910,11 +1299,13 @@ def _plan_exact_main_visual_balanced_variants(
                     )
             except MainVisualSelectionMismatch:
                 selection_mismatch_seen = True
+                materialization_mismatch_count += 1
                 logger.exception(
                     "[variant_planner] explicit balanced selection materialization mismatch"
                 )
                 continue
             except ValueError:
+                invalid_plan_count += 1
                 logger.warning(
                     "[variant_planner] rejected invalid balanced main-visual plan",
                     exc_info=True,
@@ -922,6 +1313,7 @@ def _plan_exact_main_visual_balanced_variants(
                 continue
 
             if fingerprint in used_fingerprints:
+                duplicate_fingerprint_reject_count += 1
                 continue
             accepted_plans.append(materialized)
             accepted_fingerprints.append(fingerprint)
@@ -945,6 +1337,23 @@ def _plan_exact_main_visual_balanced_variants(
     if selection_mismatch_seen:
         warning_codes.append("PLANNER_SELECTION_MISMATCH")
 
+    coverage_diagnostics = _build_coverage_diagnostics_v1(
+        dsl_payload,
+        candidate_pools,
+        coverage,
+        accepted_fingerprints,
+        requested_count=requested_count,
+        candidate_space_size=candidate_space_size,
+        search_budget=search_budget,
+        examined_count=len(examined_keys),
+        proposal_attempted_count=proposal_attempted_count,
+        termination_reason=termination_reason,
+        preview_seeded=preview_seeded,
+        materialization_mismatch_count=materialization_mismatch_count,
+        invalid_plan_count=invalid_plan_count,
+        duplicate_fingerprint_reject_count=duplicate_fingerprint_reject_count,
+    )
+
     return _VariantPlanningResult(
         plans=tuple(accepted_plans),
         fingerprints=tuple(accepted_fingerprints),
@@ -952,6 +1361,7 @@ def _plan_exact_main_visual_balanced_variants(
         candidate_space_size=candidate_space_size,
         termination_reason=termination_reason,
         warning_codes=tuple(warning_codes),
+        coverage_diagnostics=coverage_diagnostics,
     )
 
 
@@ -1591,20 +2001,24 @@ def _persist_task_history(
     child_results: list[_ChildResult],
     output_assets: list[dict],
     warning_codes: list[str],
+    coverage_diagnostics: Optional[dict[str, Any]] = None,
 ) -> None:
     """Persist the single completed-result row owned by the coordinator."""
     first_success = next(result for result in child_results if result.succeeded)
     legacy_details = first_success.prompt_details
+    planning_summary: dict[str, Any] = {
+        "requested_count": batch_size,
+        "planned_count": len(child_results),
+        "succeeded_count": sum(result.succeeded for result in child_results),
+        "failed_count": sum(not result.succeeded for result in child_results),
+        "warning_codes": list(warning_codes),
+    }
+    if coverage_diagnostics is not None:
+        planning_summary["coverage_diagnostics"] = coverage_diagnostics
     prompt_details: dict[str, Any] = {
         "meta": legacy_details.get("meta"),
         "timeline": legacy_details.get("timeline") or [],
-        "planning_summary": {
-            "requested_count": batch_size,
-            "planned_count": len(child_results),
-            "succeeded_count": sum(result.succeeded for result in child_results),
-            "failed_count": sum(not result.succeeded for result in child_results),
-            "warning_codes": list(warning_codes),
-        },
+        "planning_summary": planning_summary,
         "children": [
             {
                 "child_index": result.child_index,
@@ -1670,6 +2084,7 @@ def render_batch_worker(
     )
 
     planning_warning_codes: list[str] = []
+    coverage_diagnostics_payload: Optional[dict[str, Any]] = None
     child_work: list[_ChildWork] = []
     planning_function = None
     if variant_planning_policy == "exact_main_visual":
@@ -1706,6 +2121,22 @@ def render_batch_worker(
                     raise ValueError(
                         "PLANNER_RESULT_INVALID: authoritative plans/fingerprints mismatch"
                     )
+                if variant_planning_policy == _BALANCED_VARIANT_PLANNING_POLICY:
+                    if planning_result.coverage_diagnostics is None:
+                        raise ValueError("COVERAGE_DIAGNOSTICS_MISSING")
+                    coverage_diagnostics_payload = (
+                        _validated_coverage_diagnostics_payload(
+                            planning_result.coverage_diagnostics,
+                            planning_result,
+                            computed_fingerprints,
+                        )
+                    )
+                    _emit_balanced_coverage_summary(
+                        task_id,
+                        coverage_diagnostics_payload,
+                    )
+                elif planning_result.coverage_diagnostics is not None:
+                    raise ValueError("COVERAGE_DIAGNOSTICS_UNEXPECTED_FOR_EXACT_POLICY")
                 planning_warning_codes.extend(planning_result.warning_codes)
                 identities = (
                     _create_child_executions(task_id, len(planning_result.plans))
@@ -1867,6 +2298,7 @@ def render_batch_worker(
                 child_results=child_results,
                 output_assets=all_assets,
                 warning_codes=warning_codes,
+                coverage_diagnostics=coverage_diagnostics_payload,
             )
             history_persisted = True
             logger.info(

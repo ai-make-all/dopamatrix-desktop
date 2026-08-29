@@ -285,17 +285,7 @@ class BalancedPolicyRoutingTests(unittest.TestCase):
 
     def test_var1b10_capacity_warning_propagates_without_duplicate_fill(self):
         pools = _pools(2)
-        payload = _payload(pools)
-        plans = [
-            _plan_for_selections(payload, (pools[0][0],)),
-            _plan_for_selections(payload, (pools[0][1],)),
-        ]
-        result = _planning_result(
-            plans,
-            warning_codes=("INSUFFICIENT_UNIQUE_CAPACITY",),
-            reason="TRUE_SPACE_EXHAUSTED",
-            candidate_space_size=2,
-        )
+        result, _parser, payload = _balanced(pools, 4)
 
         terminal, captured, exact, balanced, _worker = _run_coordinator(
             payload,
@@ -313,14 +303,7 @@ class BalancedPolicyRoutingTests(unittest.TestCase):
 
     def test_var1b11_search_limit_warning_propagates(self):
         pools = _pools(2, 2)
-        payload = _payload(pools)
-        plan = _plan_for_selections(payload, (pools[0][0], pools[1][0]))
-        result = _planning_result(
-            [plan],
-            warning_codes=("PLANNING_SEARCH_LIMIT_REACHED",),
-            reason="PLANNING_SEARCH_LIMIT_REACHED",
-            candidate_space_size=4,
-        )
+        result, _parser, payload = _balanced(pools, 4, search_budget=1)
 
         terminal, captured, exact, balanced, _worker = _run_coordinator(
             payload,
