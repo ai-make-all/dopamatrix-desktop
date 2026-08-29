@@ -229,20 +229,41 @@ class PlanningPolicyFrontendContractTests(unittest.TestCase):
         cls.drawer = (
             REPO_ROOT / "web_ui/src/views/DslOrchestratorDrawer.vue"
         ).read_text(encoding="utf-8")
+        draft_start = cls.workspace.index("async function draftBlueprint()")
+        draft_end = cls.workspace.index("function buildTimelineFromTracks()")
+        cls.draft_blueprint = cls.workspace[draft_start:draft_end]
+        confirm_start = cls.workspace.index("function onOrchestratorConfirm(")
+        confirm_end = cls.workspace.index("const stagedBlockCount")
+        cls.orchestrator_confirm = cls.workspace[confirm_start:confirm_end]
+        fission_start = cls.workspace.index("async function blindFission(")
+        fission_end = cls.workspace.index("</script>", fission_start)
+        cls.blind_fission = cls.workspace[fission_start:fission_end]
 
-    def test_ai_draft_direct_render_carries_exact_policy(self):
+    def test_ai_draft_direct_render_carries_balanced_policy(self):
         self.assertIn(
             "const EXACT_MAIN_VISUAL_PLANNING_POLICY = 'exact_main_visual'",
             self.workspace,
         )
-        self.assertNotIn("exact_main_visual_balanced", self.workspace)
-        self.assertNotIn("exact_main_visual_balanced", self.drawer)
         self.assertIn(
-            "orchestratorVariantPlanningPolicy.value = "
-            "EXACT_MAIN_VISUAL_PLANNING_POLICY",
+            "const BALANCED_MAIN_VISUAL_PLANNING_POLICY = "
+            "'exact_main_visual_balanced'",
             self.workspace,
         )
-        self.assertIn("orchestratorDirectRender.value = true", self.workspace)
+        self.assertIn(
+            "orchestratorVariantPlanningPolicy.value = "
+            "BALANCED_MAIN_VISUAL_PLANNING_POLICY",
+            self.draft_blueprint,
+        )
+        self.assertNotIn("exact_main_visual_balanced", self.drawer)
+        self.assertIn(
+            "orchestratorDirectRender.value = true",
+            self.draft_blueprint,
+        )
+        self.assertNotIn(
+            "orchestratorVariantPlanningPolicy.value = "
+            "EXACT_MAIN_VISUAL_PLANNING_POLICY",
+            self.draft_blueprint,
+        )
         self.assertIn(
             ':variant-planning-policy="orchestratorVariantPlanningPolicy"',
             self.workspace,
@@ -253,9 +274,15 @@ class PlanningPolicyFrontendContractTests(unittest.TestCase):
             "variantPlanningPolicy: props.variantPlanningPolicy",
             self.drawer,
         )
+        self.assertIn("blindFission({", self.orchestrator_confirm)
+        self.assertIn("variantPlanningPolicy,", self.orchestrator_confirm)
         self.assertIn(
             "variant_planning_policy: variantPlanningPolicy",
-            self.workspace,
+            self.blind_fission,
+        )
+        self.assertIn(
+            "const variantPlanningPolicy = options.variantPlanningPolicy",
+            self.blind_fission,
         )
 
     def test_generic_submission_explicitly_defaults_to_legacy(self):

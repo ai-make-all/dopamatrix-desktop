@@ -528,7 +528,7 @@ class ExactPlannerControlTests(unittest.TestCase):
             ],
         )
 
-    def test_phase1b_activates_backend_policy_without_frontend_activation(self):
+    def test_phase1ca_activates_ai_draft_without_changing_backend_contract(self):
         schemas_source = (REPO_ROOT / "src/api/schemas.py").read_text(encoding="utf-8")
         routes_source = (REPO_ROOT / "src/api/routes_dsl.py").read_text(encoding="utf-8")
         workspace_source = (
@@ -540,7 +540,20 @@ class ExactPlannerControlTests(unittest.TestCase):
             'variant_planning_policy == "exact_main_visual_balanced"',
             routes_source,
         )
-        self.assertNotIn("exact_main_visual_balanced", workspace_source)
+        self.assertIn(
+            "const EXACT_MAIN_VISUAL_PLANNING_POLICY = 'exact_main_visual'",
+            workspace_source,
+        )
+        self.assertIn(
+            "const BALANCED_MAIN_VISUAL_PLANNING_POLICY = "
+            "'exact_main_visual_balanced'",
+            workspace_source,
+        )
+        self.assertIn(
+            "orchestratorVariantPlanningPolicy.value = "
+            "BALANCED_MAIN_VISUAL_PLANNING_POLICY",
+            workspace_source,
+        )
 
 
 if __name__ == "__main__":

@@ -110,6 +110,7 @@ const omniPrompt      = ref('')
 const scriptMode      = ref('auto')
 const LEGACY_VARIANT_PLANNING_POLICY = 'legacy'
 const EXACT_MAIN_VISUAL_PLANNING_POLICY = 'exact_main_visual'
+const BALANCED_MAIN_VISUAL_PLANNING_POLICY = 'exact_main_visual_balanced'
 const omniPlaceholder = computed(() =>
   scriptMode.value === 'rewrite'
     ? '粘贴您的核心营销文案全文。AI 将在保持卖点绝对不变的前提下，为您裂变出 N 个语气不同的变体文案，完美规避 TikTok 音频查重...'
@@ -337,7 +338,7 @@ async function draftBlueprint() {
     // 等待 Vue 完成本轮响应式更新，确保抽屉 watch 读到已含 items 的 dslTracks
     await nextTick()
     orchestratorDirectRender.value = true
-    orchestratorVariantPlanningPolicy.value = EXACT_MAIN_VISUAL_PLANNING_POLICY
+    orchestratorVariantPlanningPolicy.value = BALANCED_MAIN_VISUAL_PLANNING_POLICY
     showOrchestrator.value = true
     store.showToast('✨ 蓝图已生成，请在战术板验收语义标签')
   } catch (err) {
