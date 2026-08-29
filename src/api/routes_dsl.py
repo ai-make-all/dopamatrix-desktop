@@ -141,20 +141,33 @@ def _requests_exact_main_visual(payload: RenderDSLRequest) -> bool:
     return payload.variant_planning_policy == "exact_main_visual"
 
 
+def _requests_exact_main_visual_balanced(payload: RenderDSLRequest) -> bool:
+    """Return whether the request explicitly selects balanced exact planning."""
+    return payload.variant_planning_policy == "exact_main_visual_balanced"
+
+
+def _requests_authoritative_main_visual(payload: RenderDSLRequest) -> bool:
+    """Return whether request-time preview setup is required by either exact policy."""
+    return _requests_exact_main_visual(payload) or _requests_exact_main_visual_balanced(
+        payload
+    )
+
+
 def _guard_pre_planner_policy(
     payload: RenderDSLRequest,
     *,
     flow: str,
     is_blind: bool = False,
 ) -> None:
-    """Keep exact planning confined to populated ``submit-dsl`` requests."""
-    if not _requests_exact_main_visual(payload):
+    """Keep authoritative exact planning confined to populated submit-dsl requests."""
+    if not _requests_authoritative_main_visual(payload):
         return
+    policy_code = payload.variant_planning_policy.upper()
     if is_blind:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                "EXACT_MAIN_VISUAL_UNSUPPORTED_FOR_BLIND: "
+                f"{policy_code}_UNSUPPORTED_FOR_BLIND: "
                 "Blind planning is not implemented in INV-001 Phase 3A."
             ),
         )
@@ -163,7 +176,7 @@ def _guard_pre_planner_policy(
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail=(
-            f"EXACT_MAIN_VISUAL_UNSUPPORTED_FOR_{flow.upper().replace('-', '_')}: "
+            f"{policy_code}_UNSUPPORTED_FOR_{flow.upper().replace('-', '_')}: "
             "this endpoint preserves its legacy planning semantics."
         ),
     )
@@ -965,6 +978,29 @@ def _plan_exact_main_visual_variants_from_db(
         )
 
 
+def _plan_exact_main_visual_balanced_variants_from_db(
+    tenant_id: str,
+    dsl_payload: StoryDSLPayload,
+    requested_count: int,
+    *,
+    preview_plan: Optional[CompilationPlan] = None,
+) -> _VariantPlanningResult:
+    """Run balanced discovery and materialization inside one tenant DB session."""
+    tenant_engine = get_tenant_engine(tenant_id)
+    SessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=tenant_engine,
+    )
+    with SessionLocal() as db:
+        return _plan_exact_main_visual_balanced_variants(
+            DSLParserNode(db),
+            dsl_payload,
+            requested_count,
+            preview_plan=preview_plan,
+        )
+
+
 @dataclass(frozen=True)
 class _ChildResult:
     """Internal result envelope returned by one child render execution."""
@@ -1635,18 +1671,25 @@ def render_batch_worker(
 
     planning_warning_codes: list[str] = []
     child_work: list[_ChildWork] = []
+    planning_function = None
     if variant_planning_policy == "exact_main_visual":
+        planning_function = _plan_exact_main_visual_variants_from_db
+    elif variant_planning_policy == "exact_main_visual_balanced":
+        planning_function = _plan_exact_main_visual_balanced_variants_from_db
+
+    if planning_function is not None:
         if blind_dsl or dsl_payload is None:
             logger.error(
-                "[render_batch_worker] exact planning received unsupported/missing DSL "
-                "task_id=%s blind=%s",
+                "[render_batch_worker] authoritative planning received unsupported/missing "
+                "DSL task_id=%s policy=%s blind=%s",
                 task_id,
+                variant_planning_policy,
                 blind_dsl,
             )
             planning_warning_codes.append("VARIANT_PLANNING_FAILED")
         else:
             try:
-                planning_result = _plan_exact_main_visual_variants_from_db(
+                planning_result = planning_function(
                     tenant_id,
                     dsl_payload,
                     batch_size,
@@ -1682,9 +1725,10 @@ def render_batch_worker(
                     )
                 ]
                 logger.info(
-                    "[render_batch_worker] exact planning task_id=%s requested=%d "
-                    "planned=%d examined=%d space=%d reason=%s warnings=%s",
+                    "[render_batch_worker] authoritative planning task_id=%s policy=%s "
+                    "requested=%d planned=%d examined=%d space=%d reason=%s warnings=%s",
                     task_id,
+                    variant_planning_policy,
                     batch_size,
                     len(child_work),
                     planning_result.examined_combinations,
@@ -1694,14 +1738,24 @@ def render_batch_worker(
                 )
             except Exception:
                 logger.exception(
-                    "[render_batch_worker] exact planning failed task_id=%s", task_id,
+                    "[render_batch_worker] authoritative planning failed task_id=%s "
+                    "policy=%s",
+                    task_id,
+                    variant_planning_policy,
                 )
                 planning_warning_codes.append("VARIANT_PLANNING_FAILED")
-    else:
+    elif variant_planning_policy == "legacy":
         child_work = [
             _ChildWork(execution=child)
             for child in _create_child_executions(task_id, batch_size)
         ]
+    else:
+        logger.error(
+            "[render_batch_worker] unsupported variant planning policy task_id=%s policy=%s",
+            task_id,
+            variant_planning_policy,
+        )
+        planning_warning_codes.append("VARIANT_PLANNING_FAILED")
 
     child_results: list[_ChildResult] = []
 
@@ -2137,7 +2191,7 @@ def submit_dsl(
         "enable_subtitles": payload.enable_subtitles,
         "variant_planning_policy": payload.variant_planning_policy,
     }
-    if _requests_exact_main_visual(payload):
+    if _requests_authoritative_main_visual(payload):
         # Request-time preview is only a validated seed; the coordinator still
         # owns bounded batch planning before any child identity is allocated.
         _worker_kw["resolved_plan"] = plan

@@ -68,6 +68,18 @@ def _plan() -> CompilationPlan:
 
 
 class PlanningPolicySchemaTests(unittest.TestCase):
+    def test_all_supported_policies_are_schema_valid(self):
+        for policy in (
+            "legacy",
+            "exact_main_visual",
+            "exact_main_visual_balanced",
+        ):
+            with self.subTest(policy=policy):
+                self.assertEqual(
+                    _request(variant_planning_policy=policy).variant_planning_policy,
+                    policy,
+                )
+
     def test_omitted_policy_defaults_to_legacy(self):
         request = _request()
 
@@ -82,6 +94,14 @@ class PlanningPolicySchemaTests(unittest.TestCase):
 
         self.assertEqual(request.variant_planning_policy, "exact_main_visual")
         self.assertTrue(routes_dsl._requests_exact_main_visual(request))
+        self.assertFalse(routes_dsl._requests_exact_main_visual_balanced(request))
+
+    def test_balanced_policy_is_distinct_and_backend_visible(self):
+        request = _request(variant_planning_policy="exact_main_visual_balanced")
+
+        self.assertFalse(routes_dsl._requests_exact_main_visual(request))
+        self.assertTrue(routes_dsl._requests_exact_main_visual_balanced(request))
+        self.assertTrue(routes_dsl._requests_authoritative_main_visual(request))
 
     def test_invalid_policy_fails_schema_validation(self):
         with self.assertRaises(ValidationError):
@@ -129,6 +149,29 @@ class PlanningPolicyRouteTests(unittest.TestCase):
         self.assertIn(
             "EXACT_MAIN_VISUAL_UNSUPPORTED_FOR_BLIND",
             str(raised.exception.detail),
+        )
+
+    def test_balanced_policy_schedules_same_request_time_preview_contract(self):
+        parser = Mock()
+        parser.parse_and_resolve.return_value = _plan()
+        background = Mock()
+
+        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+            response = routes_dsl.submit_dsl(
+                _request(variant_planning_policy="exact_main_visual_balanced"),
+                background,
+                db=Mock(),
+            )
+
+        self.assertEqual(response.render_status, "rendering")
+        scheduled = background.add_task.call_args
+        self.assertEqual(
+            scheduled.kwargs["variant_planning_policy"],
+            "exact_main_visual_balanced",
+        )
+        self.assertIs(
+            scheduled.kwargs["resolved_plan"],
+            parser.parse_and_resolve.return_value,
         )
 
     def test_manual_default_policy_preserves_dispatch(self):
@@ -188,6 +231,12 @@ class PlanningPolicyFrontendContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
     def test_ai_draft_direct_render_carries_exact_policy(self):
+        self.assertIn(
+            "const EXACT_MAIN_VISUAL_PLANNING_POLICY = 'exact_main_visual'",
+            self.workspace,
+        )
+        self.assertNotIn("exact_main_visual_balanced", self.workspace)
+        self.assertNotIn("exact_main_visual_balanced", self.drawer)
         self.assertIn(
             "orchestratorVariantPlanningPolicy.value = "
             "EXACT_MAIN_VISUAL_PLANNING_POLICY",

@@ -399,11 +399,16 @@ class RenderDSLRequest(BaseModel):
         default="auto",
         description="导演节点模式：'auto' | 'rewrite'，透传 DirectorNode / draft-blueprint。",
     )
-    variant_planning_policy: Literal["legacy", "exact_main_visual"] = Field(
+    variant_planning_policy: Literal[
+        "legacy",
+        "exact_main_visual",
+        "exact_main_visual_balanced",
+    ] = Field(
         default="legacy",
         description=(
             "批次变体规划策略。legacy 保持既有 worker-local resolution；"
-            "exact_main_visual 请求精确主视觉组合唯一性规划。"
+            "exact_main_visual 请求精确主视觉组合唯一性规划；"
+            "exact_main_visual_balanced 在相同精确唯一性约束上优化 Beat 轴覆盖。"
         ),
     )
     user_hard_tags:  List[str]        = Field(

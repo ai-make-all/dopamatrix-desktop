@@ -528,15 +528,15 @@ class ExactPlannerControlTests(unittest.TestCase):
             ],
         )
 
-    def test_phase1a_does_not_activate_balanced_policy(self):
+    def test_phase1b_activates_backend_policy_without_frontend_activation(self):
         schemas_source = (REPO_ROOT / "src/api/schemas.py").read_text(encoding="utf-8")
         routes_source = (REPO_ROOT / "src/api/routes_dsl.py").read_text(encoding="utf-8")
         workspace_source = (
             REPO_ROOT / "web_ui/src/views/WorkspaceView.vue"
         ).read_text(encoding="utf-8")
 
-        self.assertNotIn('"exact_main_visual_balanced"', schemas_source)
-        self.assertNotIn(
+        self.assertIn('"exact_main_visual_balanced"', schemas_source)
+        self.assertIn(
             'variant_planning_policy == "exact_main_visual_balanced"',
             routes_source,
         )
