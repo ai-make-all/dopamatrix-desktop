@@ -168,11 +168,11 @@ async def health_check() -> HealthResponse:
 # ================================================================== #
 # Phase 5 & DAM 路由挂载                                                #
 # ================================================================== #
+# 今日态任务列表必须先于 /tasks/{task_id} 注册，避免 "today" 被动态路由抢先匹配。
+app.include_router(tasks_today_router, prefix="/api/v1")
 app.include_router(task_routes.router, prefix="/api/v1")
 app.include_router(routes_assets.router, prefix="/api/v1")
 app.include_router(routes_history.router, prefix="/api/v1")
-# 今日态任务列表（QueueView 刷新水合用）
-app.include_router(tasks_today_router, prefix="/api/v1")
 # 审批状态机 & 交付包导出 (Phase 9.9)
 app.include_router(routes_matrix.router, prefix="/api/v1")
 app.include_router(routes_approval.router, prefix="/api/v1")
