@@ -2103,6 +2103,7 @@ def render_batch_worker(
             )
             planning_warning_codes.append("VARIANT_PLANNING_FAILED")
         else:
+            staged_coverage_diagnostics_payload: Optional[dict[str, Any]] = None
             try:
                 planning_result = planning_function(
                     tenant_id,
@@ -2124,7 +2125,7 @@ def render_batch_worker(
                 if variant_planning_policy == _BALANCED_VARIANT_PLANNING_POLICY:
                     if planning_result.coverage_diagnostics is None:
                         raise ValueError("COVERAGE_DIAGNOSTICS_MISSING")
-                    coverage_diagnostics_payload = (
+                    staged_coverage_diagnostics_payload = (
                         _validated_coverage_diagnostics_payload(
                             planning_result.coverage_diagnostics,
                             planning_result,
@@ -2133,7 +2134,7 @@ def render_batch_worker(
                     )
                     _emit_balanced_coverage_summary(
                         task_id,
-                        coverage_diagnostics_payload,
+                        staged_coverage_diagnostics_payload,
                     )
                 elif planning_result.coverage_diagnostics is not None:
                     raise ValueError("COVERAGE_DIAGNOSTICS_UNEXPECTED_FOR_EXACT_POLICY")
@@ -2175,6 +2176,8 @@ def render_batch_worker(
                     variant_planning_policy,
                 )
                 planning_warning_codes.append("VARIANT_PLANNING_FAILED")
+            else:
+                coverage_diagnostics_payload = staged_coverage_diagnostics_payload
     elif variant_planning_policy == "legacy":
         child_work = [
             _ChildWork(execution=child)
@@ -2327,6 +2330,8 @@ def render_batch_worker(
     }
     if all_assets:
         terminal_payload["assets"] = all_assets
+    if coverage_diagnostics_payload is not None:
+        terminal_payload["coverageDiagnostics"] = coverage_diagnostics_payload
 
     try:
         ws_manager.broadcast_sync(

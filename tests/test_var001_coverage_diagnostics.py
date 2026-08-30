@@ -381,7 +381,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(emitted), 1)
         self.assertIs(emitted[0], persisted[0])
         self.assertEqual(emitted[0], _payload_for(result))
-        self.assertNotIn("coverageDiagnostics", terminal)
+        self.assertIs(terminal["coverageDiagnostics"], emitted[0])
 
     def test_coordinator_digest_mismatch_is_hard_and_emits_nothing(self):
         result, _parser, payload = _balanced(_pools(2), 2)
@@ -399,6 +399,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
         worker.assert_not_called()
         self.assertEqual(terminal["plannedCount"], 0)
         self.assertIn("VARIANT_PLANNING_FAILED", terminal["warningCodes"])
+        self.assertNotIn("coverageDiagnostics", terminal)
 
     def test_coordinator_contract_identity_mismatch_is_hard(self):
         result, _parser, payload = _balanced(_pools(2), 2)
@@ -434,6 +435,43 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
                     "VARIANT_PLANNING_FAILED",
                     terminal["warningCodes"],
                 )
+                self.assertNotIn("coverageDiagnostics", terminal)
+
+    def test_post_validation_coordinator_failure_does_not_commit_live_coverage(self):
+        result, _parser, payload = _balanced(_pools(2), 2)
+        validated = []
+        original_validate = routes_dsl._validated_coverage_diagnostics_payload
+
+        def validate(*args):
+            coverage_payload = original_validate(*args)
+            validated.append(coverage_payload)
+            return coverage_payload
+
+        with (
+            patch.object(
+                routes_dsl,
+                "_validated_coverage_diagnostics_payload",
+                side_effect=validate,
+            ),
+            patch.object(
+                routes_dsl,
+                "_create_child_executions",
+                side_effect=RuntimeError("controlled coordinator failure"),
+            ),
+            patch.object(
+                routes_dsl,
+                "_emit_balanced_coverage_summary",
+            ) as summary,
+        ):
+            terminal, worker, persist = _run_balanced_coordinator(payload, result)
+
+        self.assertEqual(validated, [_payload_for(result)])
+        summary.assert_called_once_with("coverage-task", validated[0])
+        worker.assert_not_called()
+        persist.assert_not_called()
+        self.assertEqual(terminal["plannedCount"], 0)
+        self.assertIn("VARIANT_PLANNING_FAILED", terminal["warningCodes"])
+        self.assertNotIn("coverageDiagnostics", terminal)
 
     def test_summary_loguru_payload_and_logger_failure_are_nonblocking(self):
         result, _parser, payload = _balanced(_pools(2), 2)
@@ -481,6 +519,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
             ),
         )
         self.assertEqual(terminal["succeededCount"], 3)
+        self.assertEqual(terminal["coverageDiagnostics"]["accepted_count"], 4)
         self.assertEqual(persisted[0]["accepted_count"], 4)
 
     def test_cov11_taskhistory_persists_nested_payload_without_schema_change(self):
@@ -577,7 +616,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
             patch.object(routes_dsl, "_emit_balanced_coverage_summary") as summary,
             patch.object(routes_dsl.ws_manager, "broadcast_sync"),
         ):
-            routes_dsl.render_batch_worker(
+            exact_terminal = routes_dsl.render_batch_worker(
                 payload,
                 "exact-task",
                 batch_size=2,
@@ -585,6 +624,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
             )
         summary.assert_not_called()
         self.assertIsNone(persisted[0]["coverage_diagnostics"])
+        self.assertNotIn("coverageDiagnostics", exact_terminal)
 
         persisted.clear()
         resolved = _plan_for_selections(payload, (pools[0][0],))
@@ -598,7 +638,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
             patch.object(routes_dsl, "_emit_balanced_coverage_summary") as summary,
             patch.object(routes_dsl.ws_manager, "broadcast_sync"),
         ):
-            routes_dsl.render_batch_worker(
+            legacy_terminal = routes_dsl.render_batch_worker(
                 payload,
                 "legacy-task",
                 batch_size=1,
@@ -607,6 +647,7 @@ class CoverageDiagnosticsCoordinatorTests(unittest.TestCase):
             )
         summary.assert_not_called()
         self.assertIsNone(persisted[0]["coverage_diagnostics"])
+        self.assertNotIn("coverageDiagnostics", legacy_terminal)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@
 
 import { defineStore } from 'pinia'
 import { ref }         from 'vue'
+import { normalizeCoverageDiagnostics } from '../utils/coverageDiagnostics'
 
 // ── 从 Worker 侧复用类型（避免重复定义） ──────────────────────────────────────
 export type { QueueTask, QueueTaskAsset, QueueStats, TaskStatus, WsUpdatePayload } from '../workers/queueWorker'
@@ -260,6 +261,7 @@ export const useQueueStore = defineStore('queue', () => {
   // ── 降级逻辑（Worker 不可用时） ────────────────────────────────────────────
   function _fallbackUpdate(payload: WsUpdatePayload): void {
     const existing = tasks.value.find(t => t.id === payload.taskId)
+    const coverageDiagnostics = normalizeCoverageDiagnostics(payload.coverageDiagnostics)
     if (existing) {
       existing.type = payload.status
       if (payload.assets?.length) existing.assets = payload.assets
@@ -270,6 +272,7 @@ export const useQueueStore = defineStore('queue', () => {
       if (payload.failedCount !== undefined) existing.failedCount = payload.failedCount
       if (payload.historyPersisted !== undefined) existing.historyPersisted = payload.historyPersisted
       if (Array.isArray(payload.warningCodes)) existing.warningCodes = [...payload.warningCodes]
+      if (coverageDiagnostics) existing.coverageDiagnostics = coverageDiagnostics
     } else {
       const now = new Date()
       const ts  = now.toLocaleTimeString('zh', {
@@ -290,6 +293,7 @@ export const useQueueStore = defineStore('queue', () => {
         failedCount: payload.failedCount,
         historyPersisted: payload.historyPersisted,
         warningCodes: Array.isArray(payload.warningCodes) ? [...payload.warningCodes] : undefined,
+        coverageDiagnostics,
       })
     }
 

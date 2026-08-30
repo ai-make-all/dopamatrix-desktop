@@ -14,6 +14,11 @@
  *  { type: 'TICK', payload: { tasks: QueueTask[], stats: QueueStats } }
  */
 
+import {
+  normalizeCoverageDiagnostics,
+  type CoverageDiagnosticsV1,
+} from '../utils/coverageDiagnostics'
+
 // ── 共享类型定义 ─────────────────────────────────────────────────────────────
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
@@ -56,6 +61,7 @@ export interface QueueTask {
   failedCount?: number
   historyPersisted?: boolean
   warningCodes?: string[]
+  coverageDiagnostics?: CoverageDiagnosticsV1
 }
 
 export interface QueueStats {
@@ -82,6 +88,7 @@ export interface WsUpdatePayload {
   failedCount?: number
   historyPersisted?: boolean
   warningCodes?: string[]
+  coverageDiagnostics?: unknown
 }
 
 // ── 内部状态 ─────────────────────────────────────────────────────────────────
@@ -211,6 +218,7 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
   if (!payload?.taskId) return
 
   const existing = _tasks.find(t => t.id === payload.taskId)
+  const coverageDiagnostics = normalizeCoverageDiagnostics(payload.coverageDiagnostics)
 
   if (!existing) {
     // ── 新任务入队 ───────────────────────────────────────────────────────────
@@ -236,6 +244,7 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
       failedCount: payload.failedCount,
       historyPersisted: payload.historyPersisted,
       warningCodes: Array.isArray(payload.warningCodes) ? [...payload.warningCodes] : undefined,
+      coverageDiagnostics,
     })
   } else {
     // ── 更新已有任务 ─────────────────────────────────────────────────────────
@@ -249,6 +258,7 @@ function _handleWsUpdate(payload: WsUpdatePayload): void {
     if (payload.failedCount !== undefined) existing.failedCount = payload.failedCount
     if (payload.historyPersisted !== undefined) existing.historyPersisted = payload.historyPersisted
     if (Array.isArray(payload.warningCodes)) existing.warningCodes = [...payload.warningCodes]
+    if (coverageDiagnostics) existing.coverageDiagnostics = coverageDiagnostics
     if (payload.mode || payload.generation_mode) {
       existing.mode = payload.mode || payload.generation_mode
       existing.generation_mode = payload.generation_mode || payload.mode

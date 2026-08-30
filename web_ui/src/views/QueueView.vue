@@ -16,6 +16,10 @@ import type { QueueTask, QueueTaskAsset } from '../stores/useQueueStore'
 import { useAppStore }    from '../stores/appStore'
 import { updateVideoStatus } from '../api'
 import { deriveRenderOutcomeSummary } from '../utils/renderOutcome'
+import {
+  mergeCoverageDiagnostics,
+  normalizeCoverageDiagnostics,
+} from '../utils/coverageDiagnostics'
 import MasterPreviewModal from '../components/MasterPreviewModal.vue'
 import CoverPreviewCard   from '../components/matrix/CoverPreviewCard.vue'
 
@@ -55,6 +59,7 @@ function parseHistoryOutcome(record: any) {
   const plannedCount = summary.planned_count
   const succeededCount = summary.succeeded_count
   const failedCount = summary.failed_count
+  const coverageDiagnostics = normalizeCoverageDiagnostics(summary.coverage_diagnostics)
   return {
     partial: succeededCount > 0 && (failedCount > 0 || plannedCount < requestedCount),
     requestedCount,
@@ -63,6 +68,7 @@ function parseHistoryOutcome(record: any) {
     failedCount,
     historyPersisted: true,
     warningCodes: Array.isArray(summary.warning_codes) ? [...summary.warning_codes] : [],
+    coverageDiagnostics,
   }
 }
 
@@ -136,11 +142,18 @@ async function fetchTodayTasks(): Promise<Map<string, QueueTask>> {
     todayCompleted.forEach(t => hydratedById.set(t.id, t))
 
     // 仅追加本地尚未记录的任务，不覆盖 WS 实时推送的任务
-    const mergedTasks = queueStore.tasks.map(t =>
-      t.type === 'completed' && hydratedById.has(t.id)
-        ? { ...t, ...hydratedById.get(t.id)! }
-        : t
-    )
+    const mergedTasks = queueStore.tasks.map(t => {
+      if (t.type !== 'completed' || !hydratedById.has(t.id)) return t
+      const historical = hydratedById.get(t.id)!
+      return {
+        ...t,
+        ...historical,
+        coverageDiagnostics: mergeCoverageDiagnostics(
+          t.coverageDiagnostics,
+          historical.coverageDiagnostics,
+        ),
+      }
+    })
     const existingIds = new Set(mergedTasks.map(t => t.id))
     const newTasks = todayCompleted.filter(t => !existingIds.has(t.id))
     queueStore.initTasks([...mergedTasks, ...newTasks])
