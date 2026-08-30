@@ -22,6 +22,7 @@ import {
 } from '../utils/coverageDiagnostics'
 import MasterPreviewModal from '../components/MasterPreviewModal.vue'
 import CoverPreviewCard   from '../components/matrix/CoverPreviewCard.vue'
+import CoverageDiagnosticsPanel from '../components/CoverageDiagnosticsPanel.vue'
 
 const queueStore = useQueueStore()
 const appStore   = useAppStore()
@@ -215,6 +216,12 @@ const expandedPrompts = reactive<Set<string>>(new Set())
 function togglePrompt(id: string) {
   if (expandedPrompts.has(id)) expandedPrompts.delete(id)
   else expandedPrompts.add(id)
+}
+
+const expandedCoveragePanels = reactive<Set<string>>(new Set())
+function setCoveragePanelExpanded(id: string, open: boolean) {
+  if (open) expandedCoveragePanels.add(id)
+  else expandedCoveragePanels.delete(id)
 }
 
 const expandedAssetTitles = reactive<Set<string>>(new Set())
@@ -521,47 +528,59 @@ const triggerRealWsFlood = async () => {
         <p>流水线空闲，前往工作台创建矩阵任务</p>
       </div>
 
-      <!-- item-size = strip(52px) + margin-bottom(8px) = 60 -->
-      <RecycleScroller
+      <DynamicScroller
         v-else
         class="task-scroller"
         :items="processingTasks"
-        :item-size="60"
+        :min-item-size="60"
         :prerender="14"
         key-field="id"
-        v-slot="{ item }"
+        v-slot="{ item, active }"
       >
-        <!-- 极简监控条：零 <video>/<img>，~8 DOM 节点 -->
-        <div :class="['monitor-strip', `monitor-strip--${item.type}`]">
+        <DynamicScrollerItem
+          :item="item"
+          :active="active"
+          :size-dependencies="[expandedCoveragePanels.has(item.id)]"
+        >
+          <div class="monitor-entry">
+            <!-- 极简监控条：零 <video>/<img>，~8 DOM 节点 -->
+            <div :class="['monitor-strip', `monitor-strip--${item.type}`]">
 
-          <div class="ms-left">
-            <span :class="['ms-pulse', { 'ms-pulse--running': item.type === 'running' }]" />
-            <span class="ms-id">#{{ item.id.slice(-8) }}</span>
-            <span :class="['ms-badge', statusClass(item.type)]">{{ statusLabel(item.type) }}</span>
-          </div>
-
-          <p
-            class="ms-prompt"
-            :class="{ 'ms-prompt--warning': !!getOutcomeSummary(item) }"
-            :title="getOutcomeSummary(item)?.text || item.prompt || ''"
-          >{{ getOutcomeSummary(item)?.text || item.prompt || '（无描述）' }}</p>
-
-          <div class="ms-right">
-            <template v-if="item.type === 'running'">
-              <div class="ms-bar" aria-hidden="true">
-                <div class="ms-bar-fill" />
+              <div class="ms-left">
+                <span :class="['ms-pulse', { 'ms-pulse--running': item.type === 'running' }]" />
+                <span class="ms-id">#{{ item.id.slice(-8) }}</span>
+                <span :class="['ms-badge', statusClass(item.type)]">{{ statusLabel(item.type) }}</span>
               </div>
-              <svg class="ms-spin" fill="none" viewBox="0 0 24 24" width="14" height="14">
-                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" opacity="0.25"/>
-                <path fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" opacity="0.8"/>
-              </svg>
-            </template>
-            <span v-else-if="item.type === 'failed'" class="ms-fail-tag">✕ 错误</span>
-            <span v-else class="ms-ts">{{ item.startTs || '--' }}</span>
-          </div>
 
-        </div>
-      </RecycleScroller>
+              <p
+                class="ms-prompt"
+                :class="{ 'ms-prompt--warning': !!getOutcomeSummary(item) }"
+                :title="getOutcomeSummary(item)?.text || item.prompt || ''"
+              >{{ getOutcomeSummary(item)?.text || item.prompt || '（无描述）' }}</p>
+
+              <div class="ms-right">
+                <template v-if="item.type === 'running'">
+                  <div class="ms-bar" aria-hidden="true">
+                    <div class="ms-bar-fill" />
+                  </div>
+                  <svg class="ms-spin" fill="none" viewBox="0 0 24 24" width="14" height="14">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" opacity="0.25"/>
+                    <path fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" opacity="0.8"/>
+                  </svg>
+                </template>
+                <span v-else-if="item.type === 'failed'" class="ms-fail-tag">✕ 错误</span>
+                <span v-else class="ms-ts">{{ item.startTs || '--' }}</span>
+              </div>
+
+            </div>
+            <CoverageDiagnosticsPanel
+              v-if="item.coverageDiagnostics"
+              :diagnostics="item.coverageDiagnostics"
+              @toggle="setCoveragePanelExpanded(item.id, $event)"
+            />
+          </div>
+        </DynamicScrollerItem>
+      </DynamicScroller>
 
     </section>
 
@@ -573,18 +592,26 @@ const triggerRealWsFlood = async () => {
         <p>暂无完成成果，等待流水线产出战果</p>
       </div>
 
-      <!-- item-size = card(258px) + margin-bottom(12px) = 270 -->
-      <RecycleScroller
+      <DynamicScroller
         v-else
         class="task-scroller"
         :items="completedTasks"
-        :item-size="270"
+        :min-item-size="270"
         :prerender="8"
         key-field="id"
-        v-slot="{ item }"
+        v-slot="{ item, active }"
       >
-        <!-- ── Phase 7 完整三行式卡片 ── -->
-        <div class="task-card task-card--completed">
+        <DynamicScrollerItem
+          :item="item"
+          :active="active"
+          :size-dependencies="[
+            expandedCoveragePanels.has(item.id),
+            expandedPrompts.has(item.id),
+            expandedAssetTitles.size,
+          ]"
+        >
+          <!-- ── Phase 7 完整三行式卡片 ── -->
+          <div class="task-card task-card--completed">
 
           <!-- ══ ROW 1: 元数据 ══ -->
           <div class="row-meta">
@@ -637,6 +664,12 @@ const triggerRealWsFlood = async () => {
               </svg>
             </button>
           </div>
+
+          <CoverageDiagnosticsPanel
+            v-if="item.coverageDiagnostics"
+            :diagnostics="item.coverageDiagnostics"
+            @toggle="setCoveragePanelExpanded(item.id, $event)"
+          />
 
           <!-- ══ ROW 3: 资产轮播（1:1 强制比例横向轮播）══ -->
           <template v-if="item.assets?.length">
@@ -760,8 +793,9 @@ const triggerRealWsFlood = async () => {
             <div class="row-empty" />
           </template>
 
-        </div>
-      </RecycleScroller>
+          </div>
+        </DynamicScrollerItem>
+      </DynamicScroller>
 
     </section>
 
@@ -1011,6 +1045,7 @@ const triggerRealWsFlood = async () => {
   text-overflow: ellipsis;
   margin:        0;
 }
+.monitor-entry { min-width: 0; }
 .ms-prompt--warning {
   color: #fbbf24;
   font-weight: 600;
@@ -1076,7 +1111,8 @@ const triggerRealWsFlood = async () => {
    高度：220px + margin-bottom 12px = 232px（匹配 RecycleScroller item-size）
 ══════════════════════════════════════════════════════════════════════════ */
 .task-card {
-  height:         258px;
+  min-height:     258px;
+  height:         auto;
   box-sizing:     border-box;
   margin-bottom:  12px;
   padding:        0.6rem 0.85rem 0.5rem;
