@@ -189,6 +189,13 @@ class ReservationAcquireStatus(str, Enum):
     CONFLICT = "CONFLICT"
 
 
+class ReservationConfirmationStatus(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    ALREADY_CONFIRMED = "ALREADY_CONFIRMED"
+    OWNER_OR_EXPIRY_CONFLICT = "OWNER_OR_EXPIRY_CONFLICT"
+    EXECUTION_BINDING_CONFLICT = "EXECUTION_BINDING_CONFLICT"
+
+
 @dataclass(frozen=True)
 class ReservationAcquireResult:
     status: ReservationAcquireStatus
@@ -751,6 +758,63 @@ class FingerprintLedgerRepository:
             expires_at=acquired.expires_at,
         )
 
+    def confirm_reservation_detailed(
+        self,
+        fingerprint_identity_id: int,
+        *,
+        owner_task_id: str,
+        owner_slot_index: int,
+        execution_id: str,
+        now: datetime | None = None,
+    ) -> ReservationConfirmationStatus:
+        """Confirm the first execution binding without permitting later rebinding."""
+        current_time = _normalize_reservation_datetime(now or _utcnow())
+        confirmed = self._session.execute(
+            update(FingerprintReservation)
+            .where(
+                FingerprintReservation.fingerprint_identity_id
+                == fingerprint_identity_id,
+                FingerprintReservation.owner_task_id == owner_task_id,
+                FingerprintReservation.owner_slot_index == owner_slot_index,
+                FingerprintReservation.expires_at > current_time,
+                FingerprintReservation.execution_id.is_(None),
+            )
+            .values(
+                confirmed_at=current_time,
+                execution_id=execution_id,
+                updated_at=current_time,
+            )
+            .returning(FingerprintReservation.fingerprint_identity_id)
+        ).first()
+        if confirmed is not None:
+            return ReservationConfirmationStatus.CONFIRMED
+
+        reservation = self._session.execute(
+            select(
+                FingerprintReservation.owner_task_id,
+                FingerprintReservation.owner_slot_index,
+                FingerprintReservation.expires_at,
+                FingerprintReservation.confirmed_at,
+                FingerprintReservation.execution_id,
+            ).where(
+                FingerprintReservation.fingerprint_identity_id
+                == fingerprint_identity_id
+            )
+        ).first()
+        if (
+            reservation is None
+            or reservation.owner_task_id != owner_task_id
+            or reservation.owner_slot_index != owner_slot_index
+            or reservation.expires_at <= current_time
+        ):
+            return ReservationConfirmationStatus.OWNER_OR_EXPIRY_CONFLICT
+        if (
+            reservation.execution_id == execution_id
+            and reservation.confirmed_at is not None
+        ):
+            return ReservationConfirmationStatus.ALREADY_CONFIRMED
+        return ReservationConfirmationStatus.EXECUTION_BINDING_CONFLICT
+
     def confirm_reservation(
         self,
         fingerprint_identity_id: int,
@@ -760,23 +824,18 @@ class FingerprintLedgerRepository:
         execution_id: str,
         now: datetime | None = None,
     ) -> bool:
-        current_time = _normalize_reservation_datetime(now or _utcnow())
-        result = self._session.execute(
-            update(FingerprintReservation)
-            .where(
-                FingerprintReservation.fingerprint_identity_id
-                == fingerprint_identity_id,
-                FingerprintReservation.owner_task_id == owner_task_id,
-                FingerprintReservation.owner_slot_index == owner_slot_index,
-                FingerprintReservation.expires_at > current_time,
-            )
-            .values(
-                confirmed_at=current_time,
-                execution_id=execution_id,
-                updated_at=current_time,
-            )
+        """Compatibility wrapper: first binding and exact retries are successful."""
+        status = self.confirm_reservation_detailed(
+            fingerprint_identity_id,
+            owner_task_id=owner_task_id,
+            owner_slot_index=owner_slot_index,
+            execution_id=execution_id,
+            now=now,
         )
-        return bool(result.rowcount)
+        return status in {
+            ReservationConfirmationStatus.CONFIRMED,
+            ReservationConfirmationStatus.ALREADY_CONFIRMED,
+        }
 
     def release_reservation(
         self,
