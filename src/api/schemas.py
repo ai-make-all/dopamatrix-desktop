@@ -387,9 +387,11 @@ class RenderDSLRequest(BaseModel):
         default="en",
         description="输出语种：'en' | 'ar' | 'zh'，透传至 WorkflowContext.test_language。",
     )
-    tenant_id:       str             = Field(
-        default="default",
-        description="多租户标识，用于 WS 定向推送隔离。",
+    tenant_id:       Optional[str]   = Field(
+        default=None,
+        description=(
+            "可选租户声明；实际安全边界由 X-Local-User 请求头权威决定。"
+        ),
     )
     prompt:          Optional[str]   = Field(
         default=None,

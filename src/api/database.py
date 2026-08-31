@@ -41,6 +41,15 @@ def _set_sqlite_wal_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA cache_size=-10000")
     cursor.close()
 
+
+def _set_sqlite_foreign_key_pragma(dbapi_connection, connection_record):
+    """Enable FK enforcement only for dynamically opened tenant databases."""
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
 # ------------------------------------------------------------------ #
 # 确保数据存放目录存在                                                   #
 # ------------------------------------------------------------------ #
@@ -157,23 +166,38 @@ _tenant_engines: dict = {}
 _engine_lock = threading.Lock()
 
 
-def get_tenant_engine(tenant_id: str):
+def canonical_tenant_id(tenant_id: str | None) -> str:
+    """Map an external tenant identity to its physical tenant DB authority."""
+    raw_tenant_id = tenant_id or "default"
+    safe_tenant_id = "".join(
+        character
+        for character in raw_tenant_id
+        if character.isalnum() or character in ("_", "-")
+    )
+    return safe_tenant_id or "default"
+
+
+def request_tenant_id(request: Request) -> str:
+    """Resolve the canonical tenant selected by the security-boundary header."""
+    return canonical_tenant_id(request.headers.get("X-Local-User", "default"))
+
+
+def get_tenant_engine(tenant_id: str | None):
     """根据 tenant_id 动态获取或创建专属数据库 Engine。"""
-    tenant_id = tenant_id or "default"
-    # 防止目录穿越攻击：只保留字母数字、下划线、连字符
-    safe_tenant_id = "".join(c for c in tenant_id if c.isalnum() or c in ("_", "-"))
-    if not safe_tenant_id:
-        safe_tenant_id = "default"
+    safe_tenant_id = canonical_tenant_id(tenant_id)
 
     with _engine_lock:
         if safe_tenant_id not in _tenant_engines:
             db_path = f"sqlite:///./data/dopamatrix_{safe_tenant_id}.db"
             engine = create_engine(db_path, connect_args={"check_same_thread": False})
+            event.listen(engine, "connect", _set_sqlite_foreign_key_pragma)
 
             # 延迟导入 Base 避免循环依赖，并为新租户自动建表
             from .models import Base as ModelBase
             ModelBase.metadata.create_all(bind=engine)
             evolve_schema(engine)  # 自愈迁移：补齐老库中缺失的新增列
+            from .fingerprint_ledger import ensure_fingerprint_ledger_schema
+            ensure_fingerprint_ledger_schema(engine)
 
             _tenant_engines[safe_tenant_id] = engine
 
@@ -188,10 +212,11 @@ def get_db(request: Request):
     Yield 一个与当前租户绑定的 DB Session，请求结束后自动关闭。
     用法：在路由函数中 `db: Session = Depends(get_db)`
     """
-    tenant_id = request.headers.get("X-Local-User", "default")
+    tenant_id = request_tenant_id(request)
     engine = get_tenant_engine(tenant_id)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = SessionLocal()
+    db.info["tenant_id"] = tenant_id
     try:
         yield db
     finally:

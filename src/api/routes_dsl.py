@@ -48,7 +48,12 @@ from typing import Any, Optional, Sequence
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session, sessionmaker
 
-from .database import get_db, get_tenant_engine
+from .database import (
+    canonical_tenant_id,
+    get_db,
+    get_tenant_engine,
+    request_tenant_id,
+)
 from .dsl_adapter import compile_plan_to_timeline
 from src.api.ws_manager import manager as ws_manager
 from .dsl_parser import (
@@ -59,6 +64,11 @@ from .dsl_parser import (
     normalize_file_hash,
 )
 from .models import LocalAsset, TaskHistory
+from .fingerprint_ledger import (
+    LEDGER_DIGEST_ALGORITHM,
+    FingerprintLedgerRepository,
+    FingerprintOccurrenceRecord,
+)
 from .schemas import (
     CompilationPlan,
     CompilationPlanSummary,
@@ -134,6 +144,27 @@ def _is_blind_fission(payload: RenderDSLRequest) -> bool:
         and bool(payload.prompt and payload.prompt.strip())
         and len(payload.timeline) == 0
     )
+
+
+def _authoritative_request_tenant(
+    payload: RenderDSLRequest,
+    request: Optional[Request],
+) -> str:
+    """Resolve one tenant authority and reject explicit split-tenant requests."""
+    authoritative = (
+        request_tenant_id(request)
+        if request is not None
+        else canonical_tenant_id(payload.tenant_id)
+    )
+    if (
+        payload.tenant_id is not None
+        and canonical_tenant_id(payload.tenant_id) != authoritative
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="TENANT_AUTHORITY_MISMATCH",
+        )
+    return authoritative
 
 
 def _requests_exact_main_visual(payload: RenderDSLRequest) -> bool:
@@ -376,6 +407,74 @@ def _main_visual_planning_fingerprint_contract(
         components=fingerprint,
         canonical_bytes=canonical_bytes,
     )
+
+
+_FINGERPRINT_LEDGER_PROVENANCE = "coordinator_authoritative_fp001"
+
+
+def _fingerprint_ledger_occurrence_record(
+    work: _ChildWork,
+    task_id: str,
+    lifecycle_event: str,
+) -> FingerprintOccurrenceRecord:
+    """Build durable Ledger input only from a coordinator-approved FP-001 tuple."""
+    if work.visual_fingerprint is None:
+        raise ValueError("FINGERPRINT_LEDGER_AUTHORITATIVE_FINGERPRINT_MISSING")
+    contract = _main_visual_planning_fingerprint_contract(work.visual_fingerprint)
+    return FingerprintOccurrenceRecord(
+        fingerprint_type=contract.fingerprint_type,
+        fingerprint_version=contract.fingerprint_version,
+        fingerprint_digest=contract.fingerprint_digest,
+        digest_algorithm=LEDGER_DIGEST_ALGORITHM,
+        source_hash_algorithm=contract.source_hash_algorithm,
+        canonical_payload=contract.canonical_bytes.decode("utf-8"),
+        task_id=task_id,
+        execution_id=work.execution.execution_id,
+        child_index=work.execution.child_index,
+        lifecycle_event=lifecycle_event,
+        provenance=_FINGERPRINT_LEDGER_PROVENANCE,
+    )
+
+
+def _record_fingerprint_ledger_records(
+    db: Session,
+    records: Sequence[FingerprintOccurrenceRecord],
+) -> int:
+    """Record shadow occurrences in a caller-owned tenant transaction."""
+    return FingerprintLedgerRepository(db).record_occurrences(records)
+
+
+def _record_fingerprint_ledger_records_safely(
+    tenant_id: str,
+    records: Sequence[FingerprintOccurrenceRecord],
+    *,
+    phase: str,
+) -> bool:
+    """Commit shadow records without allowing Ledger faults into product flow."""
+    if not records:
+        return True
+    try:
+        ledger_engine = get_tenant_engine(tenant_id)
+        LedgerSession = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=ledger_engine,
+        )
+        with LedgerSession() as db:
+            _record_fingerprint_ledger_records(db, records)
+            db.commit()
+        return True
+    except Exception as exc:
+        try:
+            fingerprint_logger.warning(
+                "[FINGERPRINT_LEDGER_SHADOW_WRITE_FAILED] "
+                f"phase={phase[:32]} task_id={records[0].task_id[:64]} "
+                f"count={len(records)} error={type(exc).__name__[:64]} "
+                f"detail={str(exc)[:128]}"
+            )
+        except Exception:
+            pass
+        return False
 
 
 def _coverage_diagnostics_v1_payload(
@@ -2002,7 +2101,8 @@ def _persist_task_history(
     output_assets: list[dict],
     warning_codes: list[str],
     coverage_diagnostics: Optional[dict[str, Any]] = None,
-) -> None:
+    ledger_terminal_records: Sequence[FingerprintOccurrenceRecord] = (),
+) -> bool:
     """Persist the single completed-result row owned by the coordinator."""
     first_success = next(result for result in child_results if result.succeeded)
     legacy_details = first_success.prompt_details
@@ -2050,7 +2150,28 @@ def _persist_task_history(
     )
     with HistorySession() as db:
         db.add(history_record)
+        ledger_persisted = True
+        if ledger_terminal_records:
+            db.flush()
+            try:
+                with db.begin_nested():
+                    _record_fingerprint_ledger_records(
+                        db,
+                        ledger_terminal_records,
+                    )
+            except Exception as exc:
+                ledger_persisted = False
+                try:
+                    fingerprint_logger.warning(
+                        "[FINGERPRINT_LEDGER_SHADOW_WRITE_FAILED] "
+                        f"phase=terminal_history task_id={task_id[:64]} "
+                        f"count={len(ledger_terminal_records)} "
+                        f"error={type(exc).__name__[:64]} detail={str(exc)[:128]}"
+                    )
+                except Exception:
+                    pass
         db.commit()
+    return ledger_persisted
 
 
 def render_batch_worker(
@@ -2086,6 +2207,7 @@ def render_batch_worker(
     planning_warning_codes: list[str] = []
     coverage_diagnostics_payload: Optional[dict[str, Any]] = None
     child_work: list[_ChildWork] = []
+    planned_ledger_records: tuple[FingerprintOccurrenceRecord, ...] = ()
     planning_function = None
     if variant_planning_policy == "exact_main_visual":
         planning_function = _plan_exact_main_visual_variants_from_db
@@ -2153,7 +2275,7 @@ def render_batch_worker(
                     for identity, plan, fingerprint in zip(
                         identities,
                         planning_result.plans,
-                        planning_result.fingerprints,
+                        computed_fingerprints,
                     )
                 ]
                 logger.info(
@@ -2190,6 +2312,28 @@ def render_batch_worker(
             variant_planning_policy,
         )
         planning_warning_codes.append("VARIANT_PLANNING_FAILED")
+
+    if child_work and all(work.visual_fingerprint is not None for work in child_work):
+        try:
+            planned_ledger_records = tuple(
+                _fingerprint_ledger_occurrence_record(work, task_id, "PLANNED")
+                for work in child_work
+            )
+            _record_fingerprint_ledger_records_safely(
+                tenant_id,
+                planned_ledger_records,
+                phase="planned",
+            )
+        except Exception as exc:
+            planned_ledger_records = ()
+            try:
+                fingerprint_logger.warning(
+                    "[FINGERPRINT_LEDGER_SHADOW_WRITE_FAILED] "
+                    f"phase=planned_build task_id={task_id[:64]} "
+                    f"count={len(child_work)} error={type(exc).__name__[:64]}"
+                )
+            except Exception:
+                pass
 
     child_results: list[_ChildResult] = []
 
@@ -2288,11 +2432,39 @@ def render_batch_worker(
     if failed_count and "CHILD_EXECUTION_FAILED" not in warning_codes:
         warning_codes.append("CHILD_EXECUTION_FAILED")
 
+    authoritative_work_by_identity = {
+        (work.execution.child_index, work.execution.execution_id): work
+        for work in child_work
+        if work.visual_fingerprint is not None
+    }
+    terminal_ledger_records: tuple[FingerprintOccurrenceRecord, ...] = ()
+    try:
+        terminal_ledger_records = tuple(
+            _fingerprint_ledger_occurrence_record(
+                authoritative_work_by_identity[(result.child_index, result.execution_id)],
+                task_id,
+                "RENDERED" if result.succeeded else "FAILED",
+            )
+            for result in child_results
+            if (result.child_index, result.execution_id) in authoritative_work_by_identity
+        )
+    except Exception as exc:
+        terminal_ledger_records = ()
+        try:
+            fingerprint_logger.warning(
+                "[FINGERPRINT_LEDGER_SHADOW_WRITE_FAILED] "
+                f"phase=terminal_build task_id={task_id[:64]} "
+                f"count={len(child_results)} error={type(exc).__name__[:64]}"
+            )
+        except Exception:
+            pass
+
     history_persisted = False
+    terminal_ledger_persisted = not terminal_ledger_records
     elapsed = time.time() - batch_start
     if succeeded_count:
         try:
-            _persist_task_history(
+            terminal_ledger_persisted = _persist_task_history(
                 task_id=task_id,
                 tenant_id=tenant_id,
                 prompt=prompt,
@@ -2302,6 +2474,7 @@ def render_batch_worker(
                 output_assets=all_assets,
                 warning_codes=warning_codes,
                 coverage_diagnostics=coverage_diagnostics_payload,
+                ledger_terminal_records=terminal_ledger_records,
             )
             history_persisted = True
             logger.info(
@@ -2314,6 +2487,13 @@ def render_batch_worker(
                 "[render_batch_worker] 历史记录写入失败 task_id=%s；保留渲染结果",
                 task_id,
             )
+
+    if terminal_ledger_records and not terminal_ledger_persisted:
+        _record_fingerprint_ledger_records_safely(
+            tenant_id,
+            terminal_ledger_records,
+            phase="terminal_fallback",
+        )
 
     final_status = "completed" if succeeded_count else "failed"
     terminal_payload: dict[str, Any] = {
@@ -2427,7 +2607,7 @@ def draft_blueprint_endpoint(
     # 如果前端没有提供可用标签，从租户库自动查询并注入（防幻觉菜单供给）
     available_tags: list[str] = list(body.available_tags or [])
     if not available_tags:
-        _tenant_id = request.headers.get("X-Local-User", "default") or "default"
+        _tenant_id = request_tenant_id(request)
         available_tags = _fetch_available_tags(_tenant_id)
         logger.info(
             "[routes_dsl] draft-blueprint 自动注入标签菜单：%d 个可用标签（tenant=%s）",
@@ -2519,6 +2699,7 @@ def submit_dsl(
     payload: RenderDSLRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    request: Request = None,
 ) -> DSLSubmitResponse:
     """
     Story DSL 三合一端点：解析 + 适配 + 后台渲染。
@@ -2535,6 +2716,7 @@ def submit_dsl(
       7. FFmpegCompositorNode.execute → FFmpeg 子进程渲染
       8. WS 事件总线推送 running / progress / completed / failed
     """
+    tenant_id = _authoritative_request_tenant(payload, request)
     is_blind = _is_blind_fission(payload)
     _guard_pre_planner_policy(
         payload,
@@ -2637,7 +2819,7 @@ def submit_dsl(
         render_batch_worker,
         dsl_payload_for_worker,
         task_id,
-        payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+        payload.aspect_ratio, payload.target_duration, tenant_id,
         payload.prompt, batch_size, payload.test_language,
         **_worker_kw,
     )
@@ -2685,7 +2867,9 @@ def submit_manual(
     payload: RenderDSLRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    request: Request = None,
 ) -> DSLSubmitResponse:
+    tenant_id = _authoritative_request_tenant(payload, request)
     _guard_pre_planner_policy(payload, flow="submit_manual")
     logger.info(
         "[routes_dsl] submit-manual request engine=%s beats=%d aspect=%s duration=%ds",
@@ -2740,7 +2924,7 @@ def submit_manual(
         render_batch_worker,
         dsl_payload,
         task_id,
-        payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+        payload.aspect_ratio, payload.target_duration, tenant_id,
         None, batch_size, payload.test_language,
         **{**worker_kwargs, "resolved_plan": plan},
     )
@@ -2781,10 +2965,12 @@ def render_dsl(
     payload: RenderDSLRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    request: Request = None,
 ) -> RenderDSLAck:
     """
     Story DSL 纯渲染触发端点（共用 render_worker，与 submit-dsl 渲染逻辑一致）。
     """
+    tenant_id = _authoritative_request_tenant(payload, request)
     is_blind = _is_blind_fission(payload)
     _guard_pre_planner_policy(
         payload,
@@ -2871,7 +3057,7 @@ def render_dsl(
         render_batch_worker,
         dsl_payload_for_worker,
         task_id,
-        payload.aspect_ratio, payload.target_duration, payload.tenant_id,
+        payload.aspect_ratio, payload.target_duration, tenant_id,
         payload.prompt, batch_size, payload.test_language,
         **_worker_kw,
     )
