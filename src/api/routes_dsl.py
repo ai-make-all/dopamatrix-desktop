@@ -43,9 +43,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import product
 from math import prod
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from sqlalchemy.exc import (
+    DisconnectionError,
+    InterfaceError,
+    OperationalError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.orm import Session, sessionmaker
 
 from .database import (
@@ -66,8 +72,19 @@ from .dsl_parser import (
 from .models import LocalAsset, TaskHistory
 from .fingerprint_ledger import (
     LEDGER_DIGEST_ALGORITHM,
+    FingerprintIdentityRecord,
+    FingerprintLedgerError,
     FingerprintLedgerRepository,
     FingerprintOccurrenceRecord,
+    HistoricalExactLookupResult,
+)
+from .historical_novelty_policy import (
+    HistoricalDecisionAction,
+    HistoricalEvidenceKind,
+    HistoricalNoveltyPolicy,
+    HistoricalNoveltyPolicyConfiguration,
+    HistoricalPolicyMode,
+    PreviewIntent,
 )
 from .schemas import (
     CompilationPlan,
@@ -191,6 +208,14 @@ def _guard_pre_planner_policy(
     is_blind: bool = False,
 ) -> None:
     """Keep authoritative exact planning confined to populated submit-dsl requests."""
+    if (
+        payload.historical_novelty_mode != _HISTORICAL_MODE_OFF
+        and not _requests_authoritative_main_visual(payload)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="HISTORICAL_NOVELTY_REQUIRES_AUTHORITATIVE_PLANNING",
+        )
     if not _requests_authoritative_main_visual(payload):
         return
     policy_code = payload.variant_planning_policy.upper()
@@ -246,6 +271,13 @@ _COVERAGE_FIXED_BY_CAPACITY = "FIXED_BY_CAPACITY"
 _COVERAGE_VARIABLE_BALANCED = "VARIABLE_BALANCED"
 _COVERAGE_VARIABLE_TARGET_NOT_MET = "VARIABLE_TARGET_NOT_MET"
 
+_HISTORICAL_NOVELTY_DIAGNOSTICS_TYPE = "historical_novelty"
+_HISTORICAL_NOVELTY_DIAGNOSTICS_VERSION = 1
+_HISTORICAL_NOVELTY_SUMMARY_EVENT = "HistoricalNoveltySummary"
+_HISTORICAL_MODE_OFF = HistoricalPolicyMode.OFF.value
+_HISTORICAL_MODE_OBSERVE = HistoricalPolicyMode.OBSERVE.value
+_HISTORICAL_MODE_ADVISORY = HistoricalPolicyMode.ADVISORY.value
+
 
 @dataclass(frozen=True)
 class _CoverageHistogramEntryV1:
@@ -298,6 +330,38 @@ class _CoverageDiagnosticsV1:
 
 
 @dataclass(frozen=True)
+class _HistoricalNoveltyDiagnosticsV1:
+    diagnostics_type: str
+    version: int
+    historical_policy_mode: str
+    policy_scope_type: str
+    policy_scope_id: Optional[str]
+    policy_window_kind: str
+    policy_window_duration_seconds: Optional[int]
+    history_complete_since: Optional[datetime]
+    candidate_checks: int
+    lookup_successes: int
+    lookup_failures: int
+    identity_matches: int
+    historical_occurrence_matches: int
+    identity_only_matches: int
+    rendered_matches: int
+    planned_only_matches: int
+    failed_only_matches: int
+    planned_and_failed_matches: int
+    no_history_matches: int
+    advisory_count: int
+    reuse_intent_count: int
+    actual_override_count: int
+    historical_rejection_count: int
+    reservation_conflict_count: int
+    accepted_after_historical_check_count: int
+    accepted_with_lookup_unknown_count: int
+    preview_checked: bool
+    preview_intent: str
+
+
+@dataclass(frozen=True)
 class _VariantPlanningResult:
     plans: tuple[CompilationPlan, ...]
     fingerprints: tuple[_MainVisualFingerprint, ...]
@@ -306,6 +370,7 @@ class _VariantPlanningResult:
     termination_reason: str
     warning_codes: tuple[str, ...]
     coverage_diagnostics: Optional[_CoverageDiagnosticsV1] = None
+    historical_novelty_diagnostics: Optional[_HistoricalNoveltyDiagnosticsV1] = None
 
 
 @dataclass(frozen=True)
@@ -407,6 +472,340 @@ def _main_visual_planning_fingerprint_contract(
         components=fingerprint,
         canonical_bytes=canonical_bytes,
     )
+
+
+_HistoricalExactLookup = Callable[
+    [FingerprintIdentityRecord],
+    HistoricalExactLookupResult,
+]
+_HistoricalSessionFactory = Callable[[], Session]
+_HISTORICAL_LOOKUP_INFRASTRUCTURE_ERRORS = (
+    OperationalError,
+    InterfaceError,
+    DisconnectionError,
+    SQLAlchemyTimeoutError,
+)
+
+
+class _HistoricalNoveltyObserver:
+    """Observe accepted-eligible FP-001 candidates without affecting selection."""
+
+    def __init__(
+        self,
+        lookup_historical_exact: _HistoricalExactLookup,
+        historical_policy_mode: str,
+    ):
+        if historical_policy_mode not in {
+            _HISTORICAL_MODE_OBSERVE,
+            _HISTORICAL_MODE_ADVISORY,
+        }:
+            raise ValueError("HISTORICAL_NOVELTY_RUNTIME_MODE_UNSUPPORTED")
+        self._lookup_historical_exact = lookup_historical_exact
+        self._configuration = HistoricalNoveltyPolicyConfiguration(
+            historical_policy_mode=HistoricalPolicyMode(historical_policy_mode),
+        )
+        self._policy = HistoricalNoveltyPolicy()
+        self._warning_emitted = False
+        self.candidate_checks = 0
+        self.lookup_successes = 0
+        self.lookup_failures = 0
+        self.identity_matches = 0
+        self.historical_occurrence_matches = 0
+        self.identity_only_matches = 0
+        self.rendered_matches = 0
+        self.planned_only_matches = 0
+        self.failed_only_matches = 0
+        self.planned_and_failed_matches = 0
+        self.no_history_matches = 0
+        self.advisory_count = 0
+        self.accepted_after_historical_check_count = 0
+        self.accepted_with_lookup_unknown_count = 0
+        self.preview_checked = False
+        self.preview_intent = PreviewIntent.UNSPECIFIED
+
+    def observe(
+        self,
+        fingerprint: _MainVisualFingerprint,
+        *,
+        is_preview: bool = False,
+        preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    ) -> None:
+        """Record factual history for one candidate that remains accepted."""
+        if not isinstance(preview_intent, PreviewIntent):
+            raise ValueError("HISTORICAL_NOVELTY_PREVIEW_INTENT_INVALID")
+        self.candidate_checks += 1
+        if is_preview:
+            self.preview_checked = True
+            self.preview_intent = preview_intent
+
+        contract = _main_visual_planning_fingerprint_contract(fingerprint)
+        identity_record = FingerprintIdentityRecord(
+            fingerprint_type=contract.fingerprint_type,
+            fingerprint_version=contract.fingerprint_version,
+            fingerprint_digest=contract.fingerprint_digest,
+            digest_algorithm=LEDGER_DIGEST_ALGORITHM,
+            source_hash_algorithm=contract.source_hash_algorithm,
+            canonical_payload=contract.canonical_bytes.decode("utf-8"),
+        )
+        try:
+            facts = self._lookup_historical_exact(identity_record)
+        except FingerprintLedgerError:
+            raise
+        except _HISTORICAL_LOOKUP_INFRASTRUCTURE_ERRORS as exc:
+            self.lookup_failures += 1
+            self.accepted_with_lookup_unknown_count += 1
+            if not self._warning_emitted:
+                self._warning_emitted = True
+                try:
+                    fingerprint_logger.warning(
+                        "[HISTORICAL_NOVELTY_LOOKUP_FAILED] "
+                        f"mode={self._configuration.historical_policy_mode.value} "
+                        "category=database_read_unavailable "
+                        f"error={type(exc).__name__[:64]}"
+                    )
+                except Exception:
+                    pass
+            return
+
+        decision = self._policy.evaluate(facts, self._configuration)
+        self.lookup_successes += 1
+        self.accepted_after_historical_check_count += 1
+        if facts.identity_exists:
+            self.identity_matches += 1
+        if facts.historical_match:
+            self.historical_occurrence_matches += 1
+        elif facts.identity_exists:
+            self.identity_only_matches += 1
+
+        evidence_counters = {
+            HistoricalEvidenceKind.RENDERED: "rendered_matches",
+            HistoricalEvidenceKind.PLANNED_ONLY: "planned_only_matches",
+            HistoricalEvidenceKind.FAILED_ONLY: "failed_only_matches",
+            HistoricalEvidenceKind.PLANNED_AND_FAILED: "planned_and_failed_matches",
+        }
+        counter_name = evidence_counters.get(decision.evidence_kind)
+        if counter_name is not None:
+            setattr(self, counter_name, getattr(self, counter_name) + 1)
+        elif not facts.identity_exists:
+            self.no_history_matches += 1
+        if decision.action is HistoricalDecisionAction.ALLOW_ADVISORY:
+            self.advisory_count += 1
+
+    def diagnostics(self) -> _HistoricalNoveltyDiagnosticsV1:
+        return _HistoricalNoveltyDiagnosticsV1(
+            diagnostics_type=_HISTORICAL_NOVELTY_DIAGNOSTICS_TYPE,
+            version=_HISTORICAL_NOVELTY_DIAGNOSTICS_VERSION,
+            historical_policy_mode=self._configuration.historical_policy_mode.value,
+            policy_scope_type=self._configuration.historical_scope.scope_type.value,
+            policy_scope_id=self._configuration.historical_scope.scope_id,
+            policy_window_kind=self._configuration.historical_window.kind.value,
+            policy_window_duration_seconds=(
+                self._configuration.historical_window.duration_seconds
+            ),
+            history_complete_since=None,
+            candidate_checks=self.candidate_checks,
+            lookup_successes=self.lookup_successes,
+            lookup_failures=self.lookup_failures,
+            identity_matches=self.identity_matches,
+            historical_occurrence_matches=self.historical_occurrence_matches,
+            identity_only_matches=self.identity_only_matches,
+            rendered_matches=self.rendered_matches,
+            planned_only_matches=self.planned_only_matches,
+            failed_only_matches=self.failed_only_matches,
+            planned_and_failed_matches=self.planned_and_failed_matches,
+            no_history_matches=self.no_history_matches,
+            advisory_count=self.advisory_count,
+            reuse_intent_count=0,
+            actual_override_count=0,
+            historical_rejection_count=0,
+            reservation_conflict_count=0,
+            accepted_after_historical_check_count=(
+                self.accepted_after_historical_check_count
+            ),
+            accepted_with_lookup_unknown_count=(
+                self.accepted_with_lookup_unknown_count
+            ),
+            preview_checked=self.preview_checked,
+            preview_intent=self.preview_intent.value,
+        )
+
+
+def _lookup_historical_exact_in_new_session(
+    historical_session_factory: _HistoricalSessionFactory,
+    identity_record: FingerprintIdentityRecord,
+) -> HistoricalExactLookupResult:
+    """Read Ledger facts in one short-lived tenant-bound Session."""
+    with historical_session_factory() as historical_db:
+        return FingerprintLedgerRepository(historical_db).lookup_historical_exact(
+            identity_record
+        )
+
+
+def _historical_novelty_observer(
+    historical_session_factory: _HistoricalSessionFactory,
+    historical_policy_mode: str,
+) -> Optional[_HistoricalNoveltyObserver]:
+    """Create no observer and perform no Ledger read when runtime mode is OFF."""
+    if historical_policy_mode == _HISTORICAL_MODE_OFF:
+        return None
+    return _HistoricalNoveltyObserver(
+        lambda identity_record: _lookup_historical_exact_in_new_session(
+            historical_session_factory,
+            identity_record,
+        ),
+        historical_policy_mode,
+    )
+
+
+def _historical_novelty_diagnostics_v1_payload(
+    diagnostics: _HistoricalNoveltyDiagnosticsV1,
+) -> dict[str, Any]:
+    """Validate and serialize the bounded HistoricalNoveltyDiagnosticsV1 contract."""
+    if (
+        diagnostics.diagnostics_type != _HISTORICAL_NOVELTY_DIAGNOSTICS_TYPE
+        or diagnostics.version != _HISTORICAL_NOVELTY_DIAGNOSTICS_VERSION
+        or diagnostics.historical_policy_mode
+        not in {_HISTORICAL_MODE_OBSERVE, _HISTORICAL_MODE_ADVISORY}
+        or diagnostics.policy_scope_type != "UNAVAILABLE"
+        or diagnostics.policy_scope_id is not None
+        or diagnostics.policy_window_kind != "UNSPECIFIED"
+        or diagnostics.policy_window_duration_seconds is not None
+        or diagnostics.history_complete_since is not None
+    ):
+        raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_IDENTITY_MISMATCH")
+    counters = (
+        diagnostics.candidate_checks,
+        diagnostics.lookup_successes,
+        diagnostics.lookup_failures,
+        diagnostics.identity_matches,
+        diagnostics.historical_occurrence_matches,
+        diagnostics.identity_only_matches,
+        diagnostics.rendered_matches,
+        diagnostics.planned_only_matches,
+        diagnostics.failed_only_matches,
+        diagnostics.planned_and_failed_matches,
+        diagnostics.no_history_matches,
+        diagnostics.advisory_count,
+        diagnostics.reuse_intent_count,
+        diagnostics.actual_override_count,
+        diagnostics.historical_rejection_count,
+        diagnostics.reservation_conflict_count,
+        diagnostics.accepted_after_historical_check_count,
+        diagnostics.accepted_with_lookup_unknown_count,
+    )
+    if any(type(value) is not int or value < 0 for value in counters):
+        raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_COUNTER_INVALID")
+    classified_successes = (
+        diagnostics.rendered_matches
+        + diagnostics.planned_only_matches
+        + diagnostics.failed_only_matches
+        + diagnostics.planned_and_failed_matches
+        + diagnostics.identity_only_matches
+        + diagnostics.no_history_matches
+    )
+    if (
+        diagnostics.candidate_checks
+        != diagnostics.lookup_successes + diagnostics.lookup_failures
+        or diagnostics.lookup_successes != classified_successes
+        or diagnostics.identity_matches
+        != diagnostics.historical_occurrence_matches
+        + diagnostics.identity_only_matches
+        or diagnostics.accepted_after_historical_check_count
+        != diagnostics.lookup_successes
+        or diagnostics.accepted_with_lookup_unknown_count
+        != diagnostics.lookup_failures
+        or diagnostics.advisory_count > diagnostics.rendered_matches
+        or diagnostics.reuse_intent_count != 0
+        or diagnostics.actual_override_count != 0
+        or diagnostics.historical_rejection_count != 0
+        or diagnostics.reservation_conflict_count != 0
+    ):
+        raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_COUNTER_MISMATCH")
+    if diagnostics.preview_checked:
+        if diagnostics.preview_intent not in {
+            intent.value for intent in PreviewIntent
+        }:
+            raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_PREVIEW_MISMATCH")
+    elif diagnostics.preview_intent != PreviewIntent.UNSPECIFIED.value:
+        raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_PREVIEW_MISMATCH")
+
+    payload = {
+        "type": diagnostics.diagnostics_type,
+        "version": diagnostics.version,
+        "historical_policy_mode": diagnostics.historical_policy_mode,
+        "policy_scope_type": diagnostics.policy_scope_type,
+        "policy_scope_id": diagnostics.policy_scope_id,
+        "policy_window_kind": diagnostics.policy_window_kind,
+        "policy_window_duration_seconds": diagnostics.policy_window_duration_seconds,
+        "history_complete_since": None,
+        "candidate_checks": diagnostics.candidate_checks,
+        "lookup_successes": diagnostics.lookup_successes,
+        "lookup_failures": diagnostics.lookup_failures,
+        "identity_matches": diagnostics.identity_matches,
+        "historical_occurrence_matches": diagnostics.historical_occurrence_matches,
+        "identity_only_matches": diagnostics.identity_only_matches,
+        "rendered_matches": diagnostics.rendered_matches,
+        "planned_only_matches": diagnostics.planned_only_matches,
+        "failed_only_matches": diagnostics.failed_only_matches,
+        "planned_and_failed_matches": diagnostics.planned_and_failed_matches,
+        "no_history_matches": diagnostics.no_history_matches,
+        "advisory_count": diagnostics.advisory_count,
+        "reuse_intent_count": diagnostics.reuse_intent_count,
+        "actual_override_count": diagnostics.actual_override_count,
+        "historical_rejection_count": diagnostics.historical_rejection_count,
+        "reservation_conflict_count": diagnostics.reservation_conflict_count,
+        "accepted_after_historical_check_count": (
+            diagnostics.accepted_after_historical_check_count
+        ),
+        "accepted_with_lookup_unknown_count": (
+            diagnostics.accepted_with_lookup_unknown_count
+        ),
+        "preview_checked": diagnostics.preview_checked,
+        "preview_intent": diagnostics.preview_intent,
+    }
+    json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    return payload
+
+
+def _validated_historical_novelty_diagnostics_payload(
+    diagnostics: _HistoricalNoveltyDiagnosticsV1,
+    planning_result: _VariantPlanningResult,
+    historical_policy_mode: str,
+) -> dict[str, Any]:
+    payload = _historical_novelty_diagnostics_v1_payload(diagnostics)
+    if (
+        diagnostics.historical_policy_mode != historical_policy_mode
+        or diagnostics.candidate_checks != len(planning_result.plans)
+        or diagnostics.accepted_after_historical_check_count
+        + diagnostics.accepted_with_lookup_unknown_count
+        != len(planning_result.plans)
+    ):
+        raise ValueError("HISTORICAL_NOVELTY_COORDINATOR_CONTRACT_MISMATCH")
+    return payload
+
+
+def _emit_historical_novelty_summary(
+    task_id: str,
+    diagnostics_payload: dict[str, Any],
+) -> None:
+    """Emit one bounded task-level summary without affecting product execution."""
+    try:
+        fingerprint_logger.info(
+            "[HistoricalNoveltySummary] "
+            + json.dumps(
+                {
+                    "event": _HISTORICAL_NOVELTY_SUMMARY_EVENT,
+                    "task_id": task_id,
+                    "historical_novelty_diagnostics": diagnostics_payload,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except Exception:
+        pass
 
 
 _FINGERPRINT_LEDGER_PROVENANCE = "coordinator_authoritative_fp001"
@@ -1029,6 +1428,8 @@ def _plan_exact_main_visual_variants(
     *,
     preview_plan: Optional[CompilationPlan] = None,
     search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
+    historical_observer: Optional[_HistoricalNoveltyObserver] = None,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
 ) -> _VariantPlanningResult:
     """Lazily enumerate finite resolver-valid main-X combinations."""
     if requested_count < 1:
@@ -1062,6 +1463,12 @@ def _plan_exact_main_visual_variants(
         preview_key = _selection_key(preview_selections)
         preview_fingerprint = _exact_main_visual_fingerprint(preview_plan)
         examined_keys.add(preview_key)
+        if historical_observer is not None:
+            historical_observer.observe(
+                preview_fingerprint,
+                is_preview=True,
+                preview_intent=preview_intent,
+            )
         accepted_plans.append(preview_plan)
         accepted_fingerprints.append(preview_fingerprint)
         used_fingerprints.add(preview_fingerprint)
@@ -1101,6 +1508,8 @@ def _plan_exact_main_visual_variants(
 
             if fingerprint in used_fingerprints:
                 continue
+            if historical_observer is not None:
+                historical_observer.observe(fingerprint)
             accepted_plans.append(materialized)
             accepted_fingerprints.append(fingerprint)
             used_fingerprints.add(fingerprint)
@@ -1126,6 +1535,11 @@ def _plan_exact_main_visual_variants(
         candidate_space_size=candidate_space_size,
         termination_reason=termination_reason,
         warning_codes=tuple(warning_codes),
+        historical_novelty_diagnostics=(
+            historical_observer.diagnostics()
+            if historical_observer is not None
+            else None
+        ),
     )
 
 
@@ -1309,6 +1723,8 @@ def _plan_exact_main_visual_balanced_variants(
     *,
     preview_plan: Optional[CompilationPlan] = None,
     search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
+    historical_observer: Optional[_HistoricalNoveltyObserver] = None,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
 ) -> _VariantPlanningResult:
     """Select exact unique plans through a bounded greedy coverage window."""
     if requested_count < 1:
@@ -1348,6 +1764,12 @@ def _plan_exact_main_visual_balanced_variants(
         preview_key = _selection_key(preview_selections)
         preview_fingerprint = _exact_main_visual_fingerprint(preview_plan)
         examined_keys.add(preview_key)
+        if historical_observer is not None:
+            historical_observer.observe(
+                preview_fingerprint,
+                is_preview=True,
+                preview_intent=preview_intent,
+            )
         accepted_plans.append(preview_plan)
         accepted_fingerprints.append(preview_fingerprint)
         used_fingerprints.add(preview_fingerprint)
@@ -1414,6 +1836,8 @@ def _plan_exact_main_visual_balanced_variants(
             if fingerprint in used_fingerprints:
                 duplicate_fingerprint_reject_count += 1
                 continue
+            if historical_observer is not None:
+                historical_observer.observe(fingerprint)
             accepted_plans.append(materialized)
             accepted_fingerprints.append(fingerprint)
             used_fingerprints.add(fingerprint)
@@ -1461,6 +1885,11 @@ def _plan_exact_main_visual_balanced_variants(
         termination_reason=termination_reason,
         warning_codes=tuple(warning_codes),
         coverage_diagnostics=coverage_diagnostics,
+        historical_novelty_diagnostics=(
+            historical_observer.diagnostics()
+            if historical_observer is not None
+            else None
+        ),
     )
 
 
@@ -1470,6 +1899,8 @@ def _plan_exact_main_visual_variants_from_db(
     requested_count: int,
     *,
     preview_plan: Optional[CompilationPlan] = None,
+    historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
 ) -> _VariantPlanningResult:
     """Run discovery and materialization inside one tenant DB session."""
     tenant_engine = get_tenant_engine(tenant_id)
@@ -1479,11 +1910,24 @@ def _plan_exact_main_visual_variants_from_db(
         bind=tenant_engine,
     )
     with SessionLocal() as db:
+        historical_observer = _historical_novelty_observer(
+            SessionLocal,
+            historical_novelty_mode,
+        )
+        if historical_observer is None:
+            return _plan_exact_main_visual_variants(
+                DSLParserNode(db),
+                dsl_payload,
+                requested_count,
+                preview_plan=preview_plan,
+            )
         return _plan_exact_main_visual_variants(
             DSLParserNode(db),
             dsl_payload,
             requested_count,
             preview_plan=preview_plan,
+            historical_observer=historical_observer,
+            preview_intent=preview_intent,
         )
 
 
@@ -1493,6 +1937,8 @@ def _plan_exact_main_visual_balanced_variants_from_db(
     requested_count: int,
     *,
     preview_plan: Optional[CompilationPlan] = None,
+    historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
 ) -> _VariantPlanningResult:
     """Run balanced discovery and materialization inside one tenant DB session."""
     tenant_engine = get_tenant_engine(tenant_id)
@@ -1502,11 +1948,24 @@ def _plan_exact_main_visual_balanced_variants_from_db(
         bind=tenant_engine,
     )
     with SessionLocal() as db:
+        historical_observer = _historical_novelty_observer(
+            SessionLocal,
+            historical_novelty_mode,
+        )
+        if historical_observer is None:
+            return _plan_exact_main_visual_balanced_variants(
+                DSLParserNode(db),
+                dsl_payload,
+                requested_count,
+                preview_plan=preview_plan,
+            )
         return _plan_exact_main_visual_balanced_variants(
             DSLParserNode(db),
             dsl_payload,
             requested_count,
             preview_plan=preview_plan,
+            historical_observer=historical_observer,
+            preview_intent=preview_intent,
         )
 
 
@@ -2101,6 +2560,7 @@ def _persist_task_history(
     output_assets: list[dict],
     warning_codes: list[str],
     coverage_diagnostics: Optional[dict[str, Any]] = None,
+    historical_novelty_diagnostics: Optional[dict[str, Any]] = None,
     ledger_terminal_records: Sequence[FingerprintOccurrenceRecord] = (),
 ) -> bool:
     """Persist the single completed-result row owned by the coordinator."""
@@ -2115,6 +2575,10 @@ def _persist_task_history(
     }
     if coverage_diagnostics is not None:
         planning_summary["coverage_diagnostics"] = coverage_diagnostics
+    if historical_novelty_diagnostics is not None:
+        planning_summary["historical_novelty_diagnostics"] = (
+            historical_novelty_diagnostics
+        )
     prompt_details: dict[str, Any] = {
         "meta": legacy_details.get("meta"),
         "timeline": legacy_details.get("timeline") or [],
@@ -2191,6 +2655,8 @@ def render_batch_worker(
     enable_subtitles: bool = True,
     resolved_plan: Optional[CompilationPlan] = None,
     variant_planning_policy: str = "legacy",
+    historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
 ) -> dict[str, Any]:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
@@ -2206,6 +2672,7 @@ def render_batch_worker(
 
     planning_warning_codes: list[str] = []
     coverage_diagnostics_payload: Optional[dict[str, Any]] = None
+    historical_novelty_diagnostics_payload: Optional[dict[str, Any]] = None
     child_work: list[_ChildWork] = []
     planned_ledger_records: tuple[FingerprintOccurrenceRecord, ...] = ()
     planning_function = None
@@ -2226,12 +2693,23 @@ def render_batch_worker(
             planning_warning_codes.append("VARIANT_PLANNING_FAILED")
         else:
             staged_coverage_diagnostics_payload: Optional[dict[str, Any]] = None
+            staged_historical_novelty_diagnostics_payload: Optional[
+                dict[str, Any]
+            ] = None
             try:
+                planning_kwargs: dict[str, Any] = {
+                    "preview_plan": resolved_plan,
+                }
+                if historical_novelty_mode != _HISTORICAL_MODE_OFF:
+                    planning_kwargs.update({
+                        "historical_novelty_mode": historical_novelty_mode,
+                        "preview_intent": preview_intent,
+                    })
                 planning_result = planning_function(
                     tenant_id,
                     dsl_payload,
                     batch_size,
-                    preview_plan=resolved_plan,
+                    **planning_kwargs,
                 )
                 computed_fingerprints = tuple(
                     _exact_main_visual_fingerprint(plan)
@@ -2260,6 +2738,25 @@ def render_batch_worker(
                     )
                 elif planning_result.coverage_diagnostics is not None:
                     raise ValueError("COVERAGE_DIAGNOSTICS_UNEXPECTED_FOR_EXACT_POLICY")
+                if historical_novelty_mode == _HISTORICAL_MODE_OFF:
+                    if planning_result.historical_novelty_diagnostics is not None:
+                        raise ValueError(
+                            "HISTORICAL_NOVELTY_DIAGNOSTICS_UNEXPECTED_FOR_OFF"
+                        )
+                else:
+                    if planning_result.historical_novelty_diagnostics is None:
+                        raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_MISSING")
+                    staged_historical_novelty_diagnostics_payload = (
+                        _validated_historical_novelty_diagnostics_payload(
+                            planning_result.historical_novelty_diagnostics,
+                            planning_result,
+                            historical_novelty_mode,
+                        )
+                    )
+                    _emit_historical_novelty_summary(
+                        task_id,
+                        staged_historical_novelty_diagnostics_payload,
+                    )
                 planning_warning_codes.extend(planning_result.warning_codes)
                 identities = (
                     _create_child_executions(task_id, len(planning_result.plans))
@@ -2300,6 +2797,9 @@ def render_batch_worker(
                 planning_warning_codes.append("VARIANT_PLANNING_FAILED")
             else:
                 coverage_diagnostics_payload = staged_coverage_diagnostics_payload
+                historical_novelty_diagnostics_payload = (
+                    staged_historical_novelty_diagnostics_payload
+                )
     elif variant_planning_policy == "legacy":
         child_work = [
             _ChildWork(execution=child)
@@ -2474,6 +2974,9 @@ def render_batch_worker(
                 output_assets=all_assets,
                 warning_codes=warning_codes,
                 coverage_diagnostics=coverage_diagnostics_payload,
+                historical_novelty_diagnostics=(
+                    historical_novelty_diagnostics_payload
+                ),
                 ledger_terminal_records=terminal_ledger_records,
             )
             history_persisted = True
@@ -2809,11 +3312,13 @@ def submit_dsl(
         "enable_tts": payload.enable_tts,
         "enable_subtitles": payload.enable_subtitles,
         "variant_planning_policy": payload.variant_planning_policy,
+        "historical_novelty_mode": payload.historical_novelty_mode,
     }
     if _requests_authoritative_main_visual(payload):
         # Request-time preview is only a validated seed; the coordinator still
         # owns bounded batch planning before any child identity is allocated.
         _worker_kw["resolved_plan"] = plan
+        _worker_kw["preview_intent"] = PreviewIntent.AUTOMATIC_PREVIEW
 
     background_tasks.add_task(
         render_batch_worker,

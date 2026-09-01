@@ -159,6 +159,19 @@ class HistoricalNoveltyPolicyTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, HistoricalDecisionAction.ALLOW_OVERRIDE)
 
+    def test_advisory_reuse_intent_is_not_counted_as_actual_override(self):
+        decision = self.policy.evaluate(
+            _facts(rendered=1),
+            HistoricalNoveltyPolicyConfiguration(
+                historical_policy_mode=HistoricalPolicyMode.ADVISORY,
+            ),
+            reuse_intent=HistoricalReuseIntent(
+                allow_historical_reuse=True,
+                reuse_reason="future explicit reuse",
+            ),
+        )
+        self.assertEqual(decision.action, HistoricalDecisionAction.ALLOW_ADVISORY)
+
     def test_historical_and_reservation_modes_are_independent(self):
         advisory_with_reservation = HistoricalNoveltyPolicyConfiguration(
             historical_policy_mode=HistoricalPolicyMode.ADVISORY,

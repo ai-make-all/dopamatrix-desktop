@@ -413,6 +413,13 @@ class RenderDSLRequest(BaseModel):
             "exact_main_visual_balanced 在相同精确唯一性约束上优化 Beat 轴覆盖。"
         ),
     )
+    historical_novelty_mode: Literal["OFF", "OBSERVE", "ADVISORY"] = Field(
+        default="OFF",
+        description=(
+            "Historical exact-match observation mode. Phase 3D-2B supports only "
+            "OFF, OBSERVE, and non-enforcing ADVISORY."
+        ),
+    )
     user_hard_tags:  List[str]        = Field(
         default_factory=list,
         description="前端剥离的硬约束标签，透传至 DSLParserNode 寻址引擎做一票否决过滤。",

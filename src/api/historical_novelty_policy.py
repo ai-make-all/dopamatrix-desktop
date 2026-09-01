@@ -253,10 +253,10 @@ class HistoricalNoveltyPolicy:
             action = HistoricalDecisionAction.ALLOW
         elif evidence_kind is not HistoricalEvidenceKind.RENDERED:
             action = HistoricalDecisionAction.ALLOW
-        elif intent.allow_historical_reuse:
-            action = HistoricalDecisionAction.ALLOW_OVERRIDE
         elif configuration.historical_policy_mode is HistoricalPolicyMode.ADVISORY:
             action = HistoricalDecisionAction.ALLOW_ADVISORY
+        elif intent.allow_historical_reuse:
+            action = HistoricalDecisionAction.ALLOW_OVERRIDE
         else:
             action = HistoricalDecisionAction.SKIP_HISTORICAL_MATCH
 
