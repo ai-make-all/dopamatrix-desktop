@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from sqlalchemy import (
     DateTime,
@@ -196,11 +196,54 @@ class ReservationConfirmationStatus(str, Enum):
     EXECUTION_BINDING_CONFLICT = "EXECUTION_BINDING_CONFLICT"
 
 
+class ReservationRenewStatus(str, Enum):
+    RENEWED = "RENEWED"
+    OWNER_OR_EXPIRY_CONFLICT = "OWNER_OR_EXPIRY_CONFLICT"
+    EXECUTION_BINDING_CONFLICT = "EXECUTION_BINDING_CONFLICT"
+
+
+class ReservationAuthorityStatus(str, Enum):
+    CURRENT = "CURRENT"
+    OWNER_OR_EXPIRY_CONFLICT = "OWNER_OR_EXPIRY_CONFLICT"
+    EXECUTION_BINDING_CONFLICT = "EXECUTION_BINDING_CONFLICT"
+
+
 @dataclass(frozen=True)
 class ReservationAcquireResult:
     status: ReservationAcquireStatus
     fingerprint_identity_id: int
     expires_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ReservationRenewRequest:
+    fingerprint_identity_id: int
+    owner_task_id: str
+    owner_slot_index: int
+    expected_execution_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ReservationRenewResult:
+    status: ReservationRenewStatus
+    fingerprint_identity_id: int
+    expires_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ReservationAuthorityResult:
+    status: ReservationAuthorityStatus
+    fingerprint_identity_id: int
+    expires_at: datetime | None
+    execution_id: str | None
+
+
+class FingerprintReservationBatchRenewalError(FingerprintLedgerError):
+    """Raised after rolling back an all-or-nothing renewal savepoint."""
+
+    def __init__(self, result: ReservationRenewResult):
+        super().__init__(f"FINGERPRINT_RESERVATION_BATCH_RENEWAL_FAILED: {result.status.value}")
+        self.result = result
 
 
 @dataclass(frozen=True)
@@ -756,6 +799,142 @@ class FingerprintLedgerRepository:
             status=status,
             fingerprint_identity_id=acquired.fingerprint_identity_id,
             expires_at=acquired.expires_at,
+        )
+
+    def renew_reservation(
+        self,
+        fingerprint_identity_id: int,
+        *,
+        owner_task_id: str,
+        owner_slot_index: int,
+        expires_at: datetime,
+        expected_execution_id: str | None = None,
+        now: datetime | None = None,
+    ) -> ReservationRenewResult:
+        """Renew a live lease without acquiring, taking over, or resetting its binding."""
+        current_time = _normalize_reservation_datetime(now or _utcnow())
+        normalized_expires_at = _normalize_reservation_datetime(expires_at)
+        if normalized_expires_at <= current_time:
+            raise FingerprintLedgerError("FINGERPRINT_RESERVATION_EXPIRY_INVALID")
+
+        predicates = [
+            FingerprintReservation.fingerprint_identity_id == fingerprint_identity_id,
+            FingerprintReservation.owner_task_id == owner_task_id,
+            FingerprintReservation.owner_slot_index == owner_slot_index,
+            FingerprintReservation.expires_at > current_time,
+        ]
+        if expected_execution_id is not None:
+            predicates.append(FingerprintReservation.execution_id == expected_execution_id)
+
+        renewed = self._session.execute(
+            update(FingerprintReservation)
+            .where(*predicates)
+            .values(updated_at=current_time, expires_at=normalized_expires_at)
+            .returning(
+                FingerprintReservation.fingerprint_identity_id,
+                FingerprintReservation.expires_at,
+            )
+        ).first()
+        if renewed is not None:
+            return ReservationRenewResult(
+                status=ReservationRenewStatus.RENEWED,
+                fingerprint_identity_id=renewed.fingerprint_identity_id,
+                expires_at=renewed.expires_at,
+            )
+
+        reservation = self._session.execute(
+            select(
+                FingerprintReservation.owner_task_id,
+                FingerprintReservation.owner_slot_index,
+                FingerprintReservation.expires_at,
+                FingerprintReservation.execution_id,
+            ).where(
+                FingerprintReservation.fingerprint_identity_id
+                == fingerprint_identity_id
+            )
+        ).first()
+        if (
+            reservation is not None
+            and reservation.owner_task_id == owner_task_id
+            and reservation.owner_slot_index == owner_slot_index
+            and reservation.expires_at > current_time
+            and expected_execution_id is not None
+            and reservation.execution_id != expected_execution_id
+        ):
+            status = ReservationRenewStatus.EXECUTION_BINDING_CONFLICT
+        else:
+            status = ReservationRenewStatus.OWNER_OR_EXPIRY_CONFLICT
+        return ReservationRenewResult(
+            status=status,
+            fingerprint_identity_id=fingerprint_identity_id,
+            expires_at=reservation.expires_at if reservation is not None else None,
+        )
+
+    def renew_reservations(
+        self,
+        requests: Sequence[ReservationRenewRequest],
+        *,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> tuple[ReservationRenewResult, ...]:
+        """Renew a bounded set atomically without taking ownership of the outer transaction."""
+        if len({request.fingerprint_identity_id for request in requests}) != len(requests):
+            raise FingerprintLedgerError("FINGERPRINT_RESERVATION_RENEWAL_DUPLICATE_IDENTITY")
+
+        results: list[ReservationRenewResult] = []
+        with self._session.begin_nested():
+            for request in requests:
+                result = self.renew_reservation(
+                    request.fingerprint_identity_id,
+                    owner_task_id=request.owner_task_id,
+                    owner_slot_index=request.owner_slot_index,
+                    expires_at=expires_at,
+                    expected_execution_id=request.expected_execution_id,
+                    now=now,
+                )
+                if result.status is not ReservationRenewStatus.RENEWED:
+                    raise FingerprintReservationBatchRenewalError(result)
+                results.append(result)
+        return tuple(results)
+
+    def verify_reservation_authority(
+        self,
+        fingerprint_identity_id: int,
+        *,
+        owner_task_id: str,
+        owner_slot_index: int,
+        expected_execution_id: str | None = None,
+        now: datetime | None = None,
+    ) -> ReservationAuthorityResult:
+        """Read current authority in the caller transaction for future write fencing."""
+        current_time = _normalize_reservation_datetime(now or _utcnow())
+        reservation = self._session.execute(
+            select(
+                FingerprintReservation.owner_task_id,
+                FingerprintReservation.owner_slot_index,
+                FingerprintReservation.expires_at,
+                FingerprintReservation.execution_id,
+            ).where(
+                FingerprintReservation.fingerprint_identity_id
+                == fingerprint_identity_id
+            )
+        ).first()
+        if (
+            reservation is None
+            or reservation.owner_task_id != owner_task_id
+            or reservation.owner_slot_index != owner_slot_index
+            or reservation.expires_at <= current_time
+        ):
+            status = ReservationAuthorityStatus.OWNER_OR_EXPIRY_CONFLICT
+        elif reservation.execution_id != expected_execution_id:
+            status = ReservationAuthorityStatus.EXECUTION_BINDING_CONFLICT
+        else:
+            status = ReservationAuthorityStatus.CURRENT
+        return ReservationAuthorityResult(
+            status=status,
+            fingerprint_identity_id=fingerprint_identity_id,
+            expires_at=reservation.expires_at if reservation is not None else None,
+            execution_id=reservation.execution_id if reservation is not None else None,
         )
 
     def confirm_reservation_detailed(
