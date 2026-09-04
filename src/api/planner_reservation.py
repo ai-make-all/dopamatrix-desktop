@@ -37,6 +37,38 @@ from .reservation_lease import (
 logger = logging.getLogger(__name__)
 
 
+def _begin_sqlite_outer_transaction(session: Session) -> None:
+    """Establish the real SQLite transaction that owns later SAVEPOINTs.
+
+    Python's sqlite3 legacy transaction mode does not emit BEGIN for a
+    SAVEPOINT.  Without this explicit physical BEGIN, releasing the first
+    renewal SAVEPOINT can make it durable outside a later Session.rollback().
+    These controller paths own fresh SQLite Sessions, so any pre-existing
+    logical or physical transaction is an integration contract violation.
+    """
+    if session.in_transaction():
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_OUTER_TRANSACTION_SESSION_NOT_FRESH"
+        )
+    bind = session.get_bind()
+    if bind.dialect.name != "sqlite":
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_OUTER_TRANSACTION_SQLITE_REQUIRED"
+        )
+
+    connection = session.connection()
+    dbapi_connection = connection.connection.dbapi_connection
+    if dbapi_connection.in_transaction:
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_OUTER_TRANSACTION_ALREADY_ACTIVE"
+        )
+    connection.exec_driver_sql("BEGIN")
+    if not dbapi_connection.in_transaction:
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_OUTER_TRANSACTION_NOT_ESTABLISHED"
+        )
+
+
 class PlannerReservationError(RuntimeError):
     """Stable hard failure for enforcement-critical Reservation coordination."""
 
@@ -213,6 +245,7 @@ class PlannerReservationController:
         renewal_results = ()
         with self._session_factory() as session:
             try:
+                _begin_sqlite_outer_transaction(session)
                 repository = FingerprintLedgerRepository(session)
                 for binding in confirmed_bindings:
                     status = repository.confirm_reservation_detailed(
@@ -285,6 +318,7 @@ class PlannerReservationController:
         current_time, next_expiry = self._lease_window()
         with self._session_factory() as session:
             try:
+                _begin_sqlite_outer_transaction(session)
                 FingerprintLedgerRepository(session).renew_reservations(
                     self._renew_requests(confirmed_bindings),
                     now=current_time,
