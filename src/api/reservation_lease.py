@@ -13,7 +13,7 @@ import logging
 import math
 import os
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 from sqlalchemy.exc import (
     DisconnectionError,
@@ -233,6 +233,22 @@ class ReservationLeaseTracker:
         execution_id: str,
     ) -> None:
         with self._lock:
+            binding = self._bindings.get(fingerprint_identity_id)
+            if binding is None:
+                raise ReservationLeaseTrackerError(
+                    "RESERVATION_LEASE_BINDING_NOT_REGISTERED"
+                )
+            expires_at = binding.expires_at
+        self.update_committed_execution_bindings(
+            ((fingerprint_identity_id, execution_id, expires_at),)
+        )
+
+    def update_committed_execution_bindings(
+        self,
+        updates: Sequence[tuple[int, str, datetime]],
+    ) -> None:
+        """Atomically apply post-commit execution bindings to local tracker state."""
+        with self._lock:
             if (
                 self._state is not ReservationLeaseState.ACTIVE
                 or self._heartbeat_state in {
@@ -243,20 +259,32 @@ class ReservationLeaseTracker:
                 raise ReservationLeaseTrackerError(
                     "RESERVATION_LEASE_TRACKER_NOT_ACTIVE"
                 )
-            binding = self._bindings.get(fingerprint_identity_id)
-            if binding is None:
+            if len({identity_id for identity_id, _execution_id, _expiry in updates}) != len(updates):
                 raise ReservationLeaseTrackerError(
-                    "RESERVATION_LEASE_BINDING_NOT_REGISTERED"
+                    "RESERVATION_LEASE_EXECUTION_UPDATE_DUPLICATE_IDENTITY"
                 )
-            if binding.execution_id not in (None, execution_id):
-                raise ReservationLeaseTrackerError(
-                    "RESERVATION_LEASE_EXECUTION_REBIND_FORBIDDEN"
-                )
-            if binding.execution_id is None:
-                self._bindings[fingerprint_identity_id] = replace(
+            replacements: dict[int, ReservationLeaseBinding] = {}
+            for fingerprint_identity_id, execution_id, expires_at in updates:
+                binding = self._bindings.get(fingerprint_identity_id)
+                if binding is None:
+                    raise ReservationLeaseTrackerError(
+                        "RESERVATION_LEASE_BINDING_NOT_REGISTERED"
+                    )
+                if binding.execution_id not in (None, execution_id):
+                    raise ReservationLeaseTrackerError(
+                        "RESERVATION_LEASE_EXECUTION_REBIND_FORBIDDEN"
+                    )
+                replacements[fingerprint_identity_id] = replace(
                     binding,
                     execution_id=execution_id,
+                    expires_at=_normalize_reservation_datetime(expires_at),
                 )
+            self._bindings.update(replacements)
+
+    def fail_closed(self, category: str) -> None:
+        """Make an integration failure observable as irreversible local authority loss."""
+        with self._lock:
+            self._mark_lease_lost_locked(category)
 
     def start(self) -> bool:
         with self._lock:

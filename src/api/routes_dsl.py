@@ -38,6 +38,7 @@ import logging
 import os
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -88,9 +89,12 @@ from .historical_novelty_policy import (
     PreviewIntent,
 )
 from .planner_reservation import (
+    PlannerReservationAuthorityLost,
     PlannerReservationBinding,
     PlannerReservationController,
     PlannerReservationDecision,
+    PlannerReservationError,
+    PlannerReservationExecutionBinding,
 )
 from .schemas import (
     CompilationPlan,
@@ -268,6 +272,8 @@ _PLANNING_REQUEST_SATISFIED = "REQUEST_SATISFIED"
 _PLANNING_TRUE_SPACE_EXHAUSTED = "TRUE_SPACE_EXHAUSTED"
 _PLANNING_SEARCH_LIMIT_REACHED = "PLANNING_SEARCH_LIMIT_REACHED"
 _PLANNING_RESERVATION_CONFLICT_EXHAUSTED = "RESERVATION_CONFLICT_EXHAUSTED"
+_RESERVATION_AUTHORITY_LOST = "RESERVATION_AUTHORITY_LOST"
+_RESERVATION_TERMINAL_PERSIST_FAILED = "RESERVATION_TERMINAL_PERSIST_FAILED"
 _EXACT_MAIN_VISUAL_SEARCH_BUDGET = 4096
 
 _COVERAGE_DIAGNOSTICS_TYPE = "balanced_axis_coverage"
@@ -2231,6 +2237,7 @@ class _ChildResult:
     error_code: Optional[str]
     error_message: Optional[str]
     prompt_details: dict[str, Any]
+    fatigue_asset_ids: tuple[int, ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -2315,6 +2322,45 @@ def _child_prompt_details(
     }
 
 
+def _plan_fatigue_asset_ids(
+    plan: Optional[CompilationPlan],
+) -> tuple[int, ...]:
+    if plan is None:
+        return ()
+    return tuple(
+        sorted(
+            {
+                layer.asset_id
+                for beat in plan.beats
+                for layer in beat.layers
+                if layer.asset_id
+            }
+        )
+    )
+
+
+def _apply_fatigue_updates(
+    db: Session,
+    fatigue_counts: Counter[int],
+    *,
+    used_at: datetime,
+) -> int:
+    if not fatigue_counts:
+        return 0
+    assets = (
+        db.query(LocalAsset)
+        .filter(
+            LocalAsset.id.in_(tuple(fatigue_counts)),
+            LocalAsset.is_deleted.is_(False),
+        )
+        .all()
+    )
+    for asset in assets:
+        asset.usage_count = (asset.usage_count or 0) + fatigue_counts[asset.id]
+        asset.last_used_at = used_at
+    return len(assets)
+
+
 # ================================================================== #
 # 后台渲染 Worker  (Phase 5.2)                                        #
 # ================================================================== #
@@ -2340,6 +2386,7 @@ def render_worker(
     visual_fingerprint: Optional[_MainVisualFingerprint] = None,
     enable_tts: bool = True,
     enable_subtitles: bool = True,
+    defer_fatigue_write: bool = False,
 ) -> _ChildResult:
     """
     后台渲染主 Worker（Phase 9.11.2 单轨线性架构）。
@@ -2370,6 +2417,7 @@ def render_worker(
     )
 
     collected_assets: list[dict] = []
+    fatigue_asset_ids: tuple[int, ...] = ()
     _start_time: float = time.time()
     working_plan: Optional[CompilationPlan] = plan
 
@@ -2388,6 +2436,7 @@ def render_worker(
             error_code=error_code,
             error_message=(error_message[:500] if error_message else None),
             prompt_details=_child_prompt_details(dsl_payload, working_plan),
+            fatigue_asset_ids=fatigue_asset_ids,
         )
 
     try:
@@ -2717,6 +2766,9 @@ def render_worker(
 
         # ── 6b. 疲劳值回写 ────────────────────────────────────────────────
         if render_ok and working_plan:
+            fatigue_asset_ids = _plan_fatigue_asset_ids(working_plan)
+
+        if render_ok and working_plan and not defer_fatigue_write:
             try:
                 used_asset_ids: set[int] = set()
                 for beat in working_plan.beats:
@@ -2798,10 +2850,9 @@ def _failed_child_result(
     )
 
 
-def _persist_task_history(
+def _build_task_history_record(
     *,
     task_id: str,
-    tenant_id: str,
     prompt: Optional[str],
     batch_size: int,
     elapsed: float,
@@ -2810,9 +2861,7 @@ def _persist_task_history(
     warning_codes: list[str],
     coverage_diagnostics: Optional[dict[str, Any]] = None,
     historical_novelty_diagnostics: Optional[dict[str, Any]] = None,
-    ledger_terminal_records: Sequence[FingerprintOccurrenceRecord] = (),
-) -> bool:
-    """Persist the single completed-result row owned by the coordinator."""
+) -> TaskHistory:
     first_success = next(result for result in child_results if result.succeeded)
     legacy_details = first_success.prompt_details
     planning_summary: dict[str, Any] = {
@@ -2846,7 +2895,7 @@ def _persist_task_history(
             for result in child_results
         ],
     }
-    history_record = TaskHistory(
+    return TaskHistory(
         task_id=task_id,
         prompt=prompt or "",
         batch_size=batch_size,
@@ -2854,6 +2903,34 @@ def _persist_task_history(
         output_assets=output_assets,
         prompt_details=json.dumps(prompt_details, ensure_ascii=False),
         created_at=datetime.utcnow(),
+    )
+
+
+def _persist_task_history(
+    *,
+    task_id: str,
+    tenant_id: str,
+    prompt: Optional[str],
+    batch_size: int,
+    elapsed: float,
+    child_results: list[_ChildResult],
+    output_assets: list[dict],
+    warning_codes: list[str],
+    coverage_diagnostics: Optional[dict[str, Any]] = None,
+    historical_novelty_diagnostics: Optional[dict[str, Any]] = None,
+    ledger_terminal_records: Sequence[FingerprintOccurrenceRecord] = (),
+) -> bool:
+    """Persist the single completed-result row owned by the coordinator."""
+    history_record = _build_task_history_record(
+        task_id=task_id,
+        prompt=prompt,
+        batch_size=batch_size,
+        elapsed=elapsed,
+        child_results=child_results,
+        output_assets=output_assets,
+        warning_codes=warning_codes,
+        coverage_diagnostics=coverage_diagnostics,
+        historical_novelty_diagnostics=historical_novelty_diagnostics,
     )
     history_engine = get_tenant_engine(tenant_id)
     HistorySession = sessionmaker(
@@ -2887,6 +2964,144 @@ def _persist_task_history(
     return ledger_persisted
 
 
+def _reservation_execution_bindings(
+    *,
+    task_id: str,
+    planning_result: _VariantPlanningResult,
+    computed_fingerprints: Sequence[_MainVisualFingerprint],
+    child_work: Sequence[_ChildWork],
+    reservation_controller: PlannerReservationController,
+) -> tuple[PlannerReservationExecutionBinding, ...]:
+    """Validate the authoritative plan/FP/slot/execution handoff."""
+    controller_bindings = reservation_controller.bindings
+    result_bindings = planning_result.reservation_bindings
+    expected_count = len(planning_result.plans)
+    if (
+        reservation_controller.owner_task_id != task_id
+        or len(computed_fingerprints) != expected_count
+        or len(controller_bindings) != expected_count
+        or len(result_bindings) != expected_count
+        or len(child_work) != expected_count
+        or controller_bindings != result_bindings
+    ):
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_COORDINATOR_BINDING_COUNT_MISMATCH"
+        )
+
+    execution_bindings: list[PlannerReservationExecutionBinding] = []
+    for slot, (binding, fingerprint, work) in enumerate(
+        zip(controller_bindings, computed_fingerprints, child_work)
+    ):
+        contract = _main_visual_planning_fingerprint_contract(fingerprint)
+        if (
+            binding.owner_task_id != task_id
+            or binding.owner_slot_index != slot
+            or work.execution.child_index != slot
+            or work.authoritative_plan != planning_result.plans[slot]
+            or work.visual_fingerprint != fingerprint
+            or binding.fingerprint_type != contract.fingerprint_type
+            or binding.fingerprint_version != contract.fingerprint_version
+            or binding.fingerprint_digest != contract.fingerprint_digest
+        ):
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_COORDINATOR_BINDING_ALIGNMENT_MISMATCH"
+            )
+        execution_bindings.append(
+            PlannerReservationExecutionBinding(
+                fingerprint_identity_id=binding.fingerprint_identity_id,
+                owner_task_id=task_id,
+                owner_slot_index=slot,
+                execution_id=work.execution.execution_id,
+            )
+        )
+    return tuple(execution_bindings)
+
+
+def _persist_reservation_authoritative_terminal(
+    *,
+    reservation_controller: PlannerReservationController,
+    execution_bindings: Sequence[PlannerReservationExecutionBinding],
+    terminal_ledger_records: Sequence[FingerprintOccurrenceRecord],
+    task_id: str,
+    prompt: Optional[str],
+    batch_size: int,
+    elapsed: float,
+    child_results: list[_ChildResult],
+    output_assets: list[dict],
+    warning_codes: list[str],
+    coverage_diagnostics: Optional[dict[str, Any]],
+    historical_novelty_diagnostics: Optional[dict[str, Any]],
+) -> bool:
+    """Fence every binding and commit all authoritative terminal side effects."""
+    if (
+        len(execution_bindings) != len(child_results)
+        or len(terminal_ledger_records) != len(child_results)
+    ):
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_TERMINAL_RESULT_COUNT_MISMATCH"
+        )
+    expected_by_execution = {
+        (binding.owner_slot_index, binding.execution_id): binding
+        for binding in execution_bindings
+    }
+    if len(expected_by_execution) != len(execution_bindings):
+        raise PlannerReservationError(
+            "PLANNER_RESERVATION_TERMINAL_EXECUTION_IDENTITY_DUPLICATE"
+        )
+    for result, record in zip(child_results, terminal_ledger_records):
+        key = (result.child_index, result.execution_id)
+        binding = expected_by_execution.get(key)
+        if (
+            binding is None
+            or record.task_id != binding.owner_task_id
+            or record.child_index != binding.owner_slot_index
+            or record.execution_id != binding.execution_id
+            or record.lifecycle_event
+            != ("RENDERED" if result.succeeded else "FAILED")
+        ):
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_TERMINAL_RESULT_ALIGNMENT_MISMATCH"
+            )
+    succeeded_count = sum(result.succeeded for result in child_results)
+    fatigue_counts: Counter[int] = Counter(
+        asset_id
+        for result in child_results
+        if result.succeeded
+        for asset_id in result.fatigue_asset_ids
+    )
+
+    def _write_terminal(session: Session) -> None:
+        _record_fingerprint_ledger_records(session, terminal_ledger_records)
+        _apply_fatigue_updates(
+            session,
+            fatigue_counts,
+            used_at=datetime.utcnow(),
+        )
+        # Preserve the existing zero-success TaskHistory limitation.
+        if succeeded_count:
+            session.add(
+                _build_task_history_record(
+                    task_id=task_id,
+                    prompt=prompt,
+                    batch_size=batch_size,
+                    elapsed=elapsed,
+                    child_results=child_results,
+                    output_assets=output_assets,
+                    warning_codes=warning_codes,
+                    coverage_diagnostics=coverage_diagnostics,
+                    historical_novelty_diagnostics=(
+                        historical_novelty_diagnostics
+                    ),
+                )
+            )
+
+    reservation_controller.run_fenced_terminal_transaction(
+        execution_bindings,
+        _write_terminal,
+    )
+    return bool(succeeded_count)
+
+
 def render_batch_worker(
     dsl_payload: Optional[StoryDSLPayload],
     task_id: str,
@@ -2906,6 +3121,7 @@ def render_batch_worker(
     variant_planning_policy: str = "legacy",
     historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
 ) -> dict[str, Any]:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
@@ -2924,6 +3140,26 @@ def render_batch_worker(
     historical_novelty_diagnostics_payload: Optional[dict[str, Any]] = None
     child_work: list[_ChildWork] = []
     planned_ledger_records: tuple[FingerprintOccurrenceRecord, ...] = ()
+    reservation_execution_bindings: tuple[
+        PlannerReservationExecutionBinding, ...
+    ] = ()
+    reservation_authority_lost = False
+    reservation_terminal_persist_failed = False
+
+    if reservation_controller is not None:
+        if reservation_controller.owner_task_id != task_id:
+            reservation_controller.abort()
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_WORKER_OWNER_MISMATCH"
+            )
+        if variant_planning_policy not in {
+            "exact_main_visual",
+            "exact_main_visual_balanced",
+        }:
+            reservation_controller.abort()
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_AUTHORITATIVE_POLICY_REQUIRED"
+            )
     planning_function = None
     if variant_planning_policy == "exact_main_visual":
         planning_function = _plan_exact_main_visual_variants_from_db
@@ -2949,6 +3185,10 @@ def render_batch_worker(
                 planning_kwargs: dict[str, Any] = {
                     "preview_plan": resolved_plan,
                 }
+                if reservation_controller is not None:
+                    planning_kwargs["reservation_controller"] = (
+                        reservation_controller
+                    )
                 if historical_novelty_mode != _HISTORICAL_MODE_OFF:
                     planning_kwargs.update({
                         "historical_novelty_mode": historical_novelty_mode,
@@ -3012,7 +3252,7 @@ def render_batch_worker(
                     if planning_result.plans
                     else []
                 )
-                child_work = [
+                staged_child_work = [
                     _ChildWork(
                         execution=identity,
                         authoritative_plan=plan,
@@ -3024,6 +3264,30 @@ def render_batch_worker(
                         computed_fingerprints,
                     )
                 ]
+                if reservation_controller is not None:
+                    reservation_execution_bindings = (
+                        _reservation_execution_bindings(
+                            task_id=task_id,
+                            planning_result=planning_result,
+                            computed_fingerprints=computed_fingerprints,
+                            child_work=staged_child_work,
+                            reservation_controller=reservation_controller,
+                        )
+                    )
+                    planned_ledger_records = tuple(
+                        _fingerprint_ledger_occurrence_record(
+                            work,
+                            task_id,
+                            "PLANNED",
+                        )
+                        for work in staged_child_work
+                    )
+                    reservation_controller.confirm_and_record_planned(
+                        reservation_execution_bindings,
+                        planned_ledger_records,
+                    )
+                    reservation_controller.require_active()
+                child_work = staged_child_work
                 logger.info(
                     "[render_batch_worker] authoritative planning task_id=%s policy=%s "
                     "requested=%d planned=%d examined=%d space=%d reason=%s warnings=%s",
@@ -3036,6 +3300,17 @@ def render_batch_worker(
                     planning_result.termination_reason,
                     planning_warning_codes,
                 )
+            except PlannerReservationAuthorityLost:
+                reservation_authority_lost = True
+                logger.exception(
+                    "[render_batch_worker] Reservation authority lost before child "
+                    "start task_id=%s policy=%s",
+                    task_id,
+                    variant_planning_policy,
+                )
+                planning_warning_codes.append(_RESERVATION_AUTHORITY_LOST)
+                if reservation_controller is not None:
+                    reservation_controller.abort()
             except Exception:
                 logger.exception(
                     "[render_batch_worker] authoritative planning failed task_id=%s "
@@ -3044,6 +3319,8 @@ def render_batch_worker(
                     variant_planning_policy,
                 )
                 planning_warning_codes.append("VARIANT_PLANNING_FAILED")
+                if reservation_controller is not None:
+                    reservation_controller.abort()
             else:
                 coverage_diagnostics_payload = staged_coverage_diagnostics_payload
                 historical_novelty_diagnostics_payload = (
@@ -3062,7 +3339,11 @@ def render_batch_worker(
         )
         planning_warning_codes.append("VARIANT_PLANNING_FAILED")
 
-    if child_work and all(work.visual_fingerprint is not None for work in child_work):
+    if (
+        reservation_controller is None
+        and child_work
+        and all(work.visual_fingerprint is not None for work in child_work)
+    ):
         try:
             planned_ledger_records = tuple(
                 _fingerprint_ledger_occurrence_record(work, task_id, "PLANNED")
@@ -3110,6 +3391,7 @@ def render_batch_worker(
                 visual_fingerprint=work.visual_fingerprint,
                 enable_tts=enable_tts,
                 enable_subtitles=enable_subtitles,
+                defer_fatigue_write=reservation_controller is not None,
             )
             if not isinstance(result, _ChildResult):
                 raise TypeError("render_worker must return _ChildResult")
@@ -3133,14 +3415,28 @@ def render_batch_worker(
                 time.time() - child_start,
             )
 
+    if reservation_controller is not None and child_work:
+        try:
+            reservation_controller.require_active()
+        except PlannerReservationAuthorityLost:
+            reservation_authority_lost = True
+            child_work = []
+            if _RESERVATION_AUTHORITY_LOST not in planning_warning_codes:
+                planning_warning_codes.append(_RESERVATION_AUTHORITY_LOST)
+
     if len(child_work) == 1:
         child_results.append(_execute_child(child_work[0]))
     elif len(child_work) > 1:
         with ThreadPoolExecutor(max_workers=len(child_work)) as pool:
-            future_map = {
-                pool.submit(_execute_child, work): work.execution
-                for work in child_work
-            }
+            future_map = {}
+            for work in child_work:
+                if reservation_controller is not None:
+                    try:
+                        reservation_controller.require_active()
+                    except PlannerReservationAuthorityLost:
+                        reservation_authority_lost = True
+                        break
+                future_map[pool.submit(_execute_child, work)] = work.execution
             for future in as_completed(future_map):
                 child = future_map[future]
                 try:
@@ -3173,7 +3469,11 @@ def render_batch_worker(
     ]
     succeeded_count = len(successful_results)
     failed_count = len(child_results) - succeeded_count
-    planned_count = len(child_results)
+    planned_count = (
+        len(reservation_execution_bindings)
+        if reservation_controller is not None
+        else len(child_results)
+    )
     partial = succeeded_count > 0 and (
         failed_count > 0 or planned_count < batch_size
     )
@@ -3199,6 +3499,8 @@ def render_batch_worker(
         )
     except Exception as exc:
         terminal_ledger_records = ()
+        if reservation_controller is not None:
+            reservation_terminal_persist_failed = True
         try:
             fingerprint_logger.warning(
                 "[FINGERPRINT_LEDGER_SHADOW_WRITE_FAILED] "
@@ -3211,7 +3513,51 @@ def render_batch_worker(
     history_persisted = False
     terminal_ledger_persisted = not terminal_ledger_records
     elapsed = time.time() - batch_start
-    if succeeded_count:
+    if reservation_controller is not None and reservation_execution_bindings:
+        if reservation_authority_lost:
+            terminal_ledger_persisted = False
+        elif reservation_terminal_persist_failed:
+            terminal_ledger_persisted = False
+        else:
+            try:
+                history_persisted = _persist_reservation_authoritative_terminal(
+                    reservation_controller=reservation_controller,
+                    execution_bindings=reservation_execution_bindings,
+                    terminal_ledger_records=terminal_ledger_records,
+                    task_id=task_id,
+                    prompt=prompt,
+                    batch_size=batch_size,
+                    elapsed=elapsed,
+                    child_results=child_results,
+                    output_assets=all_assets,
+                    warning_codes=warning_codes,
+                    coverage_diagnostics=coverage_diagnostics_payload,
+                    historical_novelty_diagnostics=(
+                        historical_novelty_diagnostics_payload
+                    ),
+                )
+                terminal_ledger_persisted = True
+            except PlannerReservationAuthorityLost:
+                reservation_authority_lost = True
+                terminal_ledger_persisted = False
+                logger.exception(
+                    "[render_batch_worker] Reservation terminal authority lost "
+                    "task_id=%s",
+                    task_id,
+                )
+            except Exception:
+                reservation_terminal_persist_failed = True
+                terminal_ledger_persisted = False
+                logger.exception(
+                    "[render_batch_worker] Reservation terminal transaction failed "
+                    "task_id=%s",
+                    task_id,
+                )
+        reservation_controller.abort()
+    elif reservation_controller is not None:
+        # No accepted bindings still has an owned controller lifecycle to quiesce.
+        reservation_controller.abort()
+    elif succeeded_count:
         try:
             terminal_ledger_persisted = _persist_task_history(
                 task_id=task_id,
@@ -3240,14 +3586,44 @@ def render_batch_worker(
                 task_id,
             )
 
-    if terminal_ledger_records and not terminal_ledger_persisted:
+    if (
+        reservation_controller is None
+        and terminal_ledger_records
+        and not terminal_ledger_persisted
+    ):
         _record_fingerprint_ledger_records_safely(
             tenant_id,
             terminal_ledger_records,
             phase="terminal_fallback",
         )
 
-    final_status = "completed" if succeeded_count else "failed"
+    if reservation_authority_lost:
+        warning_codes = list(dict.fromkeys(
+            [*warning_codes, _RESERVATION_AUTHORITY_LOST]
+        ))
+        all_assets = []
+        history_persisted = False
+        final_status = "failed"
+        terminal_error_code = _RESERVATION_AUTHORITY_LOST
+        terminal_succeeded_count = 0
+        terminal_failed_count = planned_count
+        partial = False
+    elif reservation_terminal_persist_failed:
+        warning_codes = list(dict.fromkeys(
+            [*warning_codes, _RESERVATION_TERMINAL_PERSIST_FAILED]
+        ))
+        all_assets = []
+        history_persisted = False
+        final_status = "failed"
+        terminal_error_code = _RESERVATION_TERMINAL_PERSIST_FAILED
+        terminal_succeeded_count = 0
+        terminal_failed_count = planned_count
+        partial = False
+    else:
+        final_status = "completed" if succeeded_count else "failed"
+        terminal_error_code = None
+        terminal_succeeded_count = succeeded_count
+        terminal_failed_count = failed_count
     terminal_payload: dict[str, Any] = {
         "taskId": task_id,
         "status": final_status,
@@ -3255,11 +3631,13 @@ def render_batch_worker(
         "partial": partial,
         "requestedCount": batch_size,
         "plannedCount": planned_count,
-        "succeededCount": succeeded_count,
-        "failedCount": failed_count,
+        "succeededCount": terminal_succeeded_count,
+        "failedCount": terminal_failed_count,
         "historyPersisted": history_persisted,
         "warningCodes": warning_codes,
     }
+    if terminal_error_code is not None:
+        terminal_payload["errorCode"] = terminal_error_code
     if all_assets:
         terminal_payload["assets"] = all_assets
     if coverage_diagnostics_payload is not None:
@@ -3273,7 +3651,8 @@ def render_batch_worker(
         logger.info(
             "[render_batch_worker] task_id=%s status=%s partial=%s "
             "succeeded=%d failed=%d assets=%d history_persisted=%s",
-            task_id, final_status, partial, succeeded_count, failed_count,
+            task_id, final_status, partial,
+            terminal_succeeded_count, terminal_failed_count,
             len(all_assets), history_persisted,
         )
     except Exception:
