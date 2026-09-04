@@ -48,7 +48,7 @@ class ReservationTerminalIntegrationTests(unittest.TestCase):
 
     def _controller(self, task_id):
         return PlannerReservationController(
-            owner_task_id=task_id,
+            logical_task_id=task_id,
             session_factory=self.Session,
             configuration=self.configuration,
         )
@@ -201,7 +201,12 @@ class ReservationTerminalIntegrationTests(unittest.TestCase):
         with self.Session() as db:
             rows = db.scalars(select(FingerprintReservation)).all()
             retained = next(row for row in rows if row.owner_task_id == "takeover")
-            first = next(row for row in rows if row.owner_task_id == task_id)
+            first = next(
+                row
+                for row in rows
+                if row.owner_task_id
+                == controller.reservation_owner_attempt_id
+            )
             self.assertIsNone(first.execution_id)
             self.assertIsNone(first.confirmed_at)
             self.assertIsNone(retained.execution_id)
@@ -216,7 +221,8 @@ class ReservationTerminalIntegrationTests(unittest.TestCase):
         work = routes_dsl._ChildWork(child, result.plans[0], fingerprint)
         binding = PlannerReservationExecutionBinding(
             fingerprint_identity_id=controller.bindings[0].fingerprint_identity_id,
-            owner_task_id=task_id,
+            logical_task_id=task_id,
+            owner_attempt_id=controller.reservation_owner_attempt_id,
             owner_slot_index=0,
             execution_id=child.execution_id,
         )
@@ -253,7 +259,8 @@ class ReservationTerminalIntegrationTests(unittest.TestCase):
         work = routes_dsl._ChildWork(child, result.plans[0], fingerprint)
         binding = PlannerReservationExecutionBinding(
             fingerprint_identity_id=controller.bindings[0].fingerprint_identity_id,
-            owner_task_id=task_id,
+            logical_task_id=task_id,
+            owner_attempt_id=controller.reservation_owner_attempt_id,
             owner_slot_index=0,
             execution_id=child.execution_id,
         )

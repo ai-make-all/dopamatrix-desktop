@@ -26,6 +26,7 @@ from src.api.planner_reservation import (
     PlannerReservationAuthorityLost,
     PlannerReservationController,
     PlannerReservationExecutionBinding,
+    new_reservation_owner_attempt_id,
 )
 from src.api.reservation_lease import (
     ReservationHeartbeatState,
@@ -97,7 +98,7 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
         cleanup_timeout=2.0,
     ):
         controller = PlannerReservationController(
-            owner_task_id=task_id,
+            logical_task_id=task_id,
             session_factory=Session or self.Session,
             configuration=ReservationLeaseConfiguration(ttl, interval),
             now=now or _utcnow,
@@ -221,7 +222,8 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
         bindings = tuple(
             PlannerReservationExecutionBinding(
                 fingerprint_identity_id=reservation.fingerprint_identity_id,
-                owner_task_id=task_id,
+                logical_task_id=task_id,
+                owner_attempt_id=controller.reservation_owner_attempt_id,
                 owner_slot_index=slot,
                 execution_id=work.execution.execution_id,
             )
@@ -1055,8 +1057,9 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
             return self.Session()
 
         configuration = ReservationLeaseConfiguration(1.2, 0.1)
+        owner_attempt_id = new_reservation_owner_attempt_id()
         tracker = ReservationLeaseTracker(
-            owner_task_id=task_id,
+            owner_attempt_id=owner_attempt_id,
             session_factory=heartbeat_session_factory,
             configuration=configuration,
         )
@@ -1135,7 +1138,10 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
         identity_id = controller.bindings[0].fingerprint_identity_id
         with self.Session() as db:
             row = db.get(FingerprintReservation, identity_id)
-            self.assertEqual(row.owner_task_id, task_id)
+            self.assertEqual(
+                row.owner_task_id,
+                controller.reservation_owner_attempt_id,
+            )
             takeover = FingerprintLedgerRepository(db).acquire_reservation(
                 self._identity(result.fingerprints[0]),
                 owner_task_id="forward-new-owner",
@@ -1203,7 +1209,7 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
                 ["PLANNED"],
             )
 
-    def test_owner_slot_reuse_debt_remains_internal_and_explicit(self):
+    def test_owner_attempt_separates_reused_logical_task_slots(self):
         pools = _pools(2)
         payload = _payload(pools)
         fingerprints = [
@@ -1228,7 +1234,14 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(
                 {(row.owner_task_id, row.owner_slot_index) for row in rows},
-                {("reused-task", 0)},
+                {
+                    (first.reservation_owner_attempt_id, 0),
+                    (second.reservation_owner_attempt_id, 0),
+                },
+            )
+            self.assertNotEqual(
+                first.reservation_owner_attempt_id,
+                second.reservation_owner_attempt_id,
             )
 
 

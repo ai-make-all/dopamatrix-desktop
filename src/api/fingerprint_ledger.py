@@ -129,6 +129,12 @@ class FingerprintOccurrence(FingerprintLedgerBase):
 
 
 class FingerprintReservation(FingerprintLedgerBase):
+    """V2 lease row.
+
+    ``owner_task_id`` is the retained physical schema name. Reservation
+    authority callers store the server-generated owner-attempt identity here,
+    never the logical/public task ID.
+    """
     __tablename__ = "fingerprint_reservations"
     __table_args__ = (
         Index("ix_fingerprint_reservation_expires_at", "expires_at"),
@@ -218,6 +224,7 @@ class ReservationAcquireResult:
 @dataclass(frozen=True)
 class ReservationRenewRequest:
     fingerprint_identity_id: int
+    # Legacy physical-name compatibility: value is an owner-attempt identity.
     owner_task_id: str
     owner_slot_index: int
     expected_execution_id: str | None = None

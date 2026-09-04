@@ -454,7 +454,7 @@ class ReservationLeaseTrackerTests(unittest.TestCase):
             )
             db.commit()
         tracker = ReservationLeaseTracker(
-            owner_task_id="task-a",
+            owner_attempt_id="task-a",
             session_factory=session_factory or self.Session,
             configuration=self.config,
             now=lambda: self.base + timedelta(seconds=1),
@@ -468,7 +468,7 @@ class ReservationLeaseTrackerTests(unittest.TestCase):
 
     def test_start_requires_binding_and_stop_does_not_release(self):
         tracker = ReservationLeaseTracker(
-            owner_task_id="task-a",
+            owner_attempt_id="task-a",
             session_factory=self.Session,
             configuration=self.config,
         )
@@ -521,7 +521,7 @@ class ReservationLeaseTrackerTests(unittest.TestCase):
                 acquired_ids.append(acquired.fingerprint_identity_id)
             db.commit()
         tracker = ReservationLeaseTracker(
-            owner_task_id="task-a",
+            owner_attempt_id="task-a",
             session_factory=self.Session,
             configuration=self.config,
         )
@@ -651,7 +651,7 @@ class ReservationLeaseTrackerTests(unittest.TestCase):
                 return Session()
 
             tracker = ReservationLeaseTracker(
-                owner_task_id="task-a",
+                owner_attempt_id="task-a",
                 session_factory=counted_session,
                 configuration=ReservationLeaseConfiguration(0.6, 0.05),
             )
@@ -703,7 +703,7 @@ class ReservationLeaseTrackerTests(unittest.TestCase):
                 return Session()
 
             tracker = ReservationLeaseTracker(
-                owner_task_id="task-a",
+                owner_attempt_id="task-a",
                 session_factory=blocked_session_factory,
                 configuration=ReservationLeaseConfiguration(30, 0.05),
             )
@@ -795,7 +795,7 @@ class ReservationLeaseTrackerTests(unittest.TestCase):
                 )
                 db.commit()
             tracker = ReservationLeaseTracker(
-                owner_task_id="task-a",
+                owner_attempt_id="task-a",
                 session_factory=Session,
                 configuration=self.config,
                 heartbeat_wait=lambda _interval: False,

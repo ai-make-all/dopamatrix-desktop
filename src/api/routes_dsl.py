@@ -1533,7 +1533,9 @@ def _attach_planner_reservation_bindings(
     for slot, (binding, fingerprint) in enumerate(zip(bindings, result.fingerprints)):
         contract = _main_visual_planning_fingerprint_contract(fingerprint)
         if (
-            binding.owner_task_id != reservation_controller.owner_task_id
+            binding.logical_task_id != reservation_controller.logical_task_id
+            or binding.owner_attempt_id
+            != reservation_controller.reservation_owner_attempt_id
             or binding.owner_slot_index != slot
             or binding.fingerprint_type != contract.fingerprint_type
             or binding.fingerprint_version != contract.fingerprint_version
@@ -2977,7 +2979,7 @@ def _reservation_execution_bindings(
     result_bindings = planning_result.reservation_bindings
     expected_count = len(planning_result.plans)
     if (
-        reservation_controller.owner_task_id != task_id
+        reservation_controller.logical_task_id != task_id
         or len(computed_fingerprints) != expected_count
         or len(controller_bindings) != expected_count
         or len(result_bindings) != expected_count
@@ -2994,7 +2996,9 @@ def _reservation_execution_bindings(
     ):
         contract = _main_visual_planning_fingerprint_contract(fingerprint)
         if (
-            binding.owner_task_id != task_id
+            binding.logical_task_id != task_id
+            or binding.owner_attempt_id
+            != reservation_controller.reservation_owner_attempt_id
             or binding.owner_slot_index != slot
             or work.execution.child_index != slot
             or work.authoritative_plan != planning_result.plans[slot]
@@ -3009,7 +3013,8 @@ def _reservation_execution_bindings(
         execution_bindings.append(
             PlannerReservationExecutionBinding(
                 fingerprint_identity_id=binding.fingerprint_identity_id,
-                owner_task_id=task_id,
+                logical_task_id=task_id,
+                owner_attempt_id=binding.owner_attempt_id,
                 owner_slot_index=slot,
                 execution_id=work.execution.execution_id,
             )
@@ -3053,7 +3058,7 @@ def _persist_reservation_authoritative_terminal(
         binding = expected_by_execution.get(key)
         if (
             binding is None
-            or record.task_id != binding.owner_task_id
+            or record.task_id != binding.logical_task_id
             or record.child_index != binding.owner_slot_index
             or record.execution_id != binding.execution_id
             or record.lifecycle_event
@@ -3147,7 +3152,7 @@ def render_batch_worker(
     reservation_terminal_persist_failed = False
 
     if reservation_controller is not None:
-        if reservation_controller.owner_task_id != task_id:
+        if reservation_controller.logical_task_id != task_id:
             reservation_controller.abort()
             raise PlannerReservationError(
                 "PLANNER_RESERVATION_WORKER_OWNER_MISMATCH"

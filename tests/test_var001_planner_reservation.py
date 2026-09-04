@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -70,6 +71,7 @@ def _observer(session_factory, mode="OBSERVE"):
 
 class _FakeTracker:
     def __init__(self, *, register_error=None, stop_result=True, on_register=None):
+        self.owner_attempt_id = str(uuid.uuid4())
         self.state = ReservationLeaseState.ACTIVE
         self.heartbeat_state = ReservationHeartbeatState.NOT_STARTED
         self.register_error = register_error
@@ -110,7 +112,7 @@ class PlannerReservationIntegrationTests(unittest.TestCase):
 
     def _controller(self, owner="task-a", **kwargs):
         return PlannerReservationController(
-            owner_task_id=owner,
+            logical_task_id=owner,
             session_factory=kwargs.pop("session_factory", self.Session),
             configuration=kwargs.pop("configuration", self.configuration),
             now=kwargs.pop("now", lambda: self.now + timedelta(seconds=1)),
@@ -596,7 +598,11 @@ class PlannerReservationIntegrationTests(unittest.TestCase):
                     fingerprint
                 )
                 self.assertEqual(binding.fingerprint_digest, contract.fingerprint_digest)
-                self.assertEqual(binding.owner_task_id, "task-a")
+                self.assertEqual(binding.logical_task_id, "task-a")
+                self.assertEqual(
+                    binding.owner_attempt_id,
+                    controller.reservation_owner_attempt_id,
+                )
         finally:
             controller.abort()
 
@@ -707,7 +713,7 @@ class PlannerReservationConcurrencyTests(unittest.TestCase):
                 return _plan_for_selections(payload_arg, selections)
 
             controller = PlannerReservationController(
-                owner_task_id="task-a",
+                logical_task_id="task-a",
                 session_factory=Session,
                 configuration=ReservationLeaseConfiguration(0.3, 0.05),
             )
@@ -789,7 +795,7 @@ class PlannerReservationConcurrencyTests(unittest.TestCase):
                 return _plan_for_selections(payload_arg, selections)
 
             controller = PlannerReservationController(
-                owner_task_id="task-a",
+                logical_task_id="task-a",
                 session_factory=controlled_session_factory,
                 configuration=ReservationLeaseConfiguration(30, 0.01),
                 cleanup_join_timeout_seconds=0.02,
@@ -844,7 +850,7 @@ class PlannerReservationConcurrencyTests(unittest.TestCase):
 
         def run(owner):
             controller = PlannerReservationController(
-                owner_task_id=owner,
+                logical_task_id=owner,
                 session_factory=Session,
                 configuration=ReservationLeaseConfiguration(30, 5),
             )
@@ -922,7 +928,7 @@ class PlannerReservationConcurrencyTests(unittest.TestCase):
                 for index, engine in enumerate(engines):
                     Session = sessionmaker(bind=engine)
                     controller = PlannerReservationController(
-                        owner_task_id=f"task-{index}",
+                        logical_task_id=f"task-{index}",
                         session_factory=Session,
                         configuration=ReservationLeaseConfiguration(30, 5),
                     )

@@ -129,7 +129,7 @@ class ReservationHeartbeatState(str, Enum):
 @dataclass(frozen=True)
 class ReservationLeaseBinding:
     fingerprint_identity_id: int
-    owner_task_id: str
+    owner_attempt_id: str
     owner_slot_index: int
     expires_at: datetime
     execution_id: str | None = None
@@ -145,13 +145,13 @@ class ReservationLeaseTracker:
     def __init__(
         self,
         *,
-        owner_task_id: str,
+        owner_attempt_id: str,
         session_factory: Callable[[], Session],
         configuration: ReservationLeaseConfiguration,
         now: Callable[[], datetime] = _reservation_utcnow,
         heartbeat_wait: Callable[[float], bool] | None = None,
     ) -> None:
-        self._owner_task_id = owner_task_id
+        self._owner_attempt_id = owner_attempt_id
         self._session_factory = session_factory
         self._configuration = configuration.require_configured()
         self._now = now
@@ -165,6 +165,11 @@ class ReservationLeaseTracker:
         self._infrastructure_failure_count = 0
         self._infrastructure_warning_emitted = False
         self._terminal_failure_category: str | None = None
+
+    @property
+    def owner_attempt_id(self) -> str:
+        """Return the owner-attempt identity stored in the legacy owner column."""
+        return self._owner_attempt_id
 
     @property
     def state(self) -> ReservationLeaseState:
@@ -221,7 +226,7 @@ class ReservationLeaseTracker:
                 )
             self._bindings[fingerprint_identity_id] = ReservationLeaseBinding(
                 fingerprint_identity_id=fingerprint_identity_id,
-                owner_task_id=self._owner_task_id,
+                owner_attempt_id=self._owner_attempt_id,
                 owner_slot_index=owner_slot_index,
                 expires_at=normalized_expiry,
                 execution_id=execution_id,
@@ -350,7 +355,7 @@ class ReservationLeaseTracker:
                 requests = tuple(
                     ReservationRenewRequest(
                         fingerprint_identity_id=binding.fingerprint_identity_id,
-                        owner_task_id=binding.owner_task_id,
+                        owner_task_id=binding.owner_attempt_id,
                         owner_slot_index=binding.owner_slot_index,
                         expected_execution_id=binding.execution_id,
                     )

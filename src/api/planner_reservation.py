@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 import logging
 import threading
+import uuid
 from collections.abc import Callable, Sequence
 
 from sqlalchemy.orm import Session
@@ -88,7 +89,8 @@ class PlannerReservationBinding:
     fingerprint_type: str
     fingerprint_version: int
     fingerprint_digest: str
-    owner_task_id: str
+    logical_task_id: str
+    owner_attempt_id: str
     owner_slot_index: int
     committed_expires_at: datetime
 
@@ -102,9 +104,15 @@ class PlannerReservationAcquireOutcome:
 @dataclass(frozen=True)
 class PlannerReservationExecutionBinding:
     fingerprint_identity_id: int
-    owner_task_id: str
+    logical_task_id: str
+    owner_attempt_id: str
     owner_slot_index: int
     execution_id: str
+
+
+def new_reservation_owner_attempt_id() -> str:
+    """Return one server-generated Reservation owner identity per attempt."""
+    return str(uuid.uuid4())
 
 
 class PlannerReservationController:
@@ -113,19 +121,42 @@ class PlannerReservationController:
     def __init__(
         self,
         *,
-        owner_task_id: str,
+        logical_task_id: str,
         session_factory: Callable[[], Session],
         configuration: ReservationLeaseConfiguration,
         now: Callable[[], datetime] = _reservation_utcnow,
         tracker: ReservationLeaseTracker | None = None,
         cleanup_join_timeout_seconds: float = 2.0,
     ) -> None:
-        self._owner_task_id = owner_task_id
+        if not logical_task_id:
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_LOGICAL_TASK_ID_REQUIRED"
+            )
+        raw_attempt_id = (
+            tracker.owner_attempt_id
+            if tracker is not None
+            else new_reservation_owner_attempt_id()
+        )
+        try:
+            normalized_attempt_id = str(uuid.UUID(raw_attempt_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_OWNER_ATTEMPT_ID_INVALID"
+            ) from exc
+        if normalized_attempt_id == logical_task_id:
+            raise PlannerReservationError(
+                "PLANNER_RESERVATION_OWNER_ATTEMPT_ID_NOT_DISTINCT"
+            )
+
+        self._logical_task_id = logical_task_id
+        self._reservation_owner_attempt_id = normalized_attempt_id
         self._session_factory = session_factory
         self._configuration = configuration.require_configured()
         self._now = now
         self._tracker = tracker or ReservationLeaseTracker(
-            owner_task_id=owner_task_id,
+            # FingerprintReservation.owner_task_id is the legacy physical
+            # column name; Reservation V2 stores owner-attempt identity here.
+            owner_attempt_id=normalized_attempt_id,
             session_factory=session_factory,
             configuration=configuration,
             now=now,
@@ -137,8 +168,12 @@ class PlannerReservationController:
         self._lock = threading.RLock()
 
     @property
-    def owner_task_id(self) -> str:
-        return self._owner_task_id
+    def logical_task_id(self) -> str:
+        return self._logical_task_id
+
+    @property
+    def reservation_owner_attempt_id(self) -> str:
+        return self._reservation_owner_attempt_id
 
     @property
     def tracker(self) -> ReservationLeaseTracker:
@@ -176,8 +211,13 @@ class PlannerReservationController:
             if (
                 execution_binding.fingerprint_identity_id
                 != binding.fingerprint_identity_id
-                or execution_binding.owner_task_id != self._owner_task_id
-                or execution_binding.owner_task_id != binding.owner_task_id
+                or execution_binding.logical_task_id != self._logical_task_id
+                or execution_binding.logical_task_id != binding.logical_task_id
+                or execution_binding.owner_attempt_id
+                != self._reservation_owner_attempt_id
+                or execution_binding.owner_attempt_id != binding.owner_attempt_id
+                or execution_binding.execution_id
+                == self._reservation_owner_attempt_id
                 or execution_binding.owner_slot_index != slot
                 or execution_binding.owner_slot_index != binding.owner_slot_index
                 or not execution_binding.execution_id
@@ -200,7 +240,7 @@ class PlannerReservationController:
         return tuple(
             ReservationRenewRequest(
                 fingerprint_identity_id=binding.fingerprint_identity_id,
-                owner_task_id=binding.owner_task_id,
+                owner_task_id=binding.owner_attempt_id,
                 owner_slot_index=binding.owner_slot_index,
                 expected_execution_id=binding.execution_id,
             )
@@ -226,7 +266,7 @@ class PlannerReservationController:
             records,
         ):
             if (
-                record.task_id != binding.owner_task_id
+                record.task_id != binding.logical_task_id
                 or record.child_index != binding.owner_slot_index
                 or record.execution_id != binding.execution_id
                 or record.lifecycle_event != "PLANNED"
@@ -250,7 +290,7 @@ class PlannerReservationController:
                 for binding in confirmed_bindings:
                     status = repository.confirm_reservation_detailed(
                         binding.fingerprint_identity_id,
-                        owner_task_id=binding.owner_task_id,
+                        owner_task_id=binding.owner_attempt_id,
                         owner_slot_index=binding.owner_slot_index,
                         execution_id=binding.execution_id,
                         now=current_time,
@@ -358,7 +398,7 @@ class PlannerReservationController:
         with self._session_factory() as session:
             result = FingerprintLedgerRepository(session).acquire_reservation(
                 identity_record,
-                owner_task_id=self._owner_task_id,
+                owner_task_id=self._reservation_owner_attempt_id,
                 owner_slot_index=prospective_slot,
                 now=current_time,
                 expires_at=requested_expiry,
@@ -388,7 +428,8 @@ class PlannerReservationController:
             fingerprint_type=identity_record.fingerprint_type,
             fingerprint_version=identity_record.fingerprint_version,
             fingerprint_digest=identity_record.fingerprint_digest,
-            owner_task_id=self._owner_task_id,
+            logical_task_id=self._logical_task_id,
+            owner_attempt_id=self._reservation_owner_attempt_id,
             owner_slot_index=prospective_slot,
             committed_expires_at=_normalize_reservation_datetime(result.expires_at),
         )
@@ -436,7 +477,7 @@ class PlannerReservationController:
                 for binding in bindings:
                     repository.release_reservation(
                         binding.fingerprint_identity_id,
-                        owner_task_id=binding.owner_task_id,
+                        owner_task_id=binding.owner_attempt_id,
                         owner_slot_index=binding.owner_slot_index,
                     )
                 session.commit()
