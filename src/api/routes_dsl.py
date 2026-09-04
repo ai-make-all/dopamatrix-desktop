@@ -39,8 +39,9 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from itertools import product
 from math import prod
 from typing import Any, Callable, Optional, Sequence
@@ -85,6 +86,11 @@ from .historical_novelty_policy import (
     HistoricalNoveltyPolicyConfiguration,
     HistoricalPolicyMode,
     PreviewIntent,
+)
+from .planner_reservation import (
+    PlannerReservationBinding,
+    PlannerReservationController,
+    PlannerReservationDecision,
 )
 from .schemas import (
     CompilationPlan,
@@ -261,6 +267,7 @@ _MAX_LOGGED_SOURCE_HASH_CHARS = 128
 _PLANNING_REQUEST_SATISFIED = "REQUEST_SATISFIED"
 _PLANNING_TRUE_SPACE_EXHAUSTED = "TRUE_SPACE_EXHAUSTED"
 _PLANNING_SEARCH_LIMIT_REACHED = "PLANNING_SEARCH_LIMIT_REACHED"
+_PLANNING_RESERVATION_CONFLICT_EXHAUSTED = "RESERVATION_CONFLICT_EXHAUSTED"
 _EXACT_MAIN_VISUAL_SEARCH_BUDGET = 4096
 
 _COVERAGE_DIAGNOSTICS_TYPE = "balanced_axis_coverage"
@@ -371,6 +378,7 @@ class _VariantPlanningResult:
     warning_codes: tuple[str, ...]
     coverage_diagnostics: Optional[_CoverageDiagnosticsV1] = None
     historical_novelty_diagnostics: Optional[_HistoricalNoveltyDiagnosticsV1] = None
+    reservation_bindings: tuple[PlannerReservationBinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -388,6 +396,11 @@ class _MainVisualPlanningFingerprintContract:
     fingerprint_digest: str
     components: _MainVisualFingerprint
     canonical_bytes: bytes
+
+
+class _HistoricalObservationOutcome(str, Enum):
+    KNOWN = "KNOWN"
+    UNKNOWN = "UNKNOWN"
 
 
 def _exact_main_visual_fingerprint(
@@ -474,6 +487,21 @@ def _main_visual_planning_fingerprint_contract(
     )
 
 
+def _main_visual_fingerprint_identity_record(
+    fingerprint: _MainVisualFingerprint,
+) -> FingerprintIdentityRecord:
+    """Adapt the one authoritative FP-001 contract to Ledger identity input."""
+    contract = _main_visual_planning_fingerprint_contract(fingerprint)
+    return FingerprintIdentityRecord(
+        fingerprint_type=contract.fingerprint_type,
+        fingerprint_version=contract.fingerprint_version,
+        fingerprint_digest=contract.fingerprint_digest,
+        digest_algorithm=LEDGER_DIGEST_ALGORITHM,
+        source_hash_algorithm=contract.source_hash_algorithm,
+        canonical_payload=contract.canonical_bytes.decode("utf-8"),
+    )
+
+
 _HistoricalExactLookup = Callable[
     [FingerprintIdentityRecord],
     HistoricalExactLookupResult,
@@ -518,6 +546,7 @@ class _HistoricalNoveltyObserver:
         self.planned_and_failed_matches = 0
         self.no_history_matches = 0
         self.advisory_count = 0
+        self.reservation_conflict_count = 0
         self.accepted_after_historical_check_count = 0
         self.accepted_with_lookup_unknown_count = 0
         self.preview_checked = False
@@ -529,8 +558,8 @@ class _HistoricalNoveltyObserver:
         *,
         is_preview: bool = False,
         preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
-    ) -> None:
-        """Record factual history for one candidate that remains accepted."""
+    ) -> _HistoricalObservationOutcome:
+        """Record candidate facts, deferring acceptance counters to the planner."""
         if not isinstance(preview_intent, PreviewIntent):
             raise ValueError("HISTORICAL_NOVELTY_PREVIEW_INTENT_INVALID")
         self.candidate_checks += 1
@@ -538,22 +567,13 @@ class _HistoricalNoveltyObserver:
             self.preview_checked = True
             self.preview_intent = preview_intent
 
-        contract = _main_visual_planning_fingerprint_contract(fingerprint)
-        identity_record = FingerprintIdentityRecord(
-            fingerprint_type=contract.fingerprint_type,
-            fingerprint_version=contract.fingerprint_version,
-            fingerprint_digest=contract.fingerprint_digest,
-            digest_algorithm=LEDGER_DIGEST_ALGORITHM,
-            source_hash_algorithm=contract.source_hash_algorithm,
-            canonical_payload=contract.canonical_bytes.decode("utf-8"),
-        )
+        identity_record = _main_visual_fingerprint_identity_record(fingerprint)
         try:
             facts = self._lookup_historical_exact(identity_record)
         except FingerprintLedgerError:
             raise
         except _HISTORICAL_LOOKUP_INFRASTRUCTURE_ERRORS as exc:
             self.lookup_failures += 1
-            self.accepted_with_lookup_unknown_count += 1
             if not self._warning_emitted:
                 self._warning_emitted = True
                 try:
@@ -565,11 +585,10 @@ class _HistoricalNoveltyObserver:
                     )
                 except Exception:
                     pass
-            return
+            return _HistoricalObservationOutcome.UNKNOWN
 
         decision = self._policy.evaluate(facts, self._configuration)
         self.lookup_successes += 1
-        self.accepted_after_historical_check_count += 1
         if facts.identity_exists:
             self.identity_matches += 1
         if facts.historical_match:
@@ -590,6 +609,18 @@ class _HistoricalNoveltyObserver:
             self.no_history_matches += 1
         if decision.action is HistoricalDecisionAction.ALLOW_ADVISORY:
             self.advisory_count += 1
+        return _HistoricalObservationOutcome.KNOWN
+
+    def mark_accepted(self, outcome: _HistoricalObservationOutcome) -> None:
+        if outcome is _HistoricalObservationOutcome.KNOWN:
+            self.accepted_after_historical_check_count += 1
+        elif outcome is _HistoricalObservationOutcome.UNKNOWN:
+            self.accepted_with_lookup_unknown_count += 1
+        else:
+            raise ValueError("HISTORICAL_NOVELTY_OBSERVATION_OUTCOME_INVALID")
+
+    def mark_reservation_conflict(self) -> None:
+        self.reservation_conflict_count += 1
 
     def diagnostics(self) -> _HistoricalNoveltyDiagnosticsV1:
         return _HistoricalNoveltyDiagnosticsV1(
@@ -618,7 +649,7 @@ class _HistoricalNoveltyObserver:
             reuse_intent_count=0,
             actual_override_count=0,
             historical_rejection_count=0,
-            reservation_conflict_count=0,
+            reservation_conflict_count=self.reservation_conflict_count,
             accepted_after_historical_check_count=(
                 self.accepted_after_historical_check_count
             ),
@@ -711,14 +742,17 @@ def _historical_novelty_diagnostics_v1_payload(
         != diagnostics.historical_occurrence_matches
         + diagnostics.identity_only_matches
         or diagnostics.accepted_after_historical_check_count
-        != diagnostics.lookup_successes
+        > diagnostics.lookup_successes
         or diagnostics.accepted_with_lookup_unknown_count
-        != diagnostics.lookup_failures
+        > diagnostics.lookup_failures
+        or diagnostics.candidate_checks
+        != diagnostics.accepted_after_historical_check_count
+        + diagnostics.accepted_with_lookup_unknown_count
+        + diagnostics.reservation_conflict_count
         or diagnostics.advisory_count > diagnostics.rendered_matches
         or diagnostics.reuse_intent_count != 0
         or diagnostics.actual_override_count != 0
         or diagnostics.historical_rejection_count != 0
-        or diagnostics.reservation_conflict_count != 0
     ):
         raise ValueError("HISTORICAL_NOVELTY_DIAGNOSTICS_COUNTER_MISMATCH")
     if diagnostics.preview_checked:
@@ -775,7 +809,8 @@ def _validated_historical_novelty_diagnostics_payload(
     payload = _historical_novelty_diagnostics_v1_payload(diagnostics)
     if (
         diagnostics.historical_policy_mode != historical_policy_mode
-        or diagnostics.candidate_checks != len(planning_result.plans)
+        or diagnostics.candidate_checks
+        != len(planning_result.plans) + diagnostics.reservation_conflict_count
         or diagnostics.accepted_after_historical_check_count
         + diagnostics.accepted_with_lookup_unknown_count
         != len(planning_result.plans)
@@ -949,6 +984,9 @@ def _build_coverage_diagnostics_v1(
     materialization_mismatch_count: int,
     invalid_plan_count: int,
     duplicate_fingerprint_reject_count: int,
+    reservation_conflict_count: int = 0,
+    preview_examined: Optional[bool] = None,
+    preview_reservation_conflicted: bool = False,
 ) -> _CoverageDiagnosticsV1:
     """Freeze authoritative completed balanced-planner coverage as V1 diagnostics."""
     beat_count = len(dsl_payload.timeline)
@@ -965,6 +1003,7 @@ def _build_coverage_diagnostics_v1(
             materialization_mismatch_count,
             invalid_plan_count,
             duplicate_fingerprint_reject_count,
+            reservation_conflict_count,
         )
     ):
         raise ValueError("COVERAGE_DIAGNOSTICS_NEGATIVE_COUNTER")
@@ -979,16 +1018,27 @@ def _build_coverage_diagnostics_v1(
 
     accepted_count = len(accepted_fingerprints)
     preview_count = 1 if preview_seeded else 0
+    preview_examined_count = (
+        preview_count if preview_examined is None else int(preview_examined)
+    )
     if preview_count > accepted_count:
         raise ValueError("COVERAGE_DIAGNOSTICS_PREVIEW_STATE_INVALID")
-    if examined_count != proposal_attempted_count + preview_count:
+    if preview_reservation_conflicted and (
+        not preview_examined_count or preview_seeded or reservation_conflict_count < 1
+    ):
+        raise ValueError("COVERAGE_DIAGNOSTICS_PREVIEW_STATE_INVALID")
+    if examined_count != proposal_attempted_count + preview_examined_count:
         raise ValueError("COVERAGE_DIAGNOSTICS_EXAMINED_PARTITION_INVALID")
     non_preview_accepted_count = accepted_count - preview_count
+    normal_reservation_conflict_count = (
+        reservation_conflict_count - int(preview_reservation_conflicted)
+    )
     if proposal_attempted_count != (
         non_preview_accepted_count
         + materialization_mismatch_count
         + invalid_plan_count
         + duplicate_fingerprint_reject_count
+        + normal_reservation_conflict_count
     ):
         raise ValueError("COVERAGE_DIAGNOSTICS_PROPOSAL_PARTITION_INVALID")
 
@@ -1421,7 +1471,73 @@ def _preview_selection(
     return tuple(selections)
 
 
-def _plan_exact_main_visual_variants(
+def _acquire_planner_candidate_reservation(
+    reservation_controller: Optional[PlannerReservationController],
+    fingerprint: _MainVisualFingerprint,
+    *,
+    prospective_slot: int,
+) -> bool:
+    if reservation_controller is None:
+        return True
+    outcome = reservation_controller.acquire_candidate(
+        _main_visual_fingerprint_identity_record(fingerprint),
+        prospective_slot=prospective_slot,
+    )
+    if outcome.decision is PlannerReservationDecision.CONFLICT:
+        return False
+    if outcome.decision is not PlannerReservationDecision.OWNED:
+        raise ValueError("PLANNER_RESERVATION_DECISION_INVALID")
+    reservation_controller.require_active()
+    return True
+
+
+def _planning_termination(
+    *,
+    accepted_count: int,
+    requested_count: int,
+    examined_count: int,
+    candidate_space_size: int,
+    unresolved_unique_reservation_blocked_count: int,
+) -> tuple[str, list[str]]:
+    if accepted_count >= requested_count:
+        return _PLANNING_REQUEST_SATISFIED, []
+    if examined_count >= candidate_space_size:
+        if (
+            unresolved_unique_reservation_blocked_count > 0
+            and accepted_count + unresolved_unique_reservation_blocked_count
+            >= requested_count
+        ):
+            return (
+                _PLANNING_RESERVATION_CONFLICT_EXHAUSTED,
+                [_PLANNING_RESERVATION_CONFLICT_EXHAUSTED],
+            )
+        return _PLANNING_TRUE_SPACE_EXHAUSTED, ["INSUFFICIENT_UNIQUE_CAPACITY"]
+    return _PLANNING_SEARCH_LIMIT_REACHED, [_PLANNING_SEARCH_LIMIT_REACHED]
+
+
+def _attach_planner_reservation_bindings(
+    result: _VariantPlanningResult,
+    reservation_controller: Optional[PlannerReservationController],
+) -> _VariantPlanningResult:
+    if reservation_controller is None:
+        return result
+    bindings = reservation_controller.bindings
+    if len(bindings) != len(result.plans):
+        raise ValueError("PLANNER_RESERVATION_BINDING_COUNT_MISMATCH")
+    for slot, (binding, fingerprint) in enumerate(zip(bindings, result.fingerprints)):
+        contract = _main_visual_planning_fingerprint_contract(fingerprint)
+        if (
+            binding.owner_task_id != reservation_controller.owner_task_id
+            or binding.owner_slot_index != slot
+            or binding.fingerprint_type != contract.fingerprint_type
+            or binding.fingerprint_version != contract.fingerprint_version
+            or binding.fingerprint_digest != contract.fingerprint_digest
+        ):
+            raise ValueError("PLANNER_RESERVATION_BINDING_ALIGNMENT_MISMATCH")
+    return replace(result, reservation_bindings=bindings)
+
+
+def _plan_exact_main_visual_variants_impl(
     parser: DSLParserNode,
     dsl_payload: StoryDSLPayload,
     requested_count: int,
@@ -1430,6 +1546,7 @@ def _plan_exact_main_visual_variants(
     search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
     historical_observer: Optional[_HistoricalNoveltyObserver] = None,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
 ) -> _VariantPlanningResult:
     """Lazily enumerate finite resolver-valid main-X combinations."""
     if requested_count < 1:
@@ -1451,6 +1568,7 @@ def _plan_exact_main_visual_variants(
     accepted_plans: list[CompilationPlan] = []
     accepted_fingerprints: list[_MainVisualFingerprint] = []
     used_fingerprints: set[_MainVisualFingerprint] = set()
+    reservation_conflicted_fingerprints: set[_MainVisualFingerprint] = set()
     examined_keys: set[tuple[tuple[int, str], ...]] = set()
     selection_mismatch_seen = False
 
@@ -1463,15 +1581,28 @@ def _plan_exact_main_visual_variants(
         preview_key = _selection_key(preview_selections)
         preview_fingerprint = _exact_main_visual_fingerprint(preview_plan)
         examined_keys.add(preview_key)
+        historical_outcome = None
         if historical_observer is not None:
-            historical_observer.observe(
+            historical_outcome = historical_observer.observe(
                 preview_fingerprint,
                 is_preview=True,
                 preview_intent=preview_intent,
             )
-        accepted_plans.append(preview_plan)
-        accepted_fingerprints.append(preview_fingerprint)
-        used_fingerprints.add(preview_fingerprint)
+        if _acquire_planner_candidate_reservation(
+            reservation_controller,
+            preview_fingerprint,
+            prospective_slot=len(accepted_plans),
+        ):
+            accepted_plans.append(preview_plan)
+            accepted_fingerprints.append(preview_fingerprint)
+            used_fingerprints.add(preview_fingerprint)
+            reservation_conflicted_fingerprints.discard(preview_fingerprint)
+            if historical_observer is not None:
+                historical_observer.mark_accepted(historical_outcome)
+        else:
+            reservation_conflicted_fingerprints.add(preview_fingerprint)
+            if historical_observer is not None:
+                historical_observer.mark_reservation_conflict()
 
     if len(accepted_plans) < requested_count and candidate_space_size:
         for combination in product(*candidate_pools):
@@ -1508,23 +1639,36 @@ def _plan_exact_main_visual_variants(
 
             if fingerprint in used_fingerprints:
                 continue
+            historical_outcome = None
             if historical_observer is not None:
-                historical_observer.observe(fingerprint)
+                historical_outcome = historical_observer.observe(fingerprint)
+            if not _acquire_planner_candidate_reservation(
+                reservation_controller,
+                fingerprint,
+                prospective_slot=len(accepted_plans),
+            ):
+                reservation_conflicted_fingerprints.add(fingerprint)
+                if historical_observer is not None:
+                    historical_observer.mark_reservation_conflict()
+                continue
             accepted_plans.append(materialized)
             accepted_fingerprints.append(fingerprint)
             used_fingerprints.add(fingerprint)
+            reservation_conflicted_fingerprints.discard(fingerprint)
+            if historical_observer is not None:
+                historical_observer.mark_accepted(historical_outcome)
             if len(accepted_plans) >= requested_count:
                 break
 
-    if len(accepted_plans) >= requested_count:
-        termination_reason = _PLANNING_REQUEST_SATISFIED
-        warning_codes: list[str] = []
-    elif len(examined_keys) >= candidate_space_size:
-        termination_reason = _PLANNING_TRUE_SPACE_EXHAUSTED
-        warning_codes = ["INSUFFICIENT_UNIQUE_CAPACITY"]
-    else:
-        termination_reason = _PLANNING_SEARCH_LIMIT_REACHED
-        warning_codes = ["PLANNING_SEARCH_LIMIT_REACHED"]
+    termination_reason, warning_codes = _planning_termination(
+        accepted_count=len(accepted_plans),
+        requested_count=requested_count,
+        examined_count=len(examined_keys),
+        candidate_space_size=candidate_space_size,
+        unresolved_unique_reservation_blocked_count=len(
+            reservation_conflicted_fingerprints
+        ),
+    )
     if selection_mismatch_seen:
         warning_codes.append("PLANNER_SELECTION_MISMATCH")
 
@@ -1541,6 +1685,38 @@ def _plan_exact_main_visual_variants(
             else None
         ),
     )
+
+
+def _plan_exact_main_visual_variants(
+    parser: DSLParserNode,
+    dsl_payload: StoryDSLPayload,
+    requested_count: int,
+    *,
+    preview_plan: Optional[CompilationPlan] = None,
+    search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
+    historical_observer: Optional[_HistoricalNoveltyObserver] = None,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
+) -> _VariantPlanningResult:
+    try:
+        result = _plan_exact_main_visual_variants_impl(
+            parser,
+            dsl_payload,
+            requested_count,
+            preview_plan=preview_plan,
+            search_budget=search_budget,
+            historical_observer=historical_observer,
+            preview_intent=preview_intent,
+            reservation_controller=reservation_controller,
+        )
+        return _attach_planner_reservation_bindings(
+            result,
+            reservation_controller,
+        )
+    except Exception:
+        if reservation_controller is not None:
+            reservation_controller.abort()
+        raise
 
 
 @dataclass(frozen=True)
@@ -1716,7 +1892,7 @@ def _update_main_visual_coverage(
         coverage[beat_index][normalized_file_hash] += 1
 
 
-def _plan_exact_main_visual_balanced_variants(
+def _plan_exact_main_visual_balanced_variants_impl(
     parser: DSLParserNode,
     dsl_payload: StoryDSLPayload,
     requested_count: int,
@@ -1725,6 +1901,7 @@ def _plan_exact_main_visual_balanced_variants(
     search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
     historical_observer: Optional[_HistoricalNoveltyObserver] = None,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
 ) -> _VariantPlanningResult:
     """Select exact unique plans through a bounded greedy coverage window."""
     if requested_count < 1:
@@ -1746,10 +1923,12 @@ def _plan_exact_main_visual_balanced_variants(
     accepted_plans: list[CompilationPlan] = []
     accepted_fingerprints: list[_MainVisualFingerprint] = []
     used_fingerprints: set[_MainVisualFingerprint] = set()
+    reservation_conflicted_fingerprints: set[_MainVisualFingerprint] = set()
     examined_keys: set[tuple[tuple[int, str], ...]] = set()
     selection_mismatch_seen = False
     coverage = _initial_main_visual_coverage(candidate_pools)
     preview_seeded = False
+    preview_reservation_conflicted = False
     proposal_attempted_count = 0
     materialization_mismatch_count = 0
     invalid_plan_count = 0
@@ -1764,17 +1943,31 @@ def _plan_exact_main_visual_balanced_variants(
         preview_key = _selection_key(preview_selections)
         preview_fingerprint = _exact_main_visual_fingerprint(preview_plan)
         examined_keys.add(preview_key)
+        historical_outcome = None
         if historical_observer is not None:
-            historical_observer.observe(
+            historical_outcome = historical_observer.observe(
                 preview_fingerprint,
                 is_preview=True,
                 preview_intent=preview_intent,
             )
-        accepted_plans.append(preview_plan)
-        accepted_fingerprints.append(preview_fingerprint)
-        used_fingerprints.add(preview_fingerprint)
-        _update_main_visual_coverage(coverage, preview_fingerprint)
-        preview_seeded = True
+        if _acquire_planner_candidate_reservation(
+            reservation_controller,
+            preview_fingerprint,
+            prospective_slot=len(accepted_plans),
+        ):
+            accepted_plans.append(preview_plan)
+            accepted_fingerprints.append(preview_fingerprint)
+            used_fingerprints.add(preview_fingerprint)
+            reservation_conflicted_fingerprints.discard(preview_fingerprint)
+            _update_main_visual_coverage(coverage, preview_fingerprint)
+            preview_seeded = True
+            if historical_observer is not None:
+                historical_observer.mark_accepted(historical_outcome)
+        else:
+            reservation_conflicted_fingerprints.add(preview_fingerprint)
+            preview_reservation_conflicted = True
+            if historical_observer is not None:
+                historical_observer.mark_reservation_conflict()
 
     window = _balanced_candidate_window(
         candidate_pools,
@@ -1836,27 +2029,40 @@ def _plan_exact_main_visual_balanced_variants(
             if fingerprint in used_fingerprints:
                 duplicate_fingerprint_reject_count += 1
                 continue
+            historical_outcome = None
             if historical_observer is not None:
-                historical_observer.observe(fingerprint)
+                historical_outcome = historical_observer.observe(fingerprint)
+            if not _acquire_planner_candidate_reservation(
+                reservation_controller,
+                fingerprint,
+                prospective_slot=len(accepted_plans),
+            ):
+                reservation_conflicted_fingerprints.add(fingerprint)
+                if historical_observer is not None:
+                    historical_observer.mark_reservation_conflict()
+                continue
             accepted_plans.append(materialized)
             accepted_fingerprints.append(fingerprint)
             used_fingerprints.add(fingerprint)
+            reservation_conflicted_fingerprints.discard(fingerprint)
             _update_main_visual_coverage(coverage, fingerprint)
+            if historical_observer is not None:
+                historical_observer.mark_accepted(historical_outcome)
             accepted_this_round = True
             break
 
         if not accepted_this_round:
             break
 
-    if len(accepted_plans) >= requested_count:
-        termination_reason = _PLANNING_REQUEST_SATISFIED
-        warning_codes: list[str] = []
-    elif len(examined_keys) >= candidate_space_size:
-        termination_reason = _PLANNING_TRUE_SPACE_EXHAUSTED
-        warning_codes = ["INSUFFICIENT_UNIQUE_CAPACITY"]
-    else:
-        termination_reason = _PLANNING_SEARCH_LIMIT_REACHED
-        warning_codes = ["PLANNING_SEARCH_LIMIT_REACHED"]
+    termination_reason, warning_codes = _planning_termination(
+        accepted_count=len(accepted_plans),
+        requested_count=requested_count,
+        examined_count=len(examined_keys),
+        candidate_space_size=candidate_space_size,
+        unresolved_unique_reservation_blocked_count=len(
+            reservation_conflicted_fingerprints
+        ),
+    )
     if selection_mismatch_seen:
         warning_codes.append("PLANNER_SELECTION_MISMATCH")
 
@@ -1875,6 +2081,13 @@ def _plan_exact_main_visual_balanced_variants(
         materialization_mismatch_count=materialization_mismatch_count,
         invalid_plan_count=invalid_plan_count,
         duplicate_fingerprint_reject_count=duplicate_fingerprint_reject_count,
+        reservation_conflict_count=(
+            reservation_controller.conflict_count
+            if reservation_controller is not None
+            else 0
+        ),
+        preview_examined=(preview_selections is not None and bool(candidate_space_size)),
+        preview_reservation_conflicted=preview_reservation_conflicted,
     )
 
     return _VariantPlanningResult(
@@ -1893,6 +2106,38 @@ def _plan_exact_main_visual_balanced_variants(
     )
 
 
+def _plan_exact_main_visual_balanced_variants(
+    parser: DSLParserNode,
+    dsl_payload: StoryDSLPayload,
+    requested_count: int,
+    *,
+    preview_plan: Optional[CompilationPlan] = None,
+    search_budget: int = _EXACT_MAIN_VISUAL_SEARCH_BUDGET,
+    historical_observer: Optional[_HistoricalNoveltyObserver] = None,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
+) -> _VariantPlanningResult:
+    try:
+        result = _plan_exact_main_visual_balanced_variants_impl(
+            parser,
+            dsl_payload,
+            requested_count,
+            preview_plan=preview_plan,
+            search_budget=search_budget,
+            historical_observer=historical_observer,
+            preview_intent=preview_intent,
+            reservation_controller=reservation_controller,
+        )
+        return _attach_planner_reservation_bindings(
+            result,
+            reservation_controller,
+        )
+    except Exception:
+        if reservation_controller is not None:
+            reservation_controller.abort()
+        raise
+
+
 def _plan_exact_main_visual_variants_from_db(
     tenant_id: str,
     dsl_payload: StoryDSLPayload,
@@ -1901,6 +2146,7 @@ def _plan_exact_main_visual_variants_from_db(
     preview_plan: Optional[CompilationPlan] = None,
     historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
 ) -> _VariantPlanningResult:
     """Run discovery and materialization inside one tenant DB session."""
     tenant_engine = get_tenant_engine(tenant_id)
@@ -1914,7 +2160,7 @@ def _plan_exact_main_visual_variants_from_db(
             SessionLocal,
             historical_novelty_mode,
         )
-        if historical_observer is None:
+        if historical_observer is None and reservation_controller is None:
             return _plan_exact_main_visual_variants(
                 DSLParserNode(db),
                 dsl_payload,
@@ -1928,6 +2174,7 @@ def _plan_exact_main_visual_variants_from_db(
             preview_plan=preview_plan,
             historical_observer=historical_observer,
             preview_intent=preview_intent,
+            reservation_controller=reservation_controller,
         )
 
 
@@ -1939,6 +2186,7 @@ def _plan_exact_main_visual_balanced_variants_from_db(
     preview_plan: Optional[CompilationPlan] = None,
     historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
 ) -> _VariantPlanningResult:
     """Run balanced discovery and materialization inside one tenant DB session."""
     tenant_engine = get_tenant_engine(tenant_id)
@@ -1952,7 +2200,7 @@ def _plan_exact_main_visual_balanced_variants_from_db(
             SessionLocal,
             historical_novelty_mode,
         )
-        if historical_observer is None:
+        if historical_observer is None and reservation_controller is None:
             return _plan_exact_main_visual_balanced_variants(
                 DSLParserNode(db),
                 dsl_payload,
@@ -1966,6 +2214,7 @@ def _plan_exact_main_visual_balanced_variants_from_db(
             preview_plan=preview_plan,
             historical_observer=historical_observer,
             preview_intent=preview_intent,
+            reservation_controller=reservation_controller,
         )
 
 
