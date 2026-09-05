@@ -86,6 +86,8 @@ def submit_task(
         db.get_bind(),
         prompt=payload.prompt,
         batch_size=payload.batch_size,
+        reservation_conflict_mode="OFF",
+        planning_policy="legacy",
     )
 
     try:

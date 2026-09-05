@@ -30,6 +30,15 @@ class TaskIdentitySchemaError(RuntimeError):
     """The operational task table cannot satisfy the clean task-ID contract."""
 
 
+VIDEO_TASK_ROLLOUT_METADATA_SCHEMA_INVALID = (
+    "VIDEO_TASK_ROLLOUT_METADATA_SCHEMA_INVALID"
+)
+
+
+class TaskRolloutMetadataSchemaError(RuntimeError):
+    """The task table cannot supply the authoritative rollout denominator."""
+
+
 # ------------------------------------------------------------------ #
 # 全局 SQLite WAL 模式拦截器                                            #
 # 绑定在 Engine 类级别，所有动态创建的租户 Engine 均自动继承此配置。       #
@@ -196,14 +205,106 @@ def verify_video_task_identity_schema(engine) -> None:
         raise TaskIdentitySchemaError(VIDEO_TASK_TASK_ID_SCHEMA_RESET_REQUIRED)
 
 
+def ensure_video_task_rollout_metadata_schema(engine) -> None:
+    """Add and verify immutable task-submission metadata without rebuilding."""
+    inspector = sa_inspect(engine)
+    if "video_tasks" not in inspector.get_table_names():
+        raise TaskRolloutMetadataSchemaError(
+            VIDEO_TASK_ROLLOUT_METADATA_SCHEMA_INVALID
+        )
+
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("video_tasks")
+    }
+    additions = {
+        "reservation_conflict_mode": (
+            "TEXT NOT NULL DEFAULT 'OFF' "
+            "CHECK (reservation_conflict_mode IN ('OFF', 'ENFORCE'))"
+        ),
+        "planning_policy": (
+            "TEXT NOT NULL DEFAULT 'legacy' "
+            "CHECK (planning_policy IN ("
+            "'legacy', 'exact_main_visual', 'exact_main_visual_balanced'"
+            "))"
+        ),
+    }
+    with engine.begin() as conn:
+        for name, definition in additions.items():
+            if name not in columns:
+                conn.execute(
+                    text(
+                        f'ALTER TABLE "video_tasks" '
+                        f'ADD COLUMN "{name}" {definition}'
+                    )
+                )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_video_tasks_rollout_readiness "
+                "ON video_tasks "
+                "(reservation_conflict_mode, planning_policy, created_at)"
+            )
+        )
+
+    inspector = sa_inspect(engine)
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("video_tasks")
+    }
+    for name in additions:
+        column = columns.get(name)
+        if (
+            column is None
+            or column.get("nullable", True)
+            or not isinstance(column["type"], String)
+        ):
+            raise TaskRolloutMetadataSchemaError(
+                VIDEO_TASK_ROLLOUT_METADATA_SCHEMA_INVALID
+            )
+
+    indexes = {
+        tuple(index.get("column_names") or ())
+        for index in inspector.get_indexes("video_tasks")
+    }
+    if (
+        "reservation_conflict_mode",
+        "planning_policy",
+        "created_at",
+    ) not in indexes:
+        raise TaskRolloutMetadataSchemaError(
+            VIDEO_TASK_ROLLOUT_METADATA_SCHEMA_INVALID
+        )
+
+    with engine.connect() as conn:
+        invalid = conn.execute(
+            text(
+                "SELECT 1 FROM video_tasks "
+                "WHERE reservation_conflict_mode IS NULL "
+                "OR reservation_conflict_mode NOT IN ('OFF', 'ENFORCE') "
+                "OR planning_policy IS NULL "
+                "OR planning_policy NOT IN ("
+                "'legacy', 'exact_main_visual', "
+                "'exact_main_visual_balanced'"
+                ") LIMIT 1"
+            )
+        ).first()
+    if invalid is not None:
+        raise TaskRolloutMetadataSchemaError(
+            VIDEO_TASK_ROLLOUT_METADATA_SCHEMA_INVALID
+        )
+
+
 def initialize_application_schema(engine) -> None:
     """Create/evolve tables only after ruling out ambiguous task-ID storage."""
     verify_video_task_identity_schema(engine)
     from .models import Base as ModelBase
 
     ModelBase.metadata.create_all(bind=engine)
+    ensure_video_task_rollout_metadata_schema(engine)
     evolve_schema(engine)
     verify_video_task_identity_schema(engine)
+    ensure_video_task_rollout_metadata_schema(engine)
 
 
 # ------------------------------------------------------------------ #

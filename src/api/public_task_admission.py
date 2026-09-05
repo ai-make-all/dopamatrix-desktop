@@ -21,6 +21,11 @@ from .task_identity import PUBLIC_TASK_ID_GENERATION_COLLISION, new_task_id
 
 
 PUBLIC_TASK_ADMISSION_STATE_INVALID = "PUBLIC_TASK_ADMISSION_STATE_INVALID"
+PUBLIC_TASK_ROLLOUT_METADATA_INVALID = "PUBLIC_TASK_ROLLOUT_METADATA_INVALID"
+PUBLIC_TASK_RESERVATION_CONFLICT_MODES = frozenset({"OFF", "ENFORCE"})
+PUBLIC_TASK_PLANNING_POLICIES = frozenset(
+    {"legacy", "exact_main_visual", "exact_main_visual_balanced"}
+)
 _SERVER_ID_CLAIM_ATTEMPTS = 4
 
 
@@ -58,12 +63,30 @@ def _is_video_task_id_unique_violation(exc: IntegrityError) -> bool:
     )
 
 
+def _validate_rollout_metadata(
+    reservation_conflict_mode: str,
+    planning_policy: str,
+) -> None:
+    """Reject metadata that cannot describe a validated public submission."""
+    if (
+        reservation_conflict_mode not in PUBLIC_TASK_RESERVATION_CONFLICT_MODES
+        or planning_policy not in PUBLIC_TASK_PLANNING_POLICIES
+        or (
+            reservation_conflict_mode == "ENFORCE"
+            and planning_policy == "legacy"
+        )
+    ):
+        raise PublicTaskAdmissionError(PUBLIC_TASK_ROLLOUT_METADATA_INVALID)
+
+
 def _claim_one(
     bind: Engine,
     *,
     task_id: str,
     prompt: str,
     batch_size: int,
+    reservation_conflict_mode: str,
+    planning_policy: str,
 ) -> int:
     SessionLocal = _session_factory(bind)
     with SessionLocal() as session:
@@ -72,6 +95,8 @@ def _claim_one(
             prompt=prompt,
             batch_size=batch_size,
             status="queued",
+            reservation_conflict_mode=reservation_conflict_mode,
+            planning_policy=planning_policy,
         )
         session.add(task)
         try:
@@ -89,9 +114,12 @@ def admit_public_task(
     *,
     prompt: str | None,
     batch_size: int,
+    reservation_conflict_mode: str = "OFF",
+    planning_policy: str = "legacy",
     task_id_factory: Callable[[], str] | None = None,
 ) -> PublicTaskAdmission:
     """Generate and durably admit one public task before worker dispatch."""
+    _validate_rollout_metadata(reservation_conflict_mode, planning_policy)
     generator = task_id_factory or new_task_id
     for _ in range(_SERVER_ID_CLAIM_ATTEMPTS):
         task_id = generator()
@@ -100,6 +128,8 @@ def admit_public_task(
             task_id=task_id,
             prompt=prompt or "",
             batch_size=batch_size,
+            reservation_conflict_mode=reservation_conflict_mode,
+            planning_policy=planning_policy,
         )
         if video_task_id:
             return PublicTaskAdmission(

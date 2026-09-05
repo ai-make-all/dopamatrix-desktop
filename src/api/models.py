@@ -11,7 +11,7 @@ SQLAlchemy ORM 数据表定义。
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, ForeignKey, Text, Boolean, JSON,
-    Enum as SAEnum, UniqueConstraint,
+    CheckConstraint, Enum as SAEnum, Index, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -34,6 +34,24 @@ class VideoTask(Base):
     - status     : queued → processing → completed | failed
     """
     __tablename__ = "video_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "reservation_conflict_mode IN ('OFF', 'ENFORCE')",
+            name="ck_video_tasks_reservation_conflict_mode",
+        ),
+        CheckConstraint(
+            "planning_policy IN ("
+            "'legacy', 'exact_main_visual', 'exact_main_visual_balanced'"
+            ")",
+            name="ck_video_tasks_planning_policy",
+        ),
+        Index(
+            "ix_video_tasks_rollout_readiness",
+            "reservation_conflict_mode",
+            "planning_policy",
+            "created_at",
+        ),
+    )
 
     id              = Column(Integer, primary_key=True, index=True, autoincrement=True)
     task_id         = Column(String(64), unique=True, nullable=False, index=True)
@@ -41,6 +59,18 @@ class VideoTask(Base):
     batch_size      = Column(Integer, nullable=False, default=1) # 矩阵数量
     status          = Column(String(20), nullable=False, default="queued")
                                                                  # queued/processing/completed/failed
+    reservation_conflict_mode = Column(
+        String(16),
+        nullable=False,
+        default="OFF",
+        server_default="OFF",
+    )
+    planning_policy = Column(
+        String(64),
+        nullable=False,
+        default="legacy",
+        server_default="legacy",
+    )
     created_at      = Column(DateTime(timezone=True), nullable=False, default=_now)
     finished_at     = Column(DateTime(timezone=True), nullable=True)
 

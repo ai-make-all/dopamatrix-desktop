@@ -216,6 +216,8 @@ def _admit_dsl_public_task(db: Session, payload: RenderDSLRequest) -> str:
         db.get_bind(),
         prompt=payload.prompt,
         batch_size=payload.batch_size,
+        reservation_conflict_mode=payload.reservation_conflict_mode,
+        planning_policy=payload.variant_planning_policy,
     )
     return admission.task_id
 
