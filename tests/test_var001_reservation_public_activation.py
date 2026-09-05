@@ -283,14 +283,18 @@ class ReservationOwnerAttemptAndPublicGateTests(unittest.TestCase):
 
     def test_public_schema_cannot_control_reservation_authority(self):
         forbidden = {
-            "reservation_conflict_mode",
             "reservation_owner_attempt_id",
             "owner_attempt_id",
+            "owner_task_id",
             "reservation_lease_ttl_seconds",
             "reservation_heartbeat_interval_seconds",
             "execution_id",
         }
         self.assertTrue(forbidden.isdisjoint(RenderDSLRequest.model_fields))
+        self.assertEqual(
+            RenderDSLRequest.model_fields["reservation_conflict_mode"].default,
+            "OFF",
+        )
         self.assertIsNone(
             routes_dsl.render_batch_worker.__kwdefaults__["reservation_controller"]
         )

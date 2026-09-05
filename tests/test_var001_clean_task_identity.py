@@ -530,7 +530,7 @@ class CleanServerTaskIdentityTests(unittest.TestCase):
             self.assertEqual(a.query(VideoTask).count(), 1)
             self.assertEqual(b.query(VideoTask).count(), 1)
 
-    def test_public_runtime_does_not_construct_reservation_controller(self):
+    def test_public_routes_expose_policy_but_do_not_construct_controller(self):
         route_source = inspect.getsource(routes.submit_task)
         dsl_sources = "".join(
             inspect.getsource(endpoint)
@@ -541,7 +541,10 @@ class CleanServerTaskIdentityTests(unittest.TestCase):
             )
         )
         self.assertNotIn("PlannerReservationController(", route_source + dsl_sources)
-        self.assertNotIn("reservation_conflict_mode", RenderDSLRequest.model_fields)
+        self.assertEqual(
+            RenderDSLRequest.model_fields["reservation_conflict_mode"].default,
+            "OFF",
+        )
 
 
 if __name__ == "__main__":

@@ -96,6 +96,10 @@ from .planner_reservation import (
     PlannerReservationError,
     PlannerReservationExecutionBinding,
 )
+from .reservation_lease import (
+    ReservationLeaseConfigurationError,
+    load_reservation_lease_configuration,
+)
 from .public_task_admission import (
     admit_public_task,
     transition_public_task_status,
@@ -292,6 +296,37 @@ def _guard_pre_planner_policy(
             "this endpoint preserves its legacy planning semantics."
         ),
     )
+
+
+_RESERVATION_MODE_OFF = "OFF"
+_RESERVATION_MODE_ENFORCE = "ENFORCE"
+_RESERVATION_ENFORCE_UNSUPPORTED_FOR_LEGACY = (
+    "RESERVATION_ENFORCE_UNSUPPORTED_FOR_LEGACY"
+)
+_RESERVATION_LEASE_CONFIGURATION_REQUIRED = (
+    "RESERVATION_LEASE_CONFIGURATION_REQUIRED"
+)
+_AMBIGUOUS_RESERVATION_CONTROLLER_OWNERSHIP = (
+    "AMBIGUOUS_RESERVATION_CONTROLLER_OWNERSHIP"
+)
+
+
+def _preflight_public_reservation_policy(payload: RenderDSLRequest) -> None:
+    """Reject unrunnable public Reservation policy before durable admission."""
+    if payload.reservation_conflict_mode == _RESERVATION_MODE_OFF:
+        return
+    if not _requests_authoritative_main_visual(payload):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_RESERVATION_ENFORCE_UNSUPPORTED_FOR_LEGACY,
+        )
+    try:
+        load_reservation_lease_configuration().require_configured()
+    except ReservationLeaseConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_RESERVATION_LEASE_CONFIGURATION_REQUIRED,
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -3673,7 +3708,15 @@ def _render_batch_worker_impl(
         partial = False
     else:
         final_status = "completed" if succeeded_count else "failed"
-        terminal_error_code = None
+        terminal_error_code = (
+            _PLANNING_RESERVATION_CONFLICT_EXHAUSTED
+            if (
+                reservation_controller is not None
+                and planned_count == 0
+                and _PLANNING_RESERVATION_CONFLICT_EXHAUSTED in warning_codes
+            )
+            else None
+        )
         terminal_succeeded_count = succeeded_count
         terminal_failed_count = failed_count
     if _terminal_target_callback is not None:
@@ -3763,11 +3806,33 @@ def render_batch_worker(
     resolved_plan: Optional[CompilationPlan] = None,
     variant_planning_policy: str = "legacy",
     historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
+    reservation_conflict_mode: str = _RESERVATION_MODE_OFF,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
     reservation_controller: Optional[PlannerReservationController] = None,
     public_task_admitted: bool = False,
 ) -> dict[str, Any]:
     """Run one batch and finalize every admitted public task on worker exit."""
+
+    if reservation_conflict_mode not in {
+        _RESERVATION_MODE_OFF,
+        _RESERVATION_MODE_ENFORCE,
+    }:
+        raise ValueError("RESERVATION_CONFLICT_MODE_INVALID")
+    if (
+        reservation_conflict_mode == _RESERVATION_MODE_ENFORCE
+        and reservation_controller is not None
+        and not public_task_admitted
+    ):
+        raise PlannerReservationError(
+            _AMBIGUOUS_RESERVATION_CONTROLLER_OWNERSHIP
+        )
+    if (
+        reservation_conflict_mode == _RESERVATION_MODE_ENFORCE
+        and not public_task_admitted
+    ):
+        raise PlannerReservationError(
+            "PUBLIC_RESERVATION_ENFORCE_REQUIRES_ADMITTED_TASK"
+        )
 
     worker_kwargs = {
         "blind_dsl": blind_dsl,
@@ -3820,6 +3885,7 @@ def render_batch_worker(
         raise
 
     terminal_target: Optional[str] = None
+    public_reservation_controller: Optional[PlannerReservationController] = None
 
     def _remember_terminal_target(target_status: str) -> None:
         nonlocal terminal_target
@@ -3828,12 +3894,48 @@ def render_batch_worker(
         terminal_target = target_status
 
     try:
+        if reservation_conflict_mode == _RESERVATION_MODE_ENFORCE:
+            if reservation_controller is not None:
+                raise PlannerReservationError(
+                    _AMBIGUOUS_RESERVATION_CONTROLLER_OWNERSHIP
+                )
+            if variant_planning_policy not in {
+                "exact_main_visual",
+                "exact_main_visual_balanced",
+            }:
+                raise PlannerReservationError(
+                    _RESERVATION_ENFORCE_UNSUPPORTED_FOR_LEGACY
+                )
+            try:
+                lease_configuration = (
+                    load_reservation_lease_configuration().require_configured()
+                )
+            except ReservationLeaseConfigurationError as exc:
+                raise PlannerReservationError(
+                    _RESERVATION_LEASE_CONFIGURATION_REQUIRED
+                ) from exc
+            ReservationSession = sessionmaker(
+                autocommit=False,
+                autoflush=False,
+                expire_on_commit=False,
+                bind=admission_engine,
+            )
+            public_reservation_controller = PlannerReservationController(
+                logical_task_id=task_id,
+                session_factory=ReservationSession,
+                configuration=lease_configuration,
+            )
+            worker_kwargs["reservation_controller"] = (
+                public_reservation_controller
+            )
         terminal_payload = _render_batch_worker_impl(
             *worker_args,
             **worker_kwargs,
             _terminal_target_callback=_remember_terminal_target,
         )
     except Exception:
+        if public_reservation_controller is not None:
+            public_reservation_controller.abort()
         _best_effort_public_task_terminal_transition(
             admission_engine,
             task_id=task_id,
@@ -4053,6 +4155,7 @@ def submit_dsl(
         flow="submit_dsl",
         is_blind=is_blind,
     )
+    _preflight_public_reservation_policy(payload)
 
     logger.info(
         "[routes_dsl] submit-dsl 请求 engine=%s beats=%d blind=%s aspect=%s duration=%ds",
@@ -4139,6 +4242,7 @@ def submit_dsl(
         "enable_subtitles": payload.enable_subtitles,
         "variant_planning_policy": payload.variant_planning_policy,
         "historical_novelty_mode": payload.historical_novelty_mode,
+        "reservation_conflict_mode": payload.reservation_conflict_mode,
     }
     if _requests_authoritative_main_visual(payload):
         # Request-time preview is only a validated seed; the coordinator still
@@ -4204,6 +4308,7 @@ def submit_manual(
 ) -> DSLSubmitResponse:
     tenant_id = _authoritative_request_tenant(payload, request)
     _guard_pre_planner_policy(payload, flow="submit_manual")
+    _preflight_public_reservation_policy(payload)
     logger.info(
         "[routes_dsl] submit-manual request engine=%s beats=%d aspect=%s duration=%ds",
         payload.engine_type,
@@ -4250,6 +4355,7 @@ def submit_manual(
         "director_mode": payload.mode,
         "enable_tts": payload.enable_tts,
         "enable_subtitles": payload.enable_subtitles,
+        "reservation_conflict_mode": payload.reservation_conflict_mode,
     }
 
     task_id = _admit_dsl_public_task(db, payload)
@@ -4311,6 +4417,7 @@ def render_dsl(
         flow="render_dsl",
         is_blind=is_blind,
     )
+    _preflight_public_reservation_policy(payload)
 
     logger.info(
         "[routes_dsl] render-dsl 请求 engine=%s beats=%d blind=%s aspect=%s duration=%ds",
@@ -4384,6 +4491,7 @@ def render_dsl(
         "director_mode": payload.mode,
         "enable_tts": payload.enable_tts,
         "enable_subtitles": payload.enable_subtitles,
+        "reservation_conflict_mode": payload.reservation_conflict_mode,
     }
 
     task_id = _admit_dsl_public_task(db, payload)

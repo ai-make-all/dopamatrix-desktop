@@ -132,7 +132,10 @@ class PlannerReservationIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status, ReservationAcquireStatus.ACQUIRED)
 
     def test_public_contract_and_default_planners_have_no_activation(self):
-        self.assertNotIn("reservation_conflict_mode", RenderDSLRequest.model_fields)
+        self.assertEqual(
+            RenderDSLRequest.model_fields["reservation_conflict_mode"].default,
+            "OFF",
+        )
         pools = _pools(2)
         payload = _payload(pools)
         exact_before = routes_dsl._plan_exact_main_visual_variants(

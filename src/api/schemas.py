@@ -17,6 +17,21 @@ from .approval_types import VariantStatus
 from .task_identity import CLIENT_TASK_ID_NOT_ALLOWED
 
 
+CLIENT_RESERVATION_AUTHORITY_NOT_ALLOWED = (
+    "CLIENT_RESERVATION_AUTHORITY_NOT_ALLOWED"
+)
+_CLIENT_RESERVATION_AUTHORITY_FIELDS = frozenset(
+    {
+        "owner_attempt_id",
+        "reservation_owner_attempt_id",
+        "owner_task_id",
+        "execution_id",
+        "reservation_lease_ttl_seconds",
+        "reservation_heartbeat_interval_seconds",
+    }
+)
+
+
 class _ServerOwnedTaskRequest(BaseModel):
     """Reject legacy/client attempts to choose DopaMatrix task authority."""
 
@@ -420,6 +435,24 @@ class RenderDSLRequest(_ServerOwnedTaskRequest):
             "OFF, OBSERVE, and non-enforcing ADVISORY."
         ),
     )
+    reservation_conflict_mode: Literal["OFF", "ENFORCE"] = Field(
+        default="OFF",
+        description=(
+            "Short-lived cross-task Reservation coordination policy. OFF performs "
+            "no Reservation coordination. ENFORCE prevents concurrently active "
+            "tasks from authoritatively using the same planning fingerprint. It "
+            "is not historical, permanent, copyright, or global deduplication."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_client_reservation_authority(cls, value):
+        if isinstance(value, dict) and (
+            _CLIENT_RESERVATION_AUTHORITY_FIELDS & value.keys()
+        ):
+            raise ValueError(CLIENT_RESERVATION_AUTHORITY_NOT_ALLOWED)
+        return value
     user_hard_tags:  List[str]        = Field(
         default_factory=list,
         description="前端剥离的硬约束标签，透传至 DSLParserNode 寻址引擎做一票否决过滤。",

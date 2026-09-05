@@ -135,8 +135,11 @@ class ReservationTerminalIntegrationTests(unittest.TestCase):
         self.assertEqual(same_controller_seen, [True])
         return terminal
 
-    def test_public_contract_has_no_reservation_activation(self):
-        self.assertNotIn("reservation_conflict_mode", RenderDSLRequest.model_fields)
+    def test_public_contract_reservation_activation_defaults_off(self):
+        self.assertEqual(
+            RenderDSLRequest.model_fields["reservation_conflict_mode"].default,
+            "OFF",
+        )
         self.assertIsNone(
             routes_dsl.render_batch_worker.__kwdefaults__["reservation_controller"]
         )

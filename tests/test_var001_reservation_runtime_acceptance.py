@@ -249,8 +249,11 @@ class ReservationRuntimeAcceptanceTests(unittest.TestCase):
         with Session() as db:
             return db.get(FingerprintReservation, identity_id).expires_at
 
-    def test_public_runtime_activation_remains_absent(self):
-        self.assertNotIn("reservation_conflict_mode", RenderDSLRequest.model_fields)
+    def test_public_runtime_activation_is_explicit_and_default_off(self):
+        self.assertEqual(
+            RenderDSLRequest.model_fields["reservation_conflict_mode"].default,
+            "OFF",
+        )
         self.assertIsNone(
             routes_dsl.render_batch_worker.__kwdefaults__["reservation_controller"]
         )
