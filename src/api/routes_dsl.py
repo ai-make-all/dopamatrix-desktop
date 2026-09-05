@@ -100,6 +100,14 @@ from .reservation_lease import (
     ReservationLeaseConfigurationError,
     load_reservation_lease_configuration,
 )
+from .reservation_diagnostics import (
+    ReservationPlanningObservation,
+    ReservationTerminalObservation,
+    best_effort_record_reservation_planning,
+    best_effort_record_reservation_terminal,
+    best_effort_start_reservation_diagnostic,
+    emit_reservation_diagnostic_event,
+)
 from .public_task_admission import (
     admit_public_task,
     transition_public_task_status,
@@ -311,6 +319,39 @@ _AMBIGUOUS_RESERVATION_CONTROLLER_OWNERSHIP = (
 )
 
 
+def _invoke_reservation_diagnostic(
+    stage: str,
+    callback: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Keep all operational observation outside authority control flow."""
+    try:
+        return callback(*args, **kwargs)
+    except Exception as exc:
+        try:
+            logger.warning(
+                "[PUBLIC_ENFORCE_DIAGNOSTIC_FAILED] stage=%s category=%s",
+                stage[:32],
+                type(exc).__name__[:64],
+            )
+        except Exception:
+            pass
+        return None
+
+
+def _invoke_reservation_diagnostic_observation(
+    stage: str,
+    callback: Callable[[Any], Any],
+    observation_factory: Callable[[], Any],
+) -> Any:
+    """Prepare and publish an observation inside the isolation boundary."""
+    return _invoke_reservation_diagnostic(
+        stage,
+        lambda: callback(observation_factory()),
+    )
+
+
 def _preflight_public_reservation_policy(payload: RenderDSLRequest) -> None:
     """Reject unrunnable public Reservation policy before durable admission."""
     if payload.reservation_conflict_mode == _RESERVATION_MODE_OFF:
@@ -323,6 +364,14 @@ def _preflight_public_reservation_policy(payload: RenderDSLRequest) -> None:
     try:
         load_reservation_lease_configuration().require_configured()
     except ReservationLeaseConfigurationError as exc:
+        _invoke_reservation_diagnostic(
+            "route_config",
+            emit_reservation_diagnostic_event,
+            "PUBLIC_ENFORCE_ROUTE_CONFIG_REJECTED",
+            planning_policy=payload.variant_planning_policy,
+            requested_count=payload.batch_size,
+            error_code=_RESERVATION_LEASE_CONFIGURATION_REQUIRED,
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_RESERVATION_LEASE_CONFIGURATION_REQUIRED,
@@ -466,6 +515,7 @@ class _VariantPlanningResult:
     coverage_diagnostics: Optional[_CoverageDiagnosticsV1] = None
     historical_novelty_diagnostics: Optional[_HistoricalNoveltyDiagnosticsV1] = None
     reservation_bindings: tuple[PlannerReservationBinding, ...] = ()
+    reservation_conflict_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1658,6 +1708,7 @@ def _plan_exact_main_visual_variants_impl(
     accepted_fingerprints: list[_MainVisualFingerprint] = []
     used_fingerprints: set[_MainVisualFingerprint] = set()
     reservation_conflicted_fingerprints: set[_MainVisualFingerprint] = set()
+    reservation_conflict_observed_fingerprints: set[_MainVisualFingerprint] = set()
     examined_keys: set[tuple[tuple[int, str], ...]] = set()
     selection_mismatch_seen = False
 
@@ -1690,6 +1741,7 @@ def _plan_exact_main_visual_variants_impl(
                 historical_observer.mark_accepted(historical_outcome)
         else:
             reservation_conflicted_fingerprints.add(preview_fingerprint)
+            reservation_conflict_observed_fingerprints.add(preview_fingerprint)
             if historical_observer is not None:
                 historical_observer.mark_reservation_conflict()
 
@@ -1737,6 +1789,7 @@ def _plan_exact_main_visual_variants_impl(
                 prospective_slot=len(accepted_plans),
             ):
                 reservation_conflicted_fingerprints.add(fingerprint)
+                reservation_conflict_observed_fingerprints.add(fingerprint)
                 if historical_observer is not None:
                     historical_observer.mark_reservation_conflict()
                 continue
@@ -1772,6 +1825,9 @@ def _plan_exact_main_visual_variants_impl(
             historical_observer.diagnostics()
             if historical_observer is not None
             else None
+        ),
+        reservation_conflict_count=len(
+            reservation_conflict_observed_fingerprints
         ),
     )
 
@@ -2013,6 +2069,7 @@ def _plan_exact_main_visual_balanced_variants_impl(
     accepted_fingerprints: list[_MainVisualFingerprint] = []
     used_fingerprints: set[_MainVisualFingerprint] = set()
     reservation_conflicted_fingerprints: set[_MainVisualFingerprint] = set()
+    reservation_conflict_observed_fingerprints: set[_MainVisualFingerprint] = set()
     examined_keys: set[tuple[tuple[int, str], ...]] = set()
     selection_mismatch_seen = False
     coverage = _initial_main_visual_coverage(candidate_pools)
@@ -2054,6 +2111,7 @@ def _plan_exact_main_visual_balanced_variants_impl(
                 historical_observer.mark_accepted(historical_outcome)
         else:
             reservation_conflicted_fingerprints.add(preview_fingerprint)
+            reservation_conflict_observed_fingerprints.add(preview_fingerprint)
             preview_reservation_conflicted = True
             if historical_observer is not None:
                 historical_observer.mark_reservation_conflict()
@@ -2127,6 +2185,7 @@ def _plan_exact_main_visual_balanced_variants_impl(
                 prospective_slot=len(accepted_plans),
             ):
                 reservation_conflicted_fingerprints.add(fingerprint)
+                reservation_conflict_observed_fingerprints.add(fingerprint)
                 if historical_observer is not None:
                     historical_observer.mark_reservation_conflict()
                 continue
@@ -2191,6 +2250,9 @@ def _plan_exact_main_visual_balanced_variants_impl(
             historical_observer.diagnostics()
             if historical_observer is not None
             else None
+        ),
+        reservation_conflict_count=len(
+            reservation_conflict_observed_fingerprints
         ),
     )
 
@@ -3209,6 +3271,12 @@ def _render_batch_worker_impl(
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
     reservation_controller: Optional[PlannerReservationController] = None,
     _terminal_target_callback: Optional[Callable[[str], None]] = None,
+    _reservation_diagnostic_planning_callback: Optional[
+        Callable[[ReservationPlanningObservation], None]
+    ] = None,
+    _reservation_diagnostic_terminal_callback: Optional[
+        Callable[[ReservationTerminalObservation], None]
+    ] = None,
 ) -> dict[str, Any]:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
@@ -3334,6 +3402,20 @@ def _render_batch_worker_impl(
                         staged_historical_novelty_diagnostics_payload,
                     )
                 planning_warning_codes.extend(planning_result.warning_codes)
+                if _reservation_diagnostic_planning_callback is not None:
+                    _invoke_reservation_diagnostic_observation(
+                        "planning_callback",
+                        _reservation_diagnostic_planning_callback,
+                        lambda: ReservationPlanningObservation(
+                            planning_policy=variant_planning_policy,
+                            requested_count=batch_size,
+                            planned_count=len(planning_result.plans),
+                            reservation_conflict_count=(
+                                planning_result.reservation_conflict_count
+                            ),
+                            termination_reason=planning_result.termination_reason,
+                        ),
+                    )
                 identities = (
                     _create_child_executions(task_id, len(planning_result.plans))
                     if planning_result.plans
@@ -3740,6 +3822,27 @@ def _render_batch_worker_impl(
     if coverage_diagnostics_payload is not None:
         terminal_payload["coverageDiagnostics"] = coverage_diagnostics_payload
 
+    if _reservation_diagnostic_terminal_callback is not None:
+        _invoke_reservation_diagnostic_observation(
+            "terminal_callback",
+            _reservation_diagnostic_terminal_callback,
+            lambda: ReservationTerminalObservation(
+                planning_policy=variant_planning_policy,
+                requested_count=batch_size,
+                succeeded_count=terminal_succeeded_count,
+                failed_count=terminal_failed_count,
+                terminal_status=final_status,
+                error_code=terminal_error_code,
+                authority_lost=reservation_authority_lost,
+                terminal_persist_failed=reservation_terminal_persist_failed,
+                cleanup_warning=(
+                    reservation_controller.cleanup_warning
+                    if reservation_controller is not None
+                    else False
+                ),
+            ),
+        )
+
     try:
         ws_manager.broadcast_sync(
             {"type": "WS_UPDATE", "payload": terminal_payload},
@@ -3886,12 +3989,37 @@ def render_batch_worker(
 
     terminal_target: Optional[str] = None
     public_reservation_controller: Optional[PlannerReservationController] = None
+    reservation_diagnostic_terminal_recorded = False
 
     def _remember_terminal_target(target_status: str) -> None:
         nonlocal terminal_target
         if target_status not in {"completed", "failed"}:
             raise ValueError("PUBLIC_TASK_TERMINAL_TARGET_INVALID")
         terminal_target = target_status
+
+    def _record_reservation_planning(
+        observation: ReservationPlanningObservation,
+    ) -> None:
+        _invoke_reservation_diagnostic(
+            "planning_write",
+            best_effort_record_reservation_planning,
+            admission_engine,
+            task_id=task_id,
+            observation=observation,
+        )
+
+    def _record_reservation_terminal(
+        observation: ReservationTerminalObservation,
+    ) -> None:
+        nonlocal reservation_diagnostic_terminal_recorded
+        reservation_diagnostic_terminal_recorded = True
+        _invoke_reservation_diagnostic(
+            "terminal_write",
+            best_effort_record_reservation_terminal,
+            admission_engine,
+            task_id=task_id,
+            observation=observation,
+        )
 
     try:
         if reservation_conflict_mode == _RESERVATION_MODE_ENFORCE:
@@ -3906,11 +4034,32 @@ def render_batch_worker(
                 raise PlannerReservationError(
                     _RESERVATION_ENFORCE_UNSUPPORTED_FOR_LEGACY
                 )
+            _invoke_reservation_diagnostic(
+                "start_write",
+                best_effort_start_reservation_diagnostic,
+                admission_engine,
+                task_id=task_id,
+                planning_policy=variant_planning_policy,
+                requested_count=batch_size,
+            )
             try:
                 lease_configuration = (
                     load_reservation_lease_configuration().require_configured()
                 )
             except ReservationLeaseConfigurationError as exc:
+                _invoke_reservation_diagnostic_observation(
+                    "worker_config_terminal",
+                    _record_reservation_terminal,
+                    lambda: ReservationTerminalObservation(
+                        planning_policy=variant_planning_policy,
+                        requested_count=batch_size,
+                        succeeded_count=0,
+                        failed_count=0,
+                        terminal_status="failed",
+                        error_code=_RESERVATION_LEASE_CONFIGURATION_REQUIRED,
+                        worker_lease_config_failed=True,
+                    ),
+                )
                 raise PlannerReservationError(
                     _RESERVATION_LEASE_CONFIGURATION_REQUIRED
                 ) from exc
@@ -3928,14 +4077,52 @@ def render_batch_worker(
             worker_kwargs["reservation_controller"] = (
                 public_reservation_controller
             )
+            worker_kwargs["_reservation_diagnostic_planning_callback"] = (
+                _record_reservation_planning
+            )
+            worker_kwargs["_reservation_diagnostic_terminal_callback"] = (
+                _record_reservation_terminal
+            )
         terminal_payload = _render_batch_worker_impl(
             *worker_args,
             **worker_kwargs,
             _terminal_target_callback=_remember_terminal_target,
         )
-    except Exception:
+    except Exception as exc:
         if public_reservation_controller is not None:
             public_reservation_controller.abort()
+        if (
+            reservation_conflict_mode == _RESERVATION_MODE_ENFORCE
+            and not reservation_diagnostic_terminal_recorded
+        ):
+            def _uncaught_terminal_observation() -> ReservationTerminalObservation:
+                worker_lease_config_failed = (
+                    str(exc) == _RESERVATION_LEASE_CONFIGURATION_REQUIRED
+                )
+                return ReservationTerminalObservation(
+                    planning_policy=variant_planning_policy,
+                    requested_count=batch_size,
+                    succeeded_count=0,
+                    failed_count=0,
+                    terminal_status=terminal_target or "failed",
+                    error_code=(
+                        _RESERVATION_LEASE_CONFIGURATION_REQUIRED
+                        if worker_lease_config_failed
+                        else None
+                    ),
+                    worker_lease_config_failed=worker_lease_config_failed,
+                    cleanup_warning=(
+                        public_reservation_controller.cleanup_warning
+                        if public_reservation_controller is not None
+                        else False
+                    ),
+                )
+
+            _invoke_reservation_diagnostic_observation(
+                "uncaught_terminal",
+                _record_reservation_terminal,
+                _uncaught_terminal_observation,
+            )
         _best_effort_public_task_terminal_transition(
             admission_engine,
             task_id=task_id,

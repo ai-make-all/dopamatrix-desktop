@@ -49,6 +49,7 @@ from src.api import routes_matrix, routes_approval
 from src.api import routes_gateway
 from src.api import routes_media
 from src.api import routes_video
+from src.api import routes_reservation_diagnostics
 from src.api import routes_ws
 from src.api import settings_router
 from src.api.ws_manager import manager as ws_manager
@@ -181,6 +182,7 @@ app.include_router(routes_dsl.router, prefix="/api/v1")
 app.include_router(routes_media.router, prefix="/api/v1")
 # 视频基因舱详情接口 — manifest 查询 & 资产元信息
 app.include_router(routes_video.router, prefix="/api/v1")
+app.include_router(routes_reservation_diagnostics.router, prefix="/api/v1")
 # Omnichannel Gateway — 全渠道 IM 消息网关（Telegram / WhatsApp / 企微等统一入口）
 app.include_router(routes_gateway.router, prefix="/api/v1")
 # BYOK 设置接口 — 前端写入 / 读取 LLM API Key

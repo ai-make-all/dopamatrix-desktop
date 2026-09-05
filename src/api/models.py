@@ -62,6 +62,45 @@ class VideoTask(Base):
 
 
 # ================================================================== #
+# ReservationRunDiagnostic — tenant-local operational observation     #
+# ================================================================== #
+class ReservationRunDiagnostic(Base):
+    """Best-effort operational facts for one admitted public ENFORCE task.
+
+    This row is not Reservation authority and is never consulted by planning,
+    confirmation, fencing, terminal persistence, or task lifecycle decisions.
+    """
+
+    __tablename__ = "reservation_run_diagnostics"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    task_id = Column(String(64), unique=True, nullable=False, index=True)
+    planning_policy = Column(String(64), nullable=False)
+    requested_count = Column(Integer, nullable=False)
+    planning_observed = Column(Boolean, nullable=False, default=False)
+    planned_count = Column(Integer, nullable=True)
+    succeeded_count = Column(Integer, nullable=True)
+    failed_count = Column(Integer, nullable=True)
+    reservation_conflict_count = Column(Integer, nullable=False, default=0)
+    had_reservation_conflict = Column(Boolean, nullable=False, default=False)
+    zero_plan_conflict = Column(Boolean, nullable=False, default=False)
+    partial_plan = Column(Boolean, nullable=False, default=False)
+    authority_lost = Column(Boolean, nullable=False, default=False)
+    terminal_persist_failed = Column(Boolean, nullable=False, default=False)
+    worker_lease_config_failed = Column(Boolean, nullable=False, default=False)
+    cleanup_warning = Column(Boolean, nullable=False, default=False)
+    terminal_status = Column(String(20), nullable=True, index=True)
+    error_code = Column(String(64), nullable=True)
+    started_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_now,
+        index=True,
+    )
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+
+# ================================================================== #
 # VideoAsset — 视频资产 & 防重指纹                                       #
 # ================================================================== #
 class VideoAsset(Base):

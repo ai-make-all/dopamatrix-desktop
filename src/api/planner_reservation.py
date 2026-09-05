@@ -185,6 +185,12 @@ class PlannerReservationController:
             return self._conflict_count
 
     @property
+    def cleanup_warning(self) -> bool:
+        """Return whether bounded heartbeat/release cleanup ever failed."""
+        with self._lock:
+            return self._cleanup_warning_emitted
+
+    @property
     def bindings(self) -> tuple[PlannerReservationBinding, ...]:
         with self._lock:
             return tuple(self._bindings)
