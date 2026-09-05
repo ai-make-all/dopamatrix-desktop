@@ -26,7 +26,7 @@ def _temporary_working_directory():
 
 
 def _child_context(task_id: str, execution_id: str, child_index: int) -> WorkflowContext:
-    context = WorkflowContext(session_id=task_id, test_language="en")
+    context = WorkflowContext(task_id=task_id, test_language="en")
     context.config.update(
         {
             "execution_id": execution_id,
@@ -74,13 +74,12 @@ class WritableNamespaceTests(unittest.TestCase):
                 self.assertTrue(Path(mp3_path).is_file())
                 self.assertTrue(Path(vtt_path).is_file())
 
-    def test_tts_legacy_direct_call_falls_back_to_context_session(self):
+    def test_tts_legacy_direct_call_falls_back_to_context_task(self):
         context = WorkflowContext(
-            session_id="legacy-child",
+            task_id="legacy-child",
             test_language="en",
             batch_size=4,
         )
-        context.config["session_id"] = "legacy-child"
         context.set_asset("tts_script", {"en": "Legacy text"})
 
         with tempfile.TemporaryDirectory() as directory:
@@ -98,7 +97,7 @@ class WritableNamespaceTests(unittest.TestCase):
             )
 
     def test_new_child_tts_context_cannot_fall_back_to_shared_task_id(self):
-        context = WorkflowContext(session_id="shared-task", test_language="en")
+        context = WorkflowContext(task_id="shared-task", test_language="en")
         context.config["child_index"] = 0
         context.set_asset("tts_script", {"en": "Child text"})
 
@@ -107,7 +106,7 @@ class WritableNamespaceTests(unittest.TestCase):
                 TTSNode(output_dir=directory).execute(context)
 
     def test_tts_empty_script_skip_is_unchanged(self):
-        context = WorkflowContext(session_id="shared-task", test_language="en")
+        context = WorkflowContext(task_id="shared-task", test_language="en")
         context.config["child_index"] = 0
 
         with tempfile.TemporaryDirectory() as directory:
@@ -135,13 +134,12 @@ class WritableNamespaceTests(unittest.TestCase):
                 self.assertEqual(Path(ass_path).name, f"sub_{execution_id}_en.ass")
                 self.assertTrue(Path(ass_path).is_file())
 
-    def test_subtitle_legacy_direct_call_falls_back_to_context_session(self):
+    def test_subtitle_legacy_direct_call_falls_back_to_context_task(self):
         context = WorkflowContext(
-            session_id="legacy-child",
+            task_id="legacy-child",
             test_language="en",
             batch_size=4,
         )
-        context.config["session_id"] = "legacy-child"
         context.config["translations"] = {"en": "Legacy subtitle"}
 
         with _temporary_working_directory():
@@ -170,7 +168,7 @@ class WritableNamespaceTests(unittest.TestCase):
             self.assertTrue(Path(ass_path).is_file())
 
     def test_new_child_subtitle_context_cannot_fall_back_to_shared_task_id(self):
-        context = WorkflowContext(session_id="shared-task", test_language="en")
+        context = WorkflowContext(task_id="shared-task", test_language="en")
         context.config.update(
             {
                 "child_index": 0,
@@ -183,7 +181,7 @@ class WritableNamespaceTests(unittest.TestCase):
                 SubtitleNode().execute(context)
 
     def test_subtitle_empty_text_skip_is_unchanged(self):
-        context = WorkflowContext(session_id="shared-task", test_language="en")
+        context = WorkflowContext(task_id="shared-task", test_language="en")
         context.config["child_index"] = 0
 
         with _temporary_working_directory() as directory:
@@ -195,13 +193,12 @@ class WritableNamespaceTests(unittest.TestCase):
 
 class ShortOutputFilenameTests(unittest.TestCase):
     def test_master_final_and_cover_prefer_explicit_file_sid(self):
-        context = WorkflowContext(session_id="shared-task")
+        context = WorkflowContext(task_id="shared-task")
         context.config.update(
             {
                 "execution_id": str(uuid.uuid4()),
                 "file_sid": "deadbeef",
                 "child_index": 0,
-                "session_id": "legacy-wrong-token",
             }
         )
 
@@ -243,39 +240,36 @@ class ShortOutputFilenameTests(unittest.TestCase):
             CoverNode._cover_output_path(second, os.path.join("output", "video.mp4")),
         )
 
-    def test_legacy_output_name_fallbacks_are_preserved(self):
-        context = WorkflowContext(session_id="legacy-context")
-        context.config["session_id"] = "legacy-file"
+    def test_direct_output_name_falls_back_to_task_id(self):
+        context = WorkflowContext(task_id="legacy-context")
 
         self.assertEqual(
             FFmpegCompositorNode._master_output_path(context),
-            "output/master_video_legacy-file.mp4",
+            "output/master_video_legacy-context.mp4",
         )
         self.assertEqual(
             FFmpegCompositorNode._final_output_path(context, "en"),
-            "output/final_en_legacy-file.mp4",
+            "output/final_en_legacy-context.mp4",
         )
         self.assertEqual(
             CoverNode._cover_output_path(context, os.path.join("output", "video.mp4")),
-            os.path.join("output", "cover_legacy-file.jpg"),
+            os.path.join("output", "cover_legacy-context.jpg"),
         )
 
-    def test_cover_preserves_empty_legacy_session_alias(self):
-        legacy_context = WorkflowContext(session_id="legacy-context")
-        legacy_context.config["session_id"] = ""
+    def test_cover_direct_context_uses_task_id(self):
+        legacy_context = WorkflowContext(task_id="legacy-context")
         child_context = _child_context(
             "shared-task",
             "55555555-5555-4555-8555-555555555555",
             0,
         )
-        child_context.config["session_id"] = ""
 
         self.assertEqual(
             CoverNode._cover_output_path(
                 legacy_context,
                 os.path.join("output", "video.mp4"),
             ),
-            os.path.join("output", "cover_.jpg"),
+            os.path.join("output", "cover_legacy-context.jpg"),
         )
         self.assertEqual(
             CoverNode._cover_output_path(
@@ -286,12 +280,11 @@ class ShortOutputFilenameTests(unittest.TestCase):
         )
 
     def test_new_child_output_context_cannot_use_legacy_file_fallback(self):
-        context = WorkflowContext(session_id="shared-task")
+        context = WorkflowContext(task_id="shared-task")
         context.config.update(
             {
                 "execution_id": str(uuid.uuid4()),
                 "child_index": 0,
-                "session_id": "legacy-wrong-token",
             }
         )
 

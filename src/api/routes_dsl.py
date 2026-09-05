@@ -96,6 +96,10 @@ from .planner_reservation import (
     PlannerReservationError,
     PlannerReservationExecutionBinding,
 )
+from .public_task_admission import (
+    admit_public_task,
+    transition_public_task_status,
+)
 from .schemas import (
     CompilationPlan,
     CompilationPlanSummary,
@@ -192,6 +196,48 @@ def _authoritative_request_tenant(
             detail="TENANT_AUTHORITY_MISMATCH",
         )
     return authoritative
+
+
+def _admit_dsl_public_task(db: Session, payload: RenderDSLRequest) -> str:
+    """Generate and durably claim one server-owned task ID before dispatch."""
+    admission = admit_public_task(
+        db.get_bind(),
+        prompt=payload.prompt,
+        batch_size=payload.batch_size,
+    )
+    return admission.task_id
+
+
+def _dispatch_claimed_public_task(
+    background_tasks: BackgroundTasks,
+    bind: Any,
+    *worker_args: Any,
+    **worker_kwargs: Any,
+) -> None:
+    """Make a worker reachable only after its durable task claim committed."""
+    task_id = str(worker_args[1])
+    try:
+        background_tasks.add_task(
+            render_batch_worker,
+            *worker_args,
+            public_task_admitted=True,
+            **worker_kwargs,
+        )
+    except Exception:
+        try:
+            transition_public_task_status(
+                bind,
+                task_id=task_id,
+                target_status="failed",
+            )
+        except Exception as status_exc:
+            logger.error(
+                "[PUBLIC_TASK_STATUS_UPDATE_FAILED] phase=dispatch task_id=%s "
+                "error=%s",
+                task_id,
+                type(status_exc).__name__,
+            )
+        raise
 
 
 def _requests_exact_main_visual(payload: RenderDSLRequest) -> bool:
@@ -2574,7 +2620,7 @@ def render_worker(
 
         # ── 2. 初始化 WorkflowContext，将 Timeline 注入数据总线 ─────────
         context = WorkflowContext(
-            session_id=task_id,
+            task_id=task_id,
             aspect_ratio=aspect_ratio,
             target_duration=target_duration,
             tenant_id=tenant_id,
@@ -2584,8 +2630,8 @@ def render_worker(
         context.set_asset("timeline", timeline)
 
         # ── 3. 显式 child execution identity ───────────────────────────
-        # context.session_id 保持 shared task/UI/WS identity；写路径与短输出名
-        # 分别使用 execution_id / file_sid，不再复用语义含混的 config session_id。
+        # context.task_id keeps shared task/UI/WS identity; execution/file
+        # execution_id and file_sid are distinct from public task identity.
         context.config["execution_id"] = execution_id
         context.config["file_sid"] = resolved_file_sid
         context.config["child_index"] = child_index
@@ -3107,7 +3153,7 @@ def _persist_reservation_authoritative_terminal(
     return bool(succeeded_count)
 
 
-def render_batch_worker(
+def _render_batch_worker_impl(
     dsl_payload: Optional[StoryDSLPayload],
     task_id: str,
     aspect_ratio: str = "9:16",
@@ -3127,6 +3173,7 @@ def render_batch_worker(
     historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
     preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
     reservation_controller: Optional[PlannerReservationController] = None,
+    _terminal_target_callback: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
     """
     批量矩阵渲染 Worker（Phase 5.9）。
@@ -3629,6 +3676,8 @@ def render_batch_worker(
         terminal_error_code = None
         terminal_succeeded_count = succeeded_count
         terminal_failed_count = failed_count
+    if _terminal_target_callback is not None:
+        _terminal_target_callback(final_status)
     terminal_payload: dict[str, Any] = {
         "taskId": task_id,
         "status": final_status,
@@ -3668,6 +3717,151 @@ def render_batch_worker(
     return terminal_payload
 
 
+def _best_effort_public_task_terminal_transition(
+    admission_engine: Any,
+    *,
+    task_id: str,
+    target_status: str,
+    phase: str,
+) -> None:
+    """Persist operational task state without replacing worker truth/errors."""
+    try:
+        transition_public_task_status(
+            admission_engine,
+            task_id=task_id,
+            target_status=target_status,
+        )
+    except Exception as exc:
+        try:
+            logger.error(
+                "[PUBLIC_TASK_STATUS_UPDATE_FAILED] phase=%s task_id=%s status=%s "
+                "error=%s",
+                phase,
+                task_id,
+                target_status,
+                type(exc).__name__,
+            )
+        except Exception:
+            pass
+
+
+def render_batch_worker(
+    dsl_payload: Optional[StoryDSLPayload],
+    task_id: str,
+    aspect_ratio: str = "9:16",
+    target_duration: int = 15,
+    tenant_id: str = "default",
+    prompt: Optional[str] = None,
+    batch_size: int = 1,
+    test_language: str = "en",
+    *,
+    blind_dsl: bool = False,
+    engine_type: str = "content",
+    director_mode: str = "auto",
+    enable_tts: bool = True,
+    enable_subtitles: bool = True,
+    resolved_plan: Optional[CompilationPlan] = None,
+    variant_planning_policy: str = "legacy",
+    historical_novelty_mode: str = _HISTORICAL_MODE_OFF,
+    preview_intent: PreviewIntent = PreviewIntent.UNSPECIFIED,
+    reservation_controller: Optional[PlannerReservationController] = None,
+    public_task_admitted: bool = False,
+) -> dict[str, Any]:
+    """Run one batch and finalize every admitted public task on worker exit."""
+
+    worker_kwargs = {
+        "blind_dsl": blind_dsl,
+        "engine_type": engine_type,
+        "director_mode": director_mode,
+        "enable_tts": enable_tts,
+        "enable_subtitles": enable_subtitles,
+        "resolved_plan": resolved_plan,
+        "variant_planning_policy": variant_planning_policy,
+        "historical_novelty_mode": historical_novelty_mode,
+        "preview_intent": preview_intent,
+        "reservation_controller": reservation_controller,
+    }
+    worker_args = (
+        dsl_payload,
+        task_id,
+        aspect_ratio,
+        target_duration,
+        tenant_id,
+        prompt,
+        batch_size,
+        test_language,
+    )
+    if not public_task_admitted:
+        return _render_batch_worker_impl(*worker_args, **worker_kwargs)
+
+    admission_engine = get_tenant_engine(tenant_id)
+    try:
+        transition_public_task_status(
+            admission_engine,
+            task_id=task_id,
+            target_status="processing",
+        )
+    except Exception as exc:
+        try:
+            logger.error(
+                "[PUBLIC_TASK_STATUS_UPDATE_FAILED] phase=worker_start task_id=%s "
+                "error=%s",
+                task_id,
+                type(exc).__name__,
+            )
+        except Exception:
+            pass
+        _best_effort_public_task_terminal_transition(
+            admission_engine,
+            task_id=task_id,
+            target_status="failed",
+            phase="worker_start_failed",
+        )
+        raise
+
+    terminal_target: Optional[str] = None
+
+    def _remember_terminal_target(target_status: str) -> None:
+        nonlocal terminal_target
+        if target_status not in {"completed", "failed"}:
+            raise ValueError("PUBLIC_TASK_TERMINAL_TARGET_INVALID")
+        terminal_target = target_status
+
+    try:
+        terminal_payload = _render_batch_worker_impl(
+            *worker_args,
+            **worker_kwargs,
+            _terminal_target_callback=_remember_terminal_target,
+        )
+    except Exception:
+        _best_effort_public_task_terminal_transition(
+            admission_engine,
+            task_id=task_id,
+            target_status=terminal_target or "failed",
+            phase="worker_uncaught_exception",
+        )
+        raise
+
+    if terminal_target is None:
+        # The implementation must report authoritative terminal intent before
+        # returning. Treat an integration breach as failed operationally.
+        _best_effort_public_task_terminal_transition(
+            admission_engine,
+            task_id=task_id,
+            target_status="failed",
+            phase="worker_terminal_target_missing",
+        )
+        raise RuntimeError("PUBLIC_TASK_TERMINAL_TARGET_MISSING")
+
+    _best_effort_public_task_terminal_transition(
+        admission_engine,
+        task_id=task_id,
+        target_status=terminal_target,
+        phase="terminal",
+    )
+    return terminal_payload
+
+
 def _run_compositor(
     compositor: FFmpegCompositorNode,
     context: WorkflowContext,
@@ -3689,7 +3883,7 @@ def _run_compositor(
         logger.exception(
             "[_run_compositor] FFmpeg 渲染失败 task_id=%s execution_id=%s "
             "child_index=%s file_sid=%s",
-            context.session_id,
+            context.task_id,
             context.config.get("execution_id"),
             context.config.get("child_index"),
             context.config.get("file_sid"),
@@ -3713,7 +3907,7 @@ def _run_cover_node(cover: CoverNode, context: WorkflowContext) -> bool:
         logger.exception(
             "[_run_cover_node] CoverNode 异常（不阻断主流程） task_id=%s "
             "execution_id=%s child_index=%s file_sid=%s",
-            context.session_id,
+            context.task_id,
             context.config.get("execution_id"),
             context.config.get("child_index"),
             context.config.get("file_sid"),
@@ -3927,7 +4121,6 @@ def submit_dsl(
     assert plan is not None
 
     # ── Step 3: 生成唯一 task_id，按 batch_size 选择 worker ──────────────
-    task_id    = payload.session_id or str(uuid.uuid4())
     batch_size = payload.batch_size
 
     # 原始 DSL Payload（未执行寻址），下发给 Worker 实现运行时动态抽卡
@@ -3953,8 +4146,10 @@ def submit_dsl(
         _worker_kw["resolved_plan"] = plan
         _worker_kw["preview_intent"] = PreviewIntent.AUTOMATIC_PREVIEW
 
-    background_tasks.add_task(
-        render_batch_worker,
+    task_id = _admit_dsl_public_task(db, payload)
+    _dispatch_claimed_public_task(
+        background_tasks,
+        db.get_bind(),
         dsl_payload_for_worker,
         task_id,
         payload.aspect_ratio, payload.target_duration, tenant_id,
@@ -4048,7 +4243,6 @@ def submit_manual(
             ),
         )
 
-    task_id = payload.session_id or str(uuid.uuid4())
     batch_size = payload.batch_size
     worker_kwargs: dict[str, Any] = {
         "blind_dsl": False,
@@ -4058,8 +4252,10 @@ def submit_manual(
         "enable_subtitles": payload.enable_subtitles,
     }
 
-    background_tasks.add_task(
-        render_batch_worker,
+    task_id = _admit_dsl_public_task(db, payload)
+    _dispatch_claimed_public_task(
+        background_tasks,
+        db.get_bind(),
         dsl_payload,
         task_id,
         payload.aspect_ratio, payload.target_duration, tenant_id,
@@ -4172,7 +4368,6 @@ def render_dsl(
 
     assert plan is not None
 
-    task_id    = payload.session_id or str(uuid.uuid4())
     batch_size = payload.batch_size
 
     # 原始 DSL Payload（未执行寻址），下发给 Worker 实现运行时动态抽卡
@@ -4191,8 +4386,10 @@ def render_dsl(
         "enable_subtitles": payload.enable_subtitles,
     }
 
-    background_tasks.add_task(
-        render_batch_worker,
+    task_id = _admit_dsl_public_task(db, payload)
+    _dispatch_claimed_public_task(
+        background_tasks,
+        db.get_bind(),
         dsl_payload_for_worker,
         task_id,
         payload.aspect_ratio, payload.target_duration, tenant_id,
@@ -4208,7 +4405,7 @@ def render_dsl(
     )
 
     return RenderDSLAck(
-        session_id=task_id,
+        task_id=task_id,
         status="processing",
         message=(
             f"渲染任务已下发（batch={batch_size}，blind_dsl={is_blind}），"

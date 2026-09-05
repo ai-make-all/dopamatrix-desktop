@@ -3,7 +3,7 @@ run_matrix_factory.py — DopaMatrix 高并发矩阵裂变入口
 
 架构：
   使用 Python concurrent.futures.ThreadPoolExecutor 实现多线程并发，
-  同时生成 N 个独立的矩阵视频（每个带有唯一 session_id）。
+  同时生成 N 个独立的矩阵视频（共享公开 task_id，各有 execution_id）。
 
   ⚠️ 重要设计说明：
   改用 ThreadPoolExecutor（而非 ProcessPoolExecutor）的原因：
@@ -26,9 +26,7 @@ run_matrix_factory.py — DopaMatrix 高并发矩阵裂变入口
     → FFmpegCompositorNode
 
 输出文件命名规则：
-  母带：  output/master_video_{session_id}.mp4
-  变体：  output/final_{lang}_{session_id}.mp4
-  （session_id 由 context.config["session_id"] 传递，compositor 自动读取）
+  输出文件使用独立 file_sid，公开任务关联始终使用 context.task_id。
 
 用法：
   # 默认 batch_size=3（同时生产 3 个矩阵视频）
@@ -60,7 +58,7 @@ def _fmt_time(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-def _build_video_manifest(context, session_id: str, test_language: str) -> dict:
+def _build_video_manifest(context, execution_id: str, test_language: str) -> dict:
     """
     从 WorkflowContext 组装视频基因配方（Video Manifest）。
 
@@ -73,7 +71,7 @@ def _build_video_manifest(context, session_id: str, test_language: str) -> dict:
 
     输出格式严格对齐前端 VideoDetailView.vue 的 videoManifest 结构：
     {
-        "video_id": "vid_<session_id>",
+        "video_id": "vid_<execution_id>",
         "bgm": "<bgm_filename>",
         "blocks": [
             {
@@ -135,7 +133,7 @@ def _build_video_manifest(context, session_id: str, test_language: str) -> dict:
                 break
 
     return {
-        "video_id" : f"vid_{session_id}",
+        "video_id" : f"vid_{execution_id}",
         "bgm"      : bgm_name,
         "blocks"   : blocks,
     }
@@ -145,7 +143,7 @@ def _build_video_manifest(context, session_id: str, test_language: str) -> dict:
 # Worker 函数（运行在独立线程中）
 # ===========================================================================
 
-def _run_single_matrix(session_id: str, user_prompt: str,
+def _run_single_matrix(execution_id: str, task_id: str, user_prompt: str,
                        aspect_ratio: str = "9:16",
                        test_language: str = "en",
                        target_duration: int = 15,
@@ -157,17 +155,18 @@ def _run_single_matrix(session_id: str, user_prompt: str,
     单个矩阵视频生产 Worker，在独立线程中执行完整 Pipeline。
 
     Args:
-        session_id:        当前任务的唯一标识符（8位短 UUID）
+        execution_id:      当前 child execution 的 UUID
+        task_id:           父级公开任务 UUID
         user_prompt:       视频生成提示词
 
     Returns:
-        结果字典，包含 session_id、success、assets、error 等字段
+        结果字典，包含 execution_id、success、assets、error 等字段
     """
     # ── 线程安全的 .env 加载（父线程已加载则幂等；override=False 不覆盖） ──────
     from src.utils.env_utils import load_env
     load_env()
 
-    logger.info(f"[Worker {session_id}] 线程启动，开始生产矩阵视频...")
+    logger.info(f"[Worker {execution_id}] 线程启动，开始生产矩阵视频...")
 
     try:
         # ── 导入所有节点（在子进程内导入，避免跨进程序列化问题）────────────
@@ -233,7 +232,7 @@ def _run_single_matrix(session_id: str, user_prompt: str,
         ]
 
         context = WorkflowContext(
-            session_id=session_id,
+            task_id=task_id,
             aspect_ratio=aspect_ratio,
             test_language=test_language,
             target_duration=target_duration,
@@ -241,12 +240,13 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             script_mode=script_mode,
             tenant_id=tenant_id,
         )
-        context.config["session_id"] = session_id
+        context.config["execution_id"] = execution_id
+        context.config["file_sid"] = execution_id.replace("-", "")[:12]
         if output_dir:
             context.config["output_dir"] = output_dir
         context.set_asset("script", user_prompt)
         logger.info(
-            f"[Worker {session_id}] 画幅: {aspect_ratio} | 语言: {test_language} "
+            f"[Worker {execution_id}] 画幅: {aspect_ratio} | 语言: {test_language} "
             f"| 时长: {target_duration}s | 模式: {script_mode}"
         )
 
@@ -255,21 +255,21 @@ def _run_single_matrix(session_id: str, user_prompt: str,
         os.makedirs("output/clips", exist_ok=True)
 
         logger.info(
-            f"[Worker {session_id}] Pipeline 节点数: {len(engine.nodes)}"
+            f"[Worker {execution_id}] Pipeline 节点数: {len(engine.nodes)}"
         )
 
         # ── 运行 Pipeline ─────────────────────────────────────────────────────
         final_context = engine.run(context)
 
         # ── 收集结果 ──────────────────────────────────────────────────────────
-        video_manifest = _build_video_manifest(final_context, session_id, test_language)
+        video_manifest = _build_video_manifest(final_context, execution_id, test_language)
         logger.info(
-            f"[Worker {session_id}] Manifest 已生成: "
+            f"[Worker {execution_id}] Manifest 已生成: "
             f"blocks={len(video_manifest['blocks'])} bgm='{video_manifest['bgm']}'"
         )
 
         result: dict = {
-            "session_id"    : session_id,
+            "execution_id"  : execution_id,
             "success"       : True,
             "error"         : None,
             "used_asset_ids": final_context.assets.get("used_asset_ids", []),
@@ -284,15 +284,15 @@ def _run_single_matrix(session_id: str, user_prompt: str,
             },
         }
 
-        logger.info(f"[Worker {session_id}] 完成！母带: {result['assets']['video_master']}")
+        logger.info(f"[Worker {execution_id}] 完成！母带: {result['assets']['video_master']}")
         return result
 
     except Exception as exc:
         tb = traceback.format_exc()
         # 使用 logger 写入日志文件（打包后 --windowed 模式下 print 输出到 NUL，无法排查）
-        logger.error(f"[Worker {session_id}] 执行失败: {exc}\n{tb}")
+        logger.error(f"[Worker {execution_id}] 执行失败: {exc}\n{tb}")
         return {
-            "session_id": session_id,
+            "execution_id": execution_id,
             "success": False,
             "error": str(exc),
             "traceback": tb,
@@ -311,7 +311,8 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
                        target_duration: int = 15,
                        output_dir: str = None,
                        script_mode: str = "auto",
-                       tenant_id: str = "default") -> list[dict]:
+                       tenant_id: str = "default",
+                       task_id: str | None = None) -> list[dict]:
     """
     启动多线程矩阵批量生产。
 
@@ -335,42 +336,47 @@ def run_matrix_factory(batch_size: int = 3, user_prompt: str = "",
             "需要吸引海湾地区的汽车用品批发商。"
         )
 
-    # 为每个任务生成唯一的 session_id（取 UUID4 前 8 位，简洁且碰撞概率极低）
-    sessions = [uuid.uuid4().hex[:8] for _ in range(batch_size)]
+    from src.api.task_identity import new_task_id
 
-    logger.info(f"[矩阵工厂] 启动，批量大小: {batch_size}，任务 ID: {sessions}")
+    task_id = task_id or new_task_id()
+    execution_ids = [str(uuid.uuid4()) for _ in range(batch_size)]
+
+    logger.info(
+        f"[矩阵工厂] 启动，task_id={task_id}，批量大小: {batch_size}，"
+        f"execution IDs: {execution_ids}"
+    )
 
     results: list[dict] = []
 
-    # ThreadPoolExecutor：每个 session 在独立线程中运行完整 Pipeline
+    # ThreadPoolExecutor：每个 child execution 在独立线程中运行完整 Pipeline
     # max_workers=batch_size 确保所有任务真正并行（受 CPU 核心数上限）
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
-        future_to_session: dict[Future, str] = {
-            executor.submit(_run_single_matrix, sid, user_prompt,
+        future_to_execution: dict[Future, str] = {
+            executor.submit(_run_single_matrix, execution_id, task_id, user_prompt,
                             aspect_ratio, test_language, target_duration,
-                            output_dir, batch_size, script_mode, tenant_id): sid
-            for sid in sessions
+                            output_dir, batch_size, script_mode, tenant_id): execution_id
+            for execution_id in execution_ids
         }
 
         logger.info(f"[矩阵工厂] 已提交 {batch_size} 个生产任务，等待完成...")
 
         # 按完成顺序收集结果（as_completed 不阻塞其他任务）
-        for future in as_completed(future_to_session):
-            sid = future_to_session[future]
+        for future in as_completed(future_to_execution):
+            execution_id = future_to_execution[future]
             try:
                 result = future.result()
                 results.append(result)
                 if result["success"]:
-                    logger.info(f"[矩阵工厂] [Session {sid}] 完成 ✓")
+                    logger.info(f"[矩阵工厂] [Execution {execution_id}] 完成 ✓")
                 else:
                     logger.warning(
-                        f"[矩阵工厂] [Session {sid}] 失败: {result.get('error', 'Unknown error')}"
+                        f"[矩阵工厂] [Execution {execution_id}] 失败: {result.get('error', 'Unknown error')}"
                     )
             except Exception as exc:
                 tb = traceback.format_exc()
-                logger.error(f"[矩阵工厂] [Session {sid}] Future 异常: {exc}\n{tb}")
+                logger.error(f"[矩阵工厂] [Execution {execution_id}] Future 异常: {exc}\n{tb}")
                 results.append({
-                    "session_id": sid,
+                    "execution_id": execution_id,
                     "success": False,
                     "error": str(exc),
                     "assets": {},
@@ -389,14 +395,14 @@ def _print_summary(results: list[dict]) -> None:
     logger.info(f"\n总计: {len(results)} 个任务，{success_count} 成功，{len(results) - success_count} 失败\n")
 
     for r in results:
-        sid = r["session_id"]
+        execution_id = r["execution_id"]
         if r["success"]:
             master = r["assets"].get("video_master", "(未生成)")
-            logger.info(f"  ✅ [{sid}] 母带: {master}")
+            logger.info(f"  ✅ [{execution_id}] 母带: {master}")
             for lang, path in r["assets"].get("variants", {}).items():
                 logger.info(f"         [{lang}]: {path or '(未生成)'}")
         else:
-            logger.warning(f"  ❌ [{sid}] 失败: {r.get('error', 'Unknown')}")
+            logger.warning(f"  ❌ [{execution_id}] 失败: {r.get('error', 'Unknown')}")
 
     logger.info("")
 

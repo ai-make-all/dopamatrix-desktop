@@ -958,7 +958,14 @@ class PolicyTransitionTests(unittest.TestCase):
         parser = Mock()
         parser.parse_and_resolve.return_value = preview
 
-        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+        with (
+            patch.object(routes_dsl, "DSLParserNode", return_value=parser),
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value="admitted-test-task",
+            ),
+        ):
             response = routes_dsl.submit_dsl(request, background, db=Mock())
 
         scheduled = background.add_task.call_args
@@ -982,8 +989,10 @@ class PolicyTransitionTests(unittest.TestCase):
             ) as planner,
             patch.object(routes_dsl, "render_worker", side_effect=fake_worker),
             patch.object(routes_dsl, "_persist_task_history"),
+            patch.object(routes_dsl, "transition_public_task_status"),
             patch.object(routes_dsl.ws_manager, "broadcast_sync"),
         ):
+            scheduled.kwargs["public_task_admitted"] = False
             terminal = scheduled.args[0](*scheduled.args[1:], **scheduled.kwargs)
 
         self.assertEqual(response.render_status, "rendering")

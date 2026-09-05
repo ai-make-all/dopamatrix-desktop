@@ -11,9 +11,21 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 from .approval_types import VariantStatus
+from .task_identity import CLIENT_TASK_ID_NOT_ALLOWED
+
+
+class _ServerOwnedTaskRequest(BaseModel):
+    """Reject legacy/client attempts to choose DopaMatrix task authority."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_client_task_identity(cls, value):
+        if isinstance(value, dict) and ({"session_id", "task_id"} & value.keys()):
+            raise ValueError(CLIENT_TASK_ID_NOT_ALLOWED)
+        return value
 
 
 class BatchUpdateStatusRequest(BaseModel):
@@ -39,16 +51,12 @@ class BatchUpdateStatusResponse(BaseModel):
 # VideoTask Schemas                                                    #
 # ================================================================== #
 
-class VideoTaskCreate(BaseModel):
+class VideoTaskCreate(_ServerOwnedTaskRequest):
     """
     POST /tasks/submit  请求体。
     调用方（Agent / GrowthOS / CLI / Tauri Desktop）提交一个新的矩阵生成任务。
     弹药完全由内部按 LRU（最少使用）算法自动补给。
     """
-    session_id: Optional[str] = Field(
-        default=None,
-        description="可选：指定 session_id；留空则由引擎自动生成 UUID。"
-    )
     prompt:      str = Field(..., min_length=1, description="剧本要求或主题文案。")
     script_mode: str = Field(
         default="auto",
@@ -103,11 +111,10 @@ class VideoTaskResponse(BaseModel):
     """
     model_config = ConfigDict(from_attributes=True)
 
-    id:           int
-    session_id:   str
+    task_id:      str
     prompt:       str
     batch_size:   int
-    status:       str           # pending | processing | completed | failed
+    status:       str           # queued | processing | completed | failed
     created_at:   datetime
     finished_at:  Optional[datetime] = None
 
@@ -126,8 +133,7 @@ class VideoTaskStatusResponse(BaseModel):
     """
     model_config = ConfigDict(from_attributes=True)
 
-    id:         int
-    session_id: str
+    task_id:    str
     status:     str
     finished_at: Optional[datetime] = None
     estimated_cost_usd: Optional[float] = None
@@ -145,7 +151,6 @@ class VideoAssetResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id:              int
-    task_id:         int
     file_path:       str
     language:        str
     file_hash:       str   = Field(..., description="MD5 文件哈希，用于精确去重。")
@@ -177,10 +182,9 @@ class TaskSubmitAck(BaseModel):
 
     职责：让前端秒拿到 task_id 以便立即开始轮询，
     同时给出人类可读的 message 说明任务在排队中。
-    不包含完整资产列表（那是 GET /tasks/{id} 的事）。
+    不包含完整资产列表（那是 GET /tasks/{task_id} 的事）。
     """
-    task_id:    int
-    session_id: str
+    task_id:    str
     status:     str = "queued"
     message:    str = "任务已提交至后台矩阵工厂，请通过 GET /tasks/{task_id} 轮询进度。"
 
@@ -355,7 +359,7 @@ class CompilationPlan(BaseModel):
 # Render DSL Schemas  (Phase 5.1 — DSL → Timeline → FFmpeg 全链路)   #
 # ================================================================== #
 
-class RenderDSLRequest(BaseModel):
+class RenderDSLRequest(_ServerOwnedTaskRequest):
     """
     POST /tasks/render-dsl 请求体。
 
@@ -367,10 +371,6 @@ class RenderDSLRequest(BaseModel):
     meta:            Optional[BlueprintMeta] = Field(default=None, description="全局社交文案与情绪归因元数据")
 
     # ── 渲染配置 ─────────────────────────────────────────────────── #
-    session_id:      Optional[str]   = Field(
-        default=None,
-        description="可选：指定 session_id；留空则由引擎自动生成 UUID。",
-    )
     aspect_ratio:    str             = Field(
         default="9:16",
         description="输出画幅比例：'9:16' | '16:9' | '1:1'。",
@@ -471,7 +471,7 @@ class RenderDSLAck(BaseModel):
     渲染任务已下发至后台线程，前端通过 WS 事件总线接收进度推送。
     """
     status:     str = "processing"
-    session_id: str
+    task_id:    str
     message:    str = "渲染任务已下发，请通过 WebSocket 事件总线监听进度。"
 
 
@@ -487,7 +487,7 @@ class DSLSubmitResponse(CompilationPlan):
     并追加渲染任务元数据，使前端无需二次请求即可获得 task_id。
 
     字段说明：
-      task_id       — UUID，与 WorkflowContext.session_id 保持一致，
+      task_id       — DopaMatrix 生成的 UUID，与 WorkflowContext.task_id 保持一致，
                       同时作为 WS 事件的 taskId 和输出文件名后缀。
       render_status — 任务下发状态（固定为 "rendering"，区别于 HTTP status）。
       message       — 人类可读的操作说明。

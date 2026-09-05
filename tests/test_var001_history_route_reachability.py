@@ -49,7 +49,7 @@ class HistoryRouteReachabilityTests(unittest.TestCase):
                 created_at=datetime.now(timezone.utc),
             )
             task = VideoTask(
-                session_id="integer-route-target",
+                task_id="integer-route-target",
                 prompt="dynamic route control",
                 batch_size=1,
                 status="completed",
@@ -57,7 +57,7 @@ class HistoryRouteReachabilityTests(unittest.TestCase):
             db.add_all([history, task])
             db.commit()
             db.refresh(task)
-            cls._integer_task_id = task.id
+            cls._public_task_id = task.task_id
 
         def override_get_db(request: Request):
             tenant_id = request.headers.get("X-Local-User", "default")
@@ -115,15 +115,16 @@ class HistoryRouteReachabilityTests(unittest.TestCase):
             source.index(dynamic_registration),
         )
 
-    def test_integer_task_route_remains_reachable(self) -> None:
+    def test_public_uuid_task_route_is_reachable(self) -> None:
         response = self.client.get(
-            f"/api/v1/tasks/{self._integer_task_id}",
+            f"/api/v1/tasks/{self._public_task_id}",
             headers={"X-Local-User": "route-tenant-a"},
         )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["id"], self._integer_task_id)
-        self.assertEqual(response.json()["session_id"], "integer-route-target")
+        self.assertEqual(response.json()["task_id"], self._public_task_id)
+        self.assertNotIn("id", response.json())
+        self.assertNotIn("session_id", response.json())
 
 
 if __name__ == "__main__":

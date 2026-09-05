@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional
-import uuid
+
+from src.api.task_identity import new_task_id
 
 class WorkflowContext:
     """
@@ -7,14 +8,14 @@ class WorkflowContext:
     类似 Coze/ComfyUI 中的 payload 传递。
     """
     # 修复处：将 str = None 改为 Optional[str] = None
-    def __init__(self, session_id: Optional[str] = None,
+    def __init__(self, task_id: Optional[str] = None,
                  aspect_ratio: str = "9:16",
                  test_language: str = "en",
                  target_duration: int = 15,
                  batch_size: int = 1,
                  script_mode: str = "auto",
                  tenant_id: str = "default"):
-        self.session_id = session_id or str(uuid.uuid4())
+        self.task_id = task_id or new_task_id()
         # 多租户隔离标识，贯穿整个 Pipeline，供各节点使用专属 DB Engine
         self.tenant_id: str = tenant_id or "default"
         # 画幅比例

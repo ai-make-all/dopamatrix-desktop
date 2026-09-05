@@ -30,17 +30,17 @@ def _now() -> datetime:
 class VideoTask(Base):
     """
     一次矩阵生成任务。
-    - session_id : 对应 WorkflowContext 中的 session_id
-    - status     : pending → processing → completed | failed
+    - task_id    : DopaMatrix 为一次提交生成的公开 UUID
+    - status     : queued → processing → completed | failed
     """
     __tablename__ = "video_tasks"
 
     id              = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    session_id      = Column(String(64), unique=True, nullable=False, index=True)
+    task_id         = Column(String(64), unique=True, nullable=False, index=True)
     prompt          = Column(Text, nullable=False)               # 剧本要求
     batch_size      = Column(Integer, nullable=False, default=1) # 矩阵数量
-    status          = Column(String(20), nullable=False, default="pending")
-                                                                 # pending/processing/completed/failed
+    status          = Column(String(20), nullable=False, default="queued")
+                                                                 # queued/processing/completed/failed
     created_at      = Column(DateTime(timezone=True), nullable=False, default=_now)
     finished_at     = Column(DateTime(timezone=True), nullable=True)
 
@@ -58,7 +58,7 @@ class VideoTask(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<VideoTask id={self.id} session={self.session_id} status={self.status}>"
+        return f"<VideoTask id={self.id} task_id={self.task_id} status={self.status}>"
 
 
 # ================================================================== #
@@ -156,7 +156,7 @@ class VariantApproval(Base):
     记录每个视频变体的质检审批状态。
 
     主键语义：(task_id, asset_hash) 联合唯一
-      task_id   : 对应 TaskHistory.task_id（session UUID hex）
+      task_id   : 对应 TaskHistory.task_id（DopaMatrix server UUID）
       asset_hash: 视频文件 MD5（TaskHistory.output_assets[].hash）
 
     status 生命周期：PROCESSING → PENDING → APPROVED | REJECTED → DELETED

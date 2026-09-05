@@ -11,7 +11,7 @@ class WorkflowEngine:
         self.nodes.append(node)
 
     def run(self, context: WorkflowContext) -> WorkflowContext:
-        print(f"🚀 Starting DopaMatrix Engine | Session: {context.session_id}")
+        print(f"🚀 Starting DopaMatrix Engine | Task: {context.task_id}")
         for node in self.nodes:
             node.log("Start executing...")
             context = node.execute(context)

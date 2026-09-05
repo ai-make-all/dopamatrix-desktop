@@ -12,7 +12,6 @@ DopaMatrix — 核心 API 路由。
 from __future__ import annotations
 
 import os
-import uuid
 from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
@@ -29,6 +28,7 @@ from .schemas import (
     TaskSubmitAck,
 )
 from .services import run_matrix_job
+from .public_task_admission import admit_public_task, transition_public_task_status
 from src.core.logger import LOG_DIR
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
@@ -82,55 +82,48 @@ def submit_task(
     # 0. 获取当前租户标识
     tenant_id: str = request.headers.get("X-Local-User", "default")
 
-    # 1. 生成 session_id
-    session_id: str = payload.session_id or uuid.uuid4().hex[:12]
+    admission = admit_public_task(
+        db.get_bind(),
+        prompt=payload.prompt,
+        batch_size=payload.batch_size,
+    )
 
-    # 2. 防止重复提交
-    existing = db.query(VideoTask).filter(VideoTask.session_id == session_id).first()
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"session_id '{session_id}' 已存在，请换一个或不传（自动生成）。",
+    try:
+        background_tasks.add_task(
+            run_matrix_job,
+            video_task_id=admission.video_task_id,
+            task_id=admission.task_id,
+            prompt=payload.prompt,
+            batch_size=payload.batch_size,
+            aspect_ratio=payload.aspect_ratio,
+            test_language=payload.test_language,
+            target_duration=payload.target_duration,
+            output_dir=payload.output_dir,
+            webhook_url=payload.webhook_url,
+            client_payload=payload.client_payload,
+            tenant_id=tenant_id,
+            script_mode=payload.script_mode,
         )
-
-    # 3. 写入数据库（初始状态 queued）
-    task = VideoTask(
-        session_id = session_id,
-        prompt     = payload.prompt,
-        batch_size = payload.batch_size,
-        status     = "queued",          # ← 注意：由 pending 改为 queued
-    )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-
-    # 4. 把实际运行逻辑投入后台（BackgroundTask 拿到 task.id 后内部独立开 Session）
-    background_tasks.add_task(
-        run_matrix_job,
-        task_id           = task.id,
-        session_id        = session_id,
-        prompt            = payload.prompt,
-        batch_size        = payload.batch_size,
-        aspect_ratio      = payload.aspect_ratio,
-        test_language     = payload.test_language,
-        target_duration   = payload.target_duration,
-        output_dir        = payload.output_dir,
-        webhook_url       = payload.webhook_url,
-        client_payload    = payload.client_payload,
-        tenant_id         = tenant_id,
-        script_mode       = payload.script_mode,
-    )
+    except Exception:
+        try:
+            transition_public_task_status(
+                db.get_bind(),
+                task_id=admission.task_id,
+                target_status="failed",
+            )
+        except Exception:
+            pass
+        raise
 
     from src.core.logger import logger
     logger.info(
-        f"[routes] 任务已入队 task_id={task.id} session={session_id}"
+        f"[routes] 任务已入队 task_id={admission.task_id}"
         f" ratio={payload.aspect_ratio} lang={payload.test_language} duration={payload.target_duration}s"
     )
 
     # 5. 秒回 202（HTTP 请求绝不阻塞 2 分钟！）
     return TaskSubmitAck(
-        task_id=task.id,
-        session_id=session_id,
+        task_id=admission.task_id,
         status="queued",
         message="任务已提交至后台矩阵工厂，请通过 GET /tasks/{task_id} 轮询进度。",
     )
@@ -146,13 +139,13 @@ def submit_task(
     description="返回任务状态与全部关联的视频资产（含 file_hash / perceptual_hash）。",
 )
 def get_task(
-    task_id: int,
+    task_id: str,
     db: Session = Depends(get_db),
 ) -> VideoTaskResponse:
     task = (
         db.query(VideoTask)
         .options(selectinload(VideoTask.assets))   # 一次查询加载关联资产，避免 N+1
-        .filter(VideoTask.id == task_id)
+        .filter(VideoTask.task_id == task_id)
         .first()
     )
     if task is None:

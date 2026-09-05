@@ -38,7 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from pyngrok import ngrok
 
 from src.core.logger import setup_logger, logger
-from src.api.database import engine, Base, evolve_schema
+from src.api.database import engine, initialize_application_schema
 from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
 from src.api import routes_assets
@@ -76,8 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ---- 启动阶段 ---- #
     logger.info("[DopaMatrix] 正在初始化数据库表结构…")
-    Base.metadata.create_all(bind=engine)
-    evolve_schema(engine)
+    initialize_application_schema(engine)
     logger.info("[DopaMatrix] 数据库就绪 ✓")
 
     # ---- 注入事件循环到 WebSocket 广播中枢 ---- #

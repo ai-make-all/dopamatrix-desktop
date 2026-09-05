@@ -74,8 +74,8 @@ def _estimate_cost(tokens: int, tts_seconds: float) -> float:
 # ------------------------------------------------------------------ #
 
 def run_matrix_job(
-    task_id:           int,
-    session_id:        str,
+    video_task_id:     int,
+    task_id:           str,
     prompt:            str,
     batch_size:        int,
     aspect_ratio:      str = "9:16",
@@ -94,8 +94,8 @@ def run_matrix_job(
     任务终态后直接调用 reporting.notify_task_result 向 Telegram 群推送战报。
 
     Args:
-        task_id:            video_tasks 表的主键
-        session_id:         日志追踪用
+        video_task_id:      video_tasks 表的内部整数主键
+        task_id:            DopaMatrix 生成的公开任务 UUID
         prompt:             剧本提示词
         batch_size:         矩阵变体数量
         aspect_ratio:       画幅比例
@@ -128,7 +128,7 @@ def run_matrix_job(
 
     try:
         # 1. 标记任务为 processing
-        task: Optional[VideoTask] = db.get(VideoTask, task_id)
+        task: Optional[VideoTask] = db.get(VideoTask, video_task_id)
         if task is None:
             logger.warning(f"[services] task_id={task_id} 在数据库中不存在，终止。")
             return
@@ -136,7 +136,7 @@ def run_matrix_job(
         task.status = "processing"
         db.commit()
         logger.info(
-            f"[services] task_id={task_id} | session={session_id} "
+            f"[services] task_id={task_id} "
             f"| lang={test_language} | 开始运行矩阵工厂…"
         )
 
@@ -147,7 +147,7 @@ def run_matrix_job(
             ws_manager.make_envelope(
                 "WS_UPDATE",
                 {
-                    "taskId":    str(task_id),
+                    "taskId":    task_id,
                     "status":    "running",
                     "prompt":    prompt,
                     "startTime": int(start_time * 1000),
@@ -165,6 +165,7 @@ def run_matrix_job(
             output_dir=output_dir,
             script_mode=script_mode,
             tenant_id=tenant_id,
+            task_id=task_id,
         )
 
         # 3. 统计成本 & 收集资产
@@ -178,7 +179,7 @@ def run_matrix_job(
             if not result.get("success"):
                 # 将 worker 的失败原因写入日志文件，便于打包后排查（print 在 --windowed 模式下无效）
                 logger.error(
-                    f"[services] task_id={task_id} worker session={result.get('session_id', '?')} "
+                    f"[services] task_id={task_id} worker failed "
                     f"失败: {result.get('error', 'unknown')} | "
                     f"traceback: {result.get('traceback', '')[:500]}"
                 )
@@ -202,7 +203,7 @@ def run_matrix_job(
 
                 fh = _md5_file(file_path)
                 asset = VideoAsset(
-                    task_id         = task_id,
+                    task_id         = video_task_id,
                     file_path       = file_path,
                     language        = lang,
                     file_hash       = fh,
@@ -260,7 +261,7 @@ def run_matrix_job(
             # 使用精准的系统时间差，保留 1 位小数
             real_duration = round(time.time() - start_time, 1)
             history_record = TaskHistory(
-                task_id=session_id, # 根据业务需求，通常用可以对外暴露的 session_id 或 UUID
+                task_id=task_id,
                 prompt=prompt,
                 batch_size=batch_size,
                 duration=real_duration, 
@@ -295,7 +296,7 @@ def run_matrix_job(
             ws_manager.make_envelope(
                 "WS_UPDATE",
                 {
-                    "taskId": str(task_id),
+                    "taskId": task_id,
                     "status": "completed",
                     "assets": [
                         {"file_path": a.file_path, "file_hash": a.file_hash}
@@ -308,7 +309,7 @@ def run_matrix_job(
     except Exception as e:
         logger.exception(f"任务 {task_id} 发生未知崩溃！耗时: {time.time() - start_time:.2f} 秒")
         try:
-            task = db.get(VideoTask, task_id)
+            task = db.get(VideoTask, video_task_id)
             if task:
                 task.status      = "failed"
                 task.finished_at = _now()
@@ -323,7 +324,7 @@ def run_matrix_job(
                 ws_manager.make_envelope(
                     "WS_UPDATE",
                     {
-                        "taskId": str(task_id),
+                        "taskId": task_id,
                         "status": "failed",
                     },
                 )
@@ -338,7 +339,6 @@ def run_matrix_job(
         # run_matrix_job 运行于 FastAPI 线程池 worker，无事件循环，asyncio.run() 安全。
         _report_payload: dict[str, Any] = {
             "task_id":            task_id,
-            "session_id":         session_id,
             "status":             _final_status,
             "assets":             _webhook_assets,
             "estimated_cost_usd": round(_cost_usd, 6),

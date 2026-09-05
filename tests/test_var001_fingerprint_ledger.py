@@ -456,7 +456,14 @@ class TenantAuthorityTests(unittest.TestCase):
         background = Mock()
         parser = Mock()
         parser.parse_and_resolve.return_value = preview
-        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+        with (
+            patch.object(routes_dsl, "DSLParserNode", return_value=parser),
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value="admitted-test-task",
+            ),
+        ):
             routes_dsl.submit_dsl(
                 request_model,
                 background,

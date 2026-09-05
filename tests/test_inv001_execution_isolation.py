@@ -6,7 +6,7 @@ import unittest
 import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi import BackgroundTasks
 
@@ -62,11 +62,10 @@ def _renderable_plan() -> CompilationPlan:
     )
 
 
-def _request(*, task_id: str, timeline: list[DSLBeatNode]) -> RenderDSLRequest:
+def _request(*, timeline: list[DSLBeatNode]) -> RenderDSLRequest:
     return RenderDSLRequest(
         engine_type="content",
         timeline=timeline,
-        session_id=task_id,
         prompt="A short test script",
         batch_size=1,
     )
@@ -132,12 +131,20 @@ class ChildIdentityTests(unittest.TestCase):
             asset_hashes=["asset-hash"],
             script_text="A short test script",
         )
-        normal_request = _request(task_id=task_id, timeline=[beat])
-        blind_request = _request(task_id=task_id, timeline=[])
+        normal_request = _request(timeline=[beat])
+        blind_request = _request(timeline=[])
         plan = _renderable_plan()
         execution_ids: list[str] = []
 
-        with patch.object(routes_dsl, "DSLParserNode") as parser_cls:
+        with (
+            patch.object(routes_dsl, "DSLParserNode") as parser_cls,
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value=task_id,
+            ),
+            patch.object(routes_dsl, "transition_public_task_status"),
+        ):
             parser_cls.return_value.parse_and_resolve.return_value = plan
             cases = (
                 ("ai-draft", routes_dsl.submit_dsl, normal_request),
@@ -149,7 +156,7 @@ class ChildIdentityTests(unittest.TestCase):
             for label, endpoint, payload in cases:
                 with self.subTest(path=label):
                     background = BackgroundTasks()
-                    endpoint(payload, background, db=object())
+                    endpoint(payload, background, db=Mock())
                     arguments = _scheduled_coordinator_arguments(background)
                     captured: list[dict] = []
 
@@ -190,6 +197,7 @@ class ChildIdentityTests(unittest.TestCase):
                         patch.object(routes_dsl, "_persist_task_history"),
                         patch.object(routes_dsl.ws_manager, "broadcast_sync"),
                     ):
+                        background.tasks[0].kwargs["public_task_admitted"] = False
                         background.tasks[0].func(
                             *background.tasks[0].args,
                             **background.tasks[0].kwargs,
@@ -305,7 +313,7 @@ class WorkerContextTests(unittest.TestCase):
 
         self.assertEqual(len(captured_contexts), 1)
         context = captured_contexts[0]
-        self.assertEqual(context.session_id, task_id)
+        self.assertEqual(context.task_id, task_id)
         self.assertEqual(context.config["execution_id"], child.execution_id)
         self.assertEqual(context.config["file_sid"], child.file_sid)
         self.assertEqual(context.config["child_index"], 0)

@@ -19,11 +19,15 @@ import sqlite3
 import threading
 
 from fastapi import Request
-from sqlalchemy import create_engine, event, inspect as sa_inspect, text
+from sqlalchemy import String, create_engine, event, inspect as sa_inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 logger = logging.getLogger(__name__)
+
+
+class TaskIdentitySchemaError(RuntimeError):
+    """The operational task table cannot satisfy the clean task-ID contract."""
 
 
 # ------------------------------------------------------------------ #
@@ -159,6 +163,49 @@ def evolve_schema(engine) -> None:
         )
 
 
+def verify_video_task_identity_schema(engine) -> None:
+    """Fail closed when an existing DB uses the removed ``session_id`` schema.
+
+    B1R intentionally has no mixed-mode or destructive runtime migration. An
+    operator must archive/remove the incompatible DB outside the application,
+    then allow DopaMatrix to create a fresh schema.
+    """
+    from .task_identity import VIDEO_TASK_TASK_ID_SCHEMA_RESET_REQUIRED
+
+    inspector = sa_inspect(engine)
+    if "video_tasks" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"]: column for column in inspector.get_columns("video_tasks")}
+    task_column = columns.get("task_id")
+    if "session_id" in columns or task_column is None:
+        raise TaskIdentitySchemaError(VIDEO_TASK_TASK_ID_SCHEMA_RESET_REQUIRED)
+    if task_column.get("nullable", True) or not isinstance(task_column["type"], String):
+        raise TaskIdentitySchemaError(VIDEO_TASK_TASK_ID_SCHEMA_RESET_REQUIRED)
+
+    unique_column_sets = {
+        tuple(constraint.get("column_names") or ())
+        for constraint in inspector.get_unique_constraints("video_tasks")
+    }
+    unique_column_sets.update(
+        tuple(index.get("column_names") or ())
+        for index in inspector.get_indexes("video_tasks")
+        if index.get("unique")
+    )
+    if ("task_id",) not in unique_column_sets:
+        raise TaskIdentitySchemaError(VIDEO_TASK_TASK_ID_SCHEMA_RESET_REQUIRED)
+
+
+def initialize_application_schema(engine) -> None:
+    """Create/evolve tables only after ruling out ambiguous task-ID storage."""
+    verify_video_task_identity_schema(engine)
+    from .models import Base as ModelBase
+
+    ModelBase.metadata.create_all(bind=engine)
+    evolve_schema(engine)
+    verify_video_task_identity_schema(engine)
+
+
 # ------------------------------------------------------------------ #
 # 多租户 Engine 缓存                                                    #
 # ------------------------------------------------------------------ #
@@ -192,12 +239,15 @@ def get_tenant_engine(tenant_id: str | None):
             engine = create_engine(db_path, connect_args={"check_same_thread": False})
             event.listen(engine, "connect", _set_sqlite_foreign_key_pragma)
 
-            # 延迟导入 Base 避免循环依赖，并为新租户自动建表
-            from .models import Base as ModelBase
-            ModelBase.metadata.create_all(bind=engine)
-            evolve_schema(engine)  # 自愈迁移：补齐老库中缺失的新增列
-            from .fingerprint_ledger import ensure_fingerprint_ledger_schema
-            ensure_fingerprint_ledger_schema(engine)
+            try:
+                # Existing session_id-era task storage is rejected before the
+                # additive evolver can create an ambiguous mixed schema.
+                initialize_application_schema(engine)
+                from .fingerprint_ledger import ensure_fingerprint_ledger_schema
+                ensure_fingerprint_ledger_schema(engine)
+            except Exception:
+                engine.dispose()
+                raise
 
             _tenant_engines[safe_tenant_id] = engine
 

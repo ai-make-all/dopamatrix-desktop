@@ -51,7 +51,7 @@ class CoverNode(BaseNode):
         logger.info("=" * 60)
         logger.info("[CoverNode] 🚀 封面抽帧节点已激活 (Phase 9.8.2)")
         logger.info(
-            f"[CoverNode] task_id={context.session_id} "
+            f"[CoverNode] task_id={context.task_id} "
             f"execution_id={context.config.get('execution_id')} "
             f"child_index={context.config.get('child_index')} "
             f"file_sid={self._resolve_file_sid(context)} "
@@ -129,11 +129,8 @@ class CoverNode(BaseNode):
         if "child_index" in context.config or "execution_id" in context.config:
             raise RuntimeError("[CoverNode] child context is missing file_sid")
 
-        # LEGACY FALLBACK: an explicitly configured alias remains authoritative,
-        # including the historical empty-string value.
-        if "session_id" in context.config:
-            return str(context.config["session_id"])
-        return str(context.session_id)
+        # Legacy direct calls without child markers use their task namespace.
+        return str(context.task_id)
 
     @classmethod
     def _cover_output_path(cls, context: WorkflowContext, video_path: str) -> str:

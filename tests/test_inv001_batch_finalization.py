@@ -410,7 +410,7 @@ class WorkerFinalizationBoundaryTests(unittest.TestCase):
         ws.assert_not_called()
 
     def test_compositor_child_failure_suppresses_failed_but_keeps_running(self):
-        context = WorkflowContext(session_id="shared-task")
+        context = WorkflowContext(task_id="shared-task")
         context.config["ws_terminal_managed_by_coordinator"] = True
         context.set_asset("timeline", SimpleNamespace(tracks=[], audio_tracks=[]))
         context.variants = {"en": {}}
@@ -433,7 +433,7 @@ class WorkerFinalizationBoundaryTests(unittest.TestCase):
         self.assertEqual(statuses, ["running"])
 
     def test_compositor_legacy_failure_still_emits_failed(self):
-        context = WorkflowContext(session_id="legacy-task")
+        context = WorkflowContext(task_id="legacy-task")
         context.set_asset("timeline", SimpleNamespace(tracks=[], audio_tracks=[]))
         context.variants = {"en": {}}
         node = FFmpegCompositorNode()
@@ -455,7 +455,7 @@ class WorkerFinalizationBoundaryTests(unittest.TestCase):
         self.assertEqual(statuses, ["running", "failed"])
 
     def test_compositor_child_master_process_failure_suppresses_failed(self):
-        context = WorkflowContext(session_id="shared-task")
+        context = WorkflowContext(task_id="shared-task")
         context.config["ws_terminal_managed_by_coordinator"] = True
         context.set_asset("timeline", SimpleNamespace(tracks=[], audio_tracks=[]))
         context.variants = {"en": {}}
@@ -490,7 +490,7 @@ class WorkerFinalizationBoundaryTests(unittest.TestCase):
         self.assertEqual(statuses, ["running"])
 
     def test_compositor_child_variant_failure_suppresses_failed(self):
-        context = WorkflowContext(session_id="shared-task")
+        context = WorkflowContext(task_id="shared-task")
         context.config["ws_terminal_managed_by_coordinator"] = True
         context.set_asset("timeline", SimpleNamespace(tracks=[], audio_tracks=[]))
         context.variants = {"en": {}}

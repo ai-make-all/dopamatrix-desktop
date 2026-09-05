@@ -114,7 +114,14 @@ class PlanningPolicyRouteTests(unittest.TestCase):
         parser.parse_and_resolve.return_value = _plan()
         background = Mock()
 
-        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+        with (
+            patch.object(routes_dsl, "DSLParserNode", return_value=parser),
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value="admitted-test-task",
+            ),
+        ):
             response = routes_dsl.submit_dsl(
                 _request(variant_planning_policy="exact_main_visual"),
                 background,
@@ -156,7 +163,14 @@ class PlanningPolicyRouteTests(unittest.TestCase):
         parser.parse_and_resolve.return_value = _plan()
         background = Mock()
 
-        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+        with (
+            patch.object(routes_dsl, "DSLParserNode", return_value=parser),
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value="admitted-test-task",
+            ),
+        ):
             response = routes_dsl.submit_dsl(
                 _request(variant_planning_policy="exact_main_visual_balanced"),
                 background,
@@ -179,7 +193,14 @@ class PlanningPolicyRouteTests(unittest.TestCase):
         parser.parse_and_resolve.return_value = _plan()
         background = Mock()
 
-        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+        with (
+            patch.object(routes_dsl, "DSLParserNode", return_value=parser),
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value="admitted-test-task",
+            ),
+        ):
             response = routes_dsl.submit_manual(
                 _request(),
                 background,
@@ -195,7 +216,14 @@ class PlanningPolicyRouteTests(unittest.TestCase):
         parser.parse_and_resolve.return_value = _plan()
         background = Mock()
 
-        with patch.object(routes_dsl, "DSLParserNode", return_value=parser):
+        with (
+            patch.object(routes_dsl, "DSLParserNode", return_value=parser),
+            patch.object(
+                routes_dsl,
+                "_admit_dsl_public_task",
+                return_value="admitted-test-task",
+            ),
+        ):
             response = routes_dsl.render_dsl(
                 _request(),
                 background,

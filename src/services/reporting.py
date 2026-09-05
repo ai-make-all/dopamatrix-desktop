@@ -137,8 +137,7 @@ async def notify_task_result(payload: dict, tenant_id: Optional[str] = None) -> 
 
     payload 结构（与 services.py 中的 _report_payload 保持一致）：
       {
-        "task_id":            int,
-        "session_id":         str,
+        "task_id":            str,
         "status":             "completed" | "failed",
         "assets":             [{"path": ..., "hash": ..., "download_url": ...}],
         "estimated_cost_usd": float,

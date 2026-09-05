@@ -49,12 +49,8 @@ def _resolve_execution_namespace(context: WorkflowContext) -> str:
         raise RuntimeError("[SubtitleNode] child context is missing execution_id")
 
     # LEGACY DIRECT-CALL FALLBACK: older factory pipelines use a per-run
-    # context.session_id but do not yet populate config["execution_id"].
-    legacy_id = (
-        getattr(context, "session_id", None)
-        or context.config.get("session_id")
-        or "default"
-    )
+    # context.task_id but do not yet populate config["execution_id"].
+    legacy_id = getattr(context, "task_id", None) or "default"
     logger.warning(
         f"[SubtitleNode] execution_id missing; using legacy direct-call namespace={legacy_id}"
     )
@@ -428,7 +424,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 execution_id = _resolve_execution_namespace(context)
                 ass_path = str(output_dir / f"sub_{execution_id}_{target_lang}.ass")
                 self.log(
-                    f"[{target_lang}] task_id={context.session_id} "
+                    f"[{target_lang}] task_id={context.task_id} "
                     f"execution_id={execution_id} "
                     f"child_index={context.config.get('child_index')} "
                     f"file_sid={context.config.get('file_sid')} ASS={ass_path}"
@@ -463,7 +459,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         execution_id = _resolve_execution_namespace(context)
         ass_path = str(output_dir / f"sub_{execution_id}_{target_lang}.ass")
         self.log(
-            f"[{target_lang}] task_id={context.session_id} execution_id={execution_id} "
+            f"[{target_lang}] task_id={context.task_id} execution_id={execution_id} "
             f"child_index={context.config.get('child_index')} "
             f"file_sid={context.config.get('file_sid')} ASS={ass_path}"
         )

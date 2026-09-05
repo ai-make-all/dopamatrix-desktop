@@ -50,14 +50,9 @@ def _resolve_execution_namespace(context: WorkflowContext) -> str:
     if "child_index" in context.config or "file_sid" in context.config:
         raise RuntimeError("[TTSNode] child context is missing execution_id")
 
-    # LEGACY DIRECT-CALL FALLBACK: run_factory/run_matrix_factory contexts do
-    # not yet carry execution_id. Their context.session_id remains their
-    # historical per-run namespace.
-    legacy_id = (
-        getattr(context, "session_id", None)
-        or context.config.get("session_id")
-        or "default"
-    )
+    # LEGACY DIRECT-CALL FALLBACK: a direct context without child markers uses
+    # its task namespace.
+    legacy_id = getattr(context, "task_id", None) or "default"
     logger.warning(
         f"[TTSNode] execution_id missing; using legacy direct-call namespace={legacy_id}"
     )
@@ -215,7 +210,7 @@ class TTSNode(BaseNode):
         vtt_path    = self._output_dir / f"voice_{execution_id}_{target_lang}.vtt"
 
         self.log(
-            f"[{target_lang}] task_id={context.session_id} execution_id={execution_id} "
+            f"[{target_lang}] task_id={context.task_id} execution_id={execution_id} "
             f"child_index={context.config.get('child_index')} "
             f"file_sid={context.config.get('file_sid')} voice={voice} | "
             f"text_length={len(text)} chars → MP3={output_path} VTT={vtt_path}"

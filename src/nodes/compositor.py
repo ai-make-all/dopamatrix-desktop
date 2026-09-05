@@ -75,9 +75,8 @@ class FFmpegCompositorNode(BaseNode):
                 "[FFmpegCompositorNode] child context is missing file_sid"
             )
 
-        # LEGACY FALLBACK: run_matrix_factory still publishes its historical
-        # short token through config["session_id"]. New API code uses file_sid.
-        return str(context.config.get("session_id") or "")
+        # Legacy direct calls without child markers use their task namespace.
+        return str(context.task_id)
 
     @classmethod
     def _master_output_path(cls, context: WorkflowContext) -> str:
@@ -123,7 +122,7 @@ class FFmpegCompositorNode(BaseNode):
           3. 定向推送（user_id）确保多租户隔离，防止跨用户数据串流
 
         Args:
-            task_id: 前端 queueWorker 中对应的任务 ID（= context.session_id）
+            task_id: 前端 queueWorker 中对应的任务 ID（= context.task_id）
             user_id: 广播目标用户（= context.tenant_id），传入则为定向推送
             extra:   追加到 payload 的业务字段（status / progress / assets 等）
         """
@@ -689,7 +688,7 @@ class FFmpegCompositorNode(BaseNode):
         full_filtergraph = video_fg
 
         # 4. 组装完整 FFmpeg 命令（无音频流：生成静音母带）
-        task_id:   str = context.session_id   # WS 任务 ID，与前端 queueWorker 对齐
+        task_id:   str = context.task_id   # WS 任务 ID，与前端 queueWorker 对齐
         user_id:   str = context.tenant_id    # 定向推送目标，防止多租户数据串流
         file_sid = self._resolve_file_sid(context)
         output_path = self._master_output_path(context)
@@ -856,7 +855,7 @@ class FFmpegCompositorNode(BaseNode):
             return
 
         # WS 推送上下文（与 execute() 保持一致，使用同一 task_id / user_id）
-        task_id: str = context.session_id
+        task_id: str = context.task_id
         user_id: str = context.tenant_id
 
         # 拉取 timeline，用于读取 BGM/SFX audio_tracks
