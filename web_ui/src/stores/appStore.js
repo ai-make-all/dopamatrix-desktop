@@ -17,6 +17,7 @@ export const useAppStore = defineStore('app', () => {
       isLoggedIn.value   = true
       axios.defaults.headers.common['X-Local-User'] = stored
     }
+    hydrateDeliveryRoot()
   }
 
   function handleLogin(username) {
@@ -24,11 +25,11 @@ export const useAppStore = defineStore('app', () => {
     loggedInUser.value = username
     isLoggedIn.value   = true
     axios.defaults.headers.common['X-Local-User'] = username
+    hydrateDeliveryRoot()
   }
 
   function handleLogout() {
     localStorage.removeItem('dopamatrix_user')
-    localStorage.removeItem('dopamatrix_output_dir')
     loggedInUser.value = ''
     isLoggedIn.value   = false
     delete axios.defaults.headers.common['X-Local-User']
@@ -211,11 +212,23 @@ export const useAppStore = defineStore('app', () => {
   }
 
   // ── Shared state ──────────────────────────────────────────────────────────
-  const globalOutputDir = ref(localStorage.getItem('dopamatrix_output_dir') || '')
+  const globalOutputDir = ref('')
 
-  function setGlobalOutputDir(path) {
-    globalOutputDir.value = path
-    localStorage.setItem('dopamatrix_output_dir', path)
+  async function hydrateDeliveryRoot() {
+    try {
+      const response = await axios.get(`${API_BASE}/api/v1/settings/delivery-root`)
+      globalOutputDir.value = response.data.delivery_root || ''
+    } catch (error) {
+      console.error('[Delivery Root] hydration failed', error)
+    }
+  }
+
+  async function setGlobalOutputDir(path) {
+    const response = await axios.post(`${API_BASE}/api/v1/settings/delivery-root`, {
+      delivery_root: path || '',
+    })
+    globalOutputDir.value = response.data.delivery_root || ''
+    return globalOutputDir.value
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -269,7 +282,7 @@ export const useAppStore = defineStore('app', () => {
     clearPollTimer, startGlobalPolling,
     pushQueuedItem, setFeedItemTaskId, markFeedItemFailed,
     // Shared state
-    globalOutputDir, setGlobalOutputDir,
+    globalOutputDir, hydrateDeliveryRoot, setGlobalOutputDir,
     // Helpers
     buildVideoUrl, copyToClipboard, dashStats,
     // Constants

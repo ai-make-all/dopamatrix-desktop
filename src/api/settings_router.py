@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 
 from .database import SETTINGS_DB_PATH
+from .delivery_output import get_delivery_root, save_delivery_root
 from src.services.llm_provider import invalidate_api_key_cache
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
@@ -89,6 +90,15 @@ class LLMKeyResponse(BaseModel):
     is_configured: bool
 
 
+class DeliveryRootPayload(BaseModel):
+    delivery_root: str = ""
+
+
+class DeliveryRootResponse(BaseModel):
+    delivery_root: str
+    is_configured: bool
+
+
 # ================================================================== #
 # 路由实现                                                              #
 # ================================================================== #
@@ -150,3 +160,47 @@ def save_llm_key(payload: LLMKeyPayload) -> dict:
     invalidate_api_key_cache(_KEY_OPENAI)
 
     return {"status": "ok"}
+
+
+@router.get(
+    "/delivery-root",
+    response_model=DeliveryRootResponse,
+    summary="Get the machine-global Delivery Root",
+)
+def read_delivery_root() -> DeliveryRootResponse:
+    try:
+        delivery_root = get_delivery_root()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to read Delivery Root",
+        ) from exc
+    return DeliveryRootResponse(
+        delivery_root=delivery_root,
+        is_configured=bool(delivery_root),
+    )
+
+
+@router.post(
+    "/delivery-root",
+    response_model=DeliveryRootResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Save the machine-global Delivery Root",
+)
+def write_delivery_root(payload: DeliveryRootPayload) -> DeliveryRootResponse:
+    try:
+        delivery_root = save_delivery_root(payload.delivery_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to save Delivery Root",
+        ) from exc
+    return DeliveryRootResponse(
+        delivery_root=delivery_root,
+        is_configured=bool(delivery_root),
+    )

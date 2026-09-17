@@ -26,25 +26,31 @@ DopaMatrix — 审批状态机 & 交付包导出 API（Phase 9.13）
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import logging
 import os
 import re
-import time
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from .database import get_db, get_tenant_engine
+from .database import get_db, get_tenant_engine, request_tenant_id
+from .delivery_output import derive_export_delivery_dir, get_delivery_root
 from .models import TaskHistory, VariantApproval
 from .approval_service import batch_update_variant_status, ensure_pending_variant_records
 from .approval_types import VariantStatus
 from src.services.tracking_adapter import CloudflareKVAdapter
+
+logger = logging.getLogger(__name__)
 
 # 模块级单例，复用 httpx 连接池（Mock 模式下无网络开销）
 _tracking_adapter = CloudflareKVAdapter()
@@ -203,11 +209,46 @@ def _normalize_export_hashes(hashes: list[str]) -> list[str]:
     return list(dict.fromkeys(asset_hash.strip() for asset_hash in hashes if asset_hash.strip()))
 
 
-def _safe_export_filename(filename: str) -> str:
-    safe_name = os.path.basename(filename or "")
-    if not safe_name.startswith("dopamatrix_delivery_") or not safe_name.endswith(".zip"):
+_EXPORT_FILENAME = re.compile(r"^dopamatrix_delivery_[A-Za-z0-9_-]+\.zip$")
+
+
+def _tenant_export_token(canonical_tenant: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9_-]", "_", canonical_tenant)[:24] or "tenant"
+    digest = hashlib.sha256(canonical_tenant.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}_{digest}"
+
+
+def _new_export_filename(canonical_tenant: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        f"dopamatrix_delivery_{_tenant_export_token(canonical_tenant)}_"
+        f"{timestamp}_{uuid.uuid4().hex[:8]}.zip"
+    )
+
+
+def _safe_export_filename(
+    filename: str,
+    *,
+    canonical_tenant: str | None = None,
+) -> str:
+    safe_name = filename or ""
+    if os.path.basename(safe_name) != safe_name or not _EXPORT_FILENAME.fullmatch(safe_name):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid export filename")
+    if canonical_tenant is not None:
+        expected_prefix = f"dopamatrix_delivery_{_tenant_export_token(canonical_tenant)}_"
+        if not safe_name.startswith(expected_prefix):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
     return safe_name
+
+
+def _export_directory_for_tenant(canonical_tenant: str) -> str:
+    delivery_root = get_delivery_root()
+    if delivery_root:
+        export_dir = derive_export_delivery_dir(delivery_root, canonical_tenant)
+    else:
+        export_dir = os.path.abspath(EXPORT_DIR)
+    os.makedirs(export_dir, exist_ok=True)
+    return str(export_dir)
 
 
 def _fallback_short_link(asset_hash: str) -> str:
@@ -219,7 +260,10 @@ def _generate_resilient_short_link(long_url: str, asset_hash: str) -> str:
     try:
         return _tracking_adapter.generate_short_link(long_url, asset_hash or "")
     except Exception as exc:
-        print(f"⚠️ [Delivery Hub] CF 短链写入失败，已降级为本地 mock 链接: {exc}")
+        logger.warning(
+            "[Delivery Hub] short-link fallback error=%s",
+            type(exc).__name__,
+        )
         return _fallback_short_link(asset_hash)
 
 
@@ -312,10 +356,16 @@ def background_build_zip(
     account_id: str = "Tk01",
     core_tag: str = "CoreTag",
     landing_base: str = "https://your-domain.com/landing",
+    export_dir: str | None = None,
 ) -> None:
     """后台独立线程：执行耗时 ZIP 压缩、CF 容灾短链回填与落盘。"""
-    safe_filename = _safe_export_filename(filename)
-    zip_path = os.path.join(EXPORT_DIR, safe_filename)
+    safe_filename = _safe_export_filename(
+        filename,
+        canonical_tenant=tenant_id,
+    )
+    resolved_export_dir = export_dir or _export_directory_for_tenant(tenant_id)
+    os.makedirs(resolved_export_dir, exist_ok=True)
+    zip_path = os.path.join(resolved_export_dir, safe_filename)
     tmp_path = f"{zip_path}.partial"
     failed_path = f"{zip_path}.failed"
 
@@ -335,14 +385,22 @@ def background_build_zip(
             landing_base=landing_base,
         )
         os.replace(tmp_path, zip_path)
-        print(f"✅ [Delivery Hub] 交付包后台落盘成功: {zip_path} ({exported_count} assets)")
+        logger.info(
+            "[Delivery Hub] export completed path=%s assets=%d",
+            zip_path,
+            exported_count,
+        )
     except Exception as exc:
         db.rollback()
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         with open(failed_path, "w", encoding="utf-8") as fh:
             fh.write(str(exc))
-        print(f"❌ [Delivery Hub] 交付包后台落盘失败: {safe_filename} - {exc}")
+        logger.error(
+            "[Delivery Hub] export failed filename=%s error=%s",
+            safe_filename,
+            type(exc).__name__,
+        )
     finally:
         db.close()
 
@@ -370,8 +428,9 @@ async def request_export(
     if not requested_hashes:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无有效变体 hashes")
 
-    filename = f"dopamatrix_delivery_{int(time.time())}.zip"
-    tenant_id = request.headers.get("X-Local-User", "default") or "default"
+    tenant_id = request_tenant_id(request)
+    filename = _new_export_filename(tenant_id)
+    export_dir = _export_directory_for_tenant(tenant_id)
     bg_tasks.add_task(
         background_build_zip,
         requested_hashes,
@@ -380,22 +439,49 @@ async def request_export(
         account_id,
         core_tag,
         landing_base,
+        export_dir,
     )
     return {"status": "processing", "filename": filename}
 
 
 @router.get("/export/status", summary="查询异步交付包状态")
-async def check_export_status(filename: str) -> dict:
-    safe_filename = _safe_export_filename(filename)
-    zip_path = os.path.join(EXPORT_DIR, safe_filename)
+async def check_export_status(filename: str, request: Request) -> dict:
+    tenant_id = request_tenant_id(request)
+    safe_filename = _safe_export_filename(
+        filename,
+        canonical_tenant=tenant_id,
+    )
+    export_dir = _export_directory_for_tenant(tenant_id)
+    zip_path = os.path.join(export_dir, safe_filename)
     failed_path = f"{zip_path}.failed"
 
     if os.path.exists(zip_path):
         return {
             "status": "ready",
-            "download_url": f"/exports/{safe_filename}",
+            "download_url": (
+                "/api/v1/matrix/export/download?filename="
+                f"{safe_filename}"
+            ),
             "local_path": os.path.abspath(zip_path),
         }
     if os.path.exists(failed_path):
         return {"status": "failed"}
     return {"status": "processing"}
+
+
+@router.get("/export/download", summary="Download a tenant-confined delivery ZIP")
+async def download_export(filename: str, request: Request) -> FileResponse:
+    tenant_id = request_tenant_id(request)
+    safe_filename = _safe_export_filename(
+        filename,
+        canonical_tenant=tenant_id,
+    )
+    export_dir = _export_directory_for_tenant(tenant_id)
+    zip_path = os.path.join(export_dir, safe_filename)
+    if not os.path.isfile(zip_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=safe_filename,
+    )

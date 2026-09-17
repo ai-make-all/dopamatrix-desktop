@@ -62,6 +62,7 @@ from .database import (
     get_tenant_engine,
     request_tenant_id,
 )
+from .delivery_output import publish_render_delivery_assets
 from .dsl_adapter import compile_plan_to_timeline
 from src.api.ws_manager import manager as ws_manager
 from .dsl_parser import (
@@ -3309,6 +3310,35 @@ def _persist_reservation_authoritative_terminal(
     return bool(succeeded_count)
 
 
+def _publish_authoritative_delivery_safely(
+    *,
+    history_persisted: bool,
+    assets: Sequence[dict[str, Any]],
+    tenant_id: str,
+    task_id: str,
+) -> None:
+    """Publish only catalog-authoritative assets without affecting task truth."""
+    if not history_persisted or not assets:
+        return
+    try:
+        publish_render_delivery_assets(
+            canonical_tenant=canonical_tenant_id(tenant_id),
+            task_id=task_id,
+            assets=assets,
+        )
+    except Exception as exc:
+        # The delivery module itself is fail-safe; retain this boundary so a
+        # future integration error still cannot replace authoritative truth.
+        try:
+            logger.warning(
+                "[DELIVERY_COPY_FAILED] task_id=%s category=hook error=%s",
+                task_id[:64],
+                type(exc).__name__[:64],
+            )
+        except Exception:
+            pass
+
+
 def _render_batch_worker_impl(
     dsl_payload: Optional[StoryDSLPayload],
     task_id: str,
@@ -3860,6 +3890,18 @@ def _render_batch_worker_impl(
         )
         terminal_succeeded_count = succeeded_count
         terminal_failed_count = failed_count
+
+    # Delivery Root is a non-authoritative convenience copy.  The hook is
+    # intentionally after the Reservation failure wipe branches and only runs
+    # when authoritative TaskHistory truth is known to exist.  The helper is
+    # fail-safe and cannot alter terminal or catalog truth.
+    _publish_authoritative_delivery_safely(
+        history_persisted=history_persisted,
+        assets=all_assets,
+        tenant_id=tenant_id,
+        task_id=task_id,
+    )
+
     if _terminal_target_callback is not None:
         _terminal_target_callback(final_status)
     terminal_payload: dict[str, Any] = {

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import axios from 'axios'
@@ -49,13 +49,38 @@ async function pickGlobalOutputFolder() {
   try {
     const selected = await open({ directory: true, multiple: false })
     if (selected && typeof selected === 'string') {
-      store.setGlobalOutputDir(selected)
-      store.showToast('✅ 输出目录已更新: ' + selected)
+      await store.setGlobalOutputDir(selected)
+      store.showToast('✅ Delivery Root 已更新: ' + selected)
     }
   } catch (err) {
     console.error('[Tauri Dialog] 设置目录打开失败：', err)
   }
 }
+
+async function clearDeliveryRoot() {
+  try {
+    await store.setGlobalOutputDir('')
+    store.showToast('✅ Delivery Root 已清除；渲染仅保留内部权威资产。')
+  } catch (err) {
+    store.showToast(`❌ 清除失败：${err.response?.data?.detail || err.message}`)
+  }
+}
+
+const tenantDeliveryPreview = computed(() => {
+  if (!store.globalOutputDir) return ''
+  const rawTenant = store.loggedInUser || 'default'
+  const safeTenant = Array.from(rawTenant)
+    .filter(character => /[\p{L}\p{N}_-]/u.test(character))
+    .join('') || 'default'
+  const separator = store.globalOutputDir.includes('\\') ? '\\' : '/'
+  return [
+    store.globalOutputDir.replace(/[\\/]+$/, ''),
+    'tenants',
+    safeTenant.toLowerCase(),
+    'projects',
+    '_default',
+  ].join(separator) + separator
+})
 
 async function openDiagnosticLogs() {
   try {
@@ -66,7 +91,10 @@ async function openDiagnosticLogs() {
   }
 }
 
-onMounted(loadLlmSettings)
+onMounted(() => {
+  loadLlmSettings()
+  store.hydrateDeliveryRoot()
+})
 </script>
 
 <template>
@@ -176,22 +204,32 @@ onMounted(loadLlmSettings)
       <div class="settings-card-title">
         <span class="settings-card-icon">📁</span>
         <div>
-          <div style="font-size:1.05rem; font-weight:800; color:#e2e8f0;">本地输出目录绑定</div>
+          <div style="font-size:1.05rem; font-weight:800; color:#e2e8f0;">交付根目录 <span style="color:#64748b; font-size:0.78rem; font-weight:400;">Delivery Root</span></div>
           <div style="font-size:0.75rem; color:#475569; margin-top:0.15rem;">
-            成品短视频的统一落地目录。若不设置，默认写入工程
-            <code style="color:#38bdf8; background:rgba(56,189,248,0.1); padding:0.1rem 0.3rem; border-radius:3px;">output/</code>
+            权威资产始终保留在应用内部 <code style="color:#38bdf8; background:rgba(56,189,248,0.1); padding:0.1rem 0.3rem; border-radius:3px;">output/</code>；此目录仅接收供运营交付的副本。
           </div>
         </div>
       </div>
       <div class="settings-path-row">
         <span style="color:#64748b; font-size:0.75rem; white-space:nowrap; flex-shrink:0;">当前路径：</span>
         <span style="color:#94a3b8; word-break:break-all; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
-          {{ store.globalOutputDir || '未设置 (默认跟随引擎 output/)' }}
+          {{ store.globalOutputDir || '未设置（渲染仅保留内部权威资产）' }}
+        </span>
+      </div>
+      <div v-if="tenantDeliveryPreview" class="settings-path-row">
+        <span style="color:#64748b; font-size:0.75rem; white-space:nowrap; flex-shrink:0;">当前租户预览：</span>
+        <span style="color:#94a3b8; word-break:break-all; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
+          {{ tenantDeliveryPreview }}<br>
+          ├─ renders<br>
+          └─ exports
         </span>
       </div>
       <div style="display:flex; gap: 0.75rem; flex-wrap: wrap;">
         <button @click="pickGlobalOutputFolder" class="cta-glow-btn" style="padding:0.65rem 1.5rem; width:auto; font-size:0.88rem;">
-          📁 更改输出目录
+          📁 选择 Delivery Root
+        </button>
+        <button v-if="store.globalOutputDir" @click="clearDeliveryRoot" class="cta-glow-btn" style="padding:0.65rem 1.5rem; width:auto; font-size:0.88rem; background:rgba(15,23,42,0.65); border-color:rgba(148,163,184,0.3);">
+          清除 Delivery Root
         </button>
         <button @click="openDiagnosticLogs" class="cta-glow-btn" style="padding:0.65rem 1.5rem; width:auto; font-size:0.88rem; background:linear-gradient(135deg,rgba(99,102,241,0.15),rgba(139,92,246,0.15)); border-color:rgba(139,92,246,0.4);">
           🗒️ 导出 / 查看诊断日志

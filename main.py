@@ -33,7 +33,6 @@ load_env()
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from pyngrok import ngrok
 
@@ -140,10 +139,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-os.makedirs(os.path.join("output", "exports"), exist_ok=True)
-app.mount("/exports", StaticFiles(directory=os.path.join("output", "exports")), name="exports")
-
 
 # ================================================================== #
 # 路由 — 健康检查                                                        #

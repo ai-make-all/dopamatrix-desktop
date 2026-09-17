@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { invoke, isTauri as tauriIsTauri } from '@tauri-apps/api/core'
 import { open as openPath } from '@tauri-apps/plugin-shell'
+import axios from 'axios'
 import { useAppStore } from './stores/appStore'
 import Login from './components/Login.vue'
 
@@ -94,18 +95,29 @@ async function triggerDownload(notification) {
     console.info('[Web] Tauri runtime not detected, using HTTP download')
   }
 
-  fallbackWebDownload(notification.downloadUrl)
+  await fallbackWebDownload(notification.downloadUrl)
 }
 
-function fallbackWebDownload(url) {
+async function fallbackWebDownload(url) {
   if (!url) return
-
-  const link = document.createElement('a')
-  link.href = url
-  link.target = '_blank'
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
+  let objectUrl = ''
+  try {
+    const response = await axios.get(url, { responseType: 'blob' })
+    objectUrl = URL.createObjectURL(response.data)
+    const parsed = new URL(url, window.location.href)
+    const filename = parsed.searchParams.get('filename') || 'dopamatrix_delivery.zip'
+    const link = document.createElement('a')
+    link.href = objectUrl
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  } catch (error) {
+    console.error('[Delivery] tenant-aware ZIP download failed', error)
+    store.showToast?.('交付包下载失败，请重试。', 'error')
+  } finally {
+    if (objectUrl) URL.revokeObjectURL(objectUrl)
+  }
 }
 </script>
 
