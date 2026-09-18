@@ -2,15 +2,20 @@
 
 ## Status
 
-This document prepares Phase 3D-2I-B. It has not been executed against a real
-Philippine production tenant and is not evidence of Philippine production
-acceptance.
+This document is the stable operating procedure for Phase 3D-2I-B. It has not
+been executed against a real Philippine production tenant and is not evidence
+of Philippine production acceptance.
+
+Numeric and governance policy comes from
+`doc/investigations/VAR001_PHASE3D2IB1C_FINAL_PHILIPPINE_SEED_POLICY_FREEZE.md`
+(V1.5 PHILIPPINE SEED POLICY v1.0). Per-tenant execution evidence is captured
+in `DOPAMATRIX_V15_PHILIPPINE_SEED_EXECUTION_PACK.md`.
 
 Product release status and a tenant's Reservation canary exposure are
 separate decisions. A tenant may deliberately remain at a controlled
 partial canary exposure; universal 100% Default-ON is not a V1.5 GA
-requirement. Any actual exposure percentage remains
-`TO_BE_DECIDED_BY_2I_B_SEED_POLICY`.
+requirement. Initial Balanced exposure is 3000 basis points for one active
+tenant; the approved V1.5 Seed envelope is 1000--4000 basis points.
 
 Ordinary seed-operator creative work stays:
 
@@ -25,10 +30,20 @@ is not same-batch uniqueness (L1) and is not historical duplicate prevention
 (future L3). L2 does not mean a video generated yesterday cannot be generated
 again.
 
-Numeric seed policy (exposure %, sample size, rate thresholds, observation
-windows, lease TTL/heartbeat) is `TO_BE_DECIDED_BY_2I_B_SEED_POLICY`. Do not
-copy Phase 3D-2I-A2 local manual-acceptance test values into Philippine
-defaults.
+Frozen Seed values are summarized below and fully enumerated in the Execution
+Pack. Do not copy Phase 3D-2I-A2 local manual-acceptance test values into
+Philippine defaults.
+
+- qualified policy: `exact_main_visual_balanced`;
+- initial Balanced / Exact exposure: 3000 / 0 basis points;
+- lease TTL / heartbeat: 180 / 45 seconds;
+- Readiness: 7d, minimum ENFORCE/planning/conflict 10/10/0, all coverage
+  minima 1.0, quality maxima .30/.20, authority/persist/worker maxima 0,
+  cleanup maximum .10;
+- rollback: 7d, minimum Canary task status milestone 5;
+- P3-W rollback quality/cleanup maxima 1.0, safety maxima 0, coverage 1.0;
+- P3-A rollback maxima .30/.20/.20, safety maxima 0, coverage 1.0;
+- no automatic ramp; serial through planning and concurrent after planning.
 
 ## Operator identity and diagnostic routes
 
@@ -63,8 +78,12 @@ curl -H "X-Local-User: <canonical-tenant>" ^
   "http://127.0.0.1:8000/api/v1/diagnostics/reservation/rollout-status?planning_policy=exact_main_visual_balanced"
 
 curl -H "X-Local-User: <canonical-tenant>" ^
-  "http://127.0.0.1:8000/api/v1/diagnostics/reservation/summary?window=24h"
+  "http://127.0.0.1:8000/api/v1/diagnostics/reservation/summary?window=7d"
 ```
+
+The explicit `7d` in this Philippine Seed evidence example is the frozen
+initial decision window. The endpoint itself continues to support `1h`,
+`24h`, `7d`, and `30d`, and its omitted-window default remains `24h`.
 
 Readiness `state` values: `NOT_CONFIGURED`, `INSUFFICIENT_EVIDENCE`,
 `BLOCKED`, `READY_FOR_CONTROLLED_CANARY`.
@@ -91,19 +110,19 @@ Minimum seed-decision fields:
 
 ## Preconditions
 
-1. Select one Philippine seed tenant using a safe operator label. Do not put
+1. Select one Philippine seed tenant using a safe operator label. Only one
+   tenant may have non-zero omitted Balanced Canary exposure during the
+   initial stagger. Do not put
    tenant business content or task IDs in the acceptance summary.
-2. Select one supported planning policy:
-   `exact_main_visual` or `exact_main_visual_balanced`.
+2. Use the qualified Seed policy `exact_main_visual_balanced`.
 3. Record the reviewed application commit/tag and a new rollout generation.
 4. Create and independently verify a complete tenant backup using
    `DOPAMATRIX_V15_BACKUP_RESTORE_RUNBOOK.md` **before** enabling seed canary
    (allowlist / enabled / non-zero basis points / kill switch inactive).
 5. Confirm the tenant's authoritative asset references are complete.
-6. Confirm Reservation lease TTL and heartbeat environment keys are set to
-   the 2I-B seed policy values (`TO_BE_DECIDED_BY_2I_B_SEED_POLICY`). Valid
-   configuration requires both keys; heartbeat must not exceed one third of
-   TTL.
+6. Confirm Reservation lease TTL and heartbeat are set to 180 and 45 seconds.
+   Valid configuration requires both keys; heartbeat must not exceed one
+   third of TTL.
 7. Query `GET /api/v1/diagnostics/reservation/readiness?planning_policy=...`
    with header `X-Local-User: <canonical-tenant>` and record every gate.
 8. Query `GET /api/v1/diagnostics/reservation/rollout-status?planning_policy=...`
@@ -117,16 +136,22 @@ Minimum seed-decision fields:
     verification succeeded. Do not print, screenshot, commit, or paste the
     assignment secret into any artifact.
 
-Do not proceed when readiness is unavailable or not
-`READY_FOR_CONTROLLED_CANARY` (unless 2I-B policy explicitly stays
-explicit-only), the kill switch is active, a breaker is latched for the
-generation, backup verification failed, or lease configuration is invalid.
+Do not enter P3-W or activate non-zero omitted Canary unless Readiness is
+exactly `READY_FOR_CONTROLLED_CANARY`, backup is verified, lease configuration
+is valid, no breaker is latched for the generation, the Delivery prerequisite
+remains valid, and the Tech Lead activation approval is recorded.
+
+During P1, `INSUFFICIENT_EVIDENCE` is expected while the 10/10 Explicit
+ENFORCE bootstrap evidence accumulates. Kill switch `true` during P0, P1, and
+P2 is intentional containment and is not a bootstrap blocker. It is disabled
+last only when entering P3-W after every activation gate above passes.
 
 ## Configuration authority
 
-All of the following are backend environment keys. Values are
-`TO_BE_DECIDED_BY_2I_B_SEED_POLICY`. Rollout control and readiness each
-require their **complete** key set; a partial set is invalid.
+All of the following are backend environment keys. Frozen values and stage
+transitions are in the Execution Pack environment manifest. Rollout control
+and Readiness each require their **complete** key set; a partial set is
+invalid.
 
 Lease:
 
@@ -183,6 +208,14 @@ Do not reuse Phase 3D-2I-A2 local test numbers (including TTL 30, heartbeat 5,
 minimum ENFORCE 3, minimum conflict 1, max zero-plan 0.34, balanced 10000
 basis points, or generation `v15-gate5-local-001`) as Philippine defaults.
 
+The production `.env` is loaded once during backend startup. Although policy
+loaders consult the running process environment at evaluation time, there is
+no supported API that mutates or reloads those variables. After changing any
+Seed environment value, perform a controlled backend restart and re-query
+Readiness and rollout status. Do not assume hot reload. Delivery Root is not
+an environment variable; it is the machine-global `delivery_root` app setting
+managed by `GET/POST /api/v1/settings/delivery-root`.
+
 ## Seed activation sequence
 
 Follow this order. Do not enable omitted-request canary before a verified
@@ -191,30 +224,36 @@ backup exists.
 1. Select tenant and planning policy; record application commit/tag.
 2. Complete backup + independent verify
    (`DOPAMATRIX_V15_BACKUP_RESTORE_RUNBOOK.md`).
-3. Keep omitted traffic `DEFAULT_OFF` / explicit-only until checks pass
-   (rollout disabled, kill switch true, or basis points 0, per 2I-B policy).
-4. Confirm lease configuration is valid.
-5. Query summary, readiness, and rollout-status with `X-Local-User`.
-6. Only then apply 2I-B seed rollout keys (generation, allowlist, basis
-   points, kill switch false) so omitted eligible UI requests may promote.
-7. Observe `WARMING_UP` then `CANARY_ACTIVE` when `canaryTaskCount` meets
-   `RESERVATION_ROLLOUT_MINIMUM_CANARY_TASKS`.
-8. Monitor summary + readiness quality/safety fields for the observation
-   window.
-9. If required, set `RESERVATION_ROLLOUT_KILL_SWITCH` and prove
+3. Keep omitted traffic `DEFAULT_OFF`: Balanced bps 0 and kill switch true.
+4. Confirm lease 180/45 and complete Readiness/Rollout configuration.
+5. P1: Central Tech Operator submits normal diverse Explicit ENFORCE Balanced
+   tasks, serial through planning, until authoritative/planning counts are at
+   least 10/10. Do not manufacture contention; conflict minimum is 0.
+6. P2: query summary, Readiness, and rollout-status with `X-Local-User`; every
+   Readiness gate must pass and state must be `READY_FOR_CONTROLLED_CANARY`.
+7. Prepare Balanced bps 3000 while kill switch remains true, restart the
+   backend, and re-query evidence.
+8. At the beginning of a staffed block with at least two hours remaining,
+   disable the kill switch last, restart, and re-query rollout status.
+9. P3-W: use ordinary omitted-mode UI work; observe `WARMING_UP`. Rollback is
+   evaluated from the first Canary even though the status milestone is 5.
+10. At five fully observed Canary tasks, evaluate the existing cohort before
+    tightening thresholds. Do not rotate generation to hide a failing cohort.
+11. P3-A: only after that review, tighten rollback zero-plan/partial/cleanup
+    maxima to .30/.20/.20 in the same generation, restart, and verify.
+12. Monitor summary + Readiness quality/safety fields for the 7d windows.
+13. If required, set `RESERVATION_ROLLOUT_KILL_SWITCH` and prove
    `rollout-status.state=KILL_SWITCHED` and the next omitted request is
    `DEFAULT_OFF`.
-10. Preserve diagnostics evidence. Restore only under the accepted backup
+14. Preserve diagnostics evidence. Restore only under the accepted backup
     contract; do not treat restore-to-staging as live-tenant overwrite.
 
 ## Initial stage and observation
 
-Choose the initial basis points explicitly
-(`TO_BE_DECIDED_BY_2I_B_SEED_POLICY`). Any later increase follows a
-policy-neutral reviewed sequence: initial reviewed exposure → higher
-reviewed exposure → later reviewed exposure. No stage is automatic, and
-no percentage is implied. Before every increase, an operator must review
-and sign the current evidence.
+Initial Balanced exposure is 3000 basis points. Later values must remain in
+the 1000--4000 envelope and move by at most 1000 basis points per three-day
+review. No stage is automatic and 100% Default-ON is not required. Before
+every increase, an operator reviews and signs the current evidence.
 
 For each observation period, record at least:
 
@@ -238,7 +277,8 @@ minutes or infer safety from a small denominator.
 
 An operator may increase the stage only when:
 
-1. the full observation period is complete;
+1. the three-day review checkpoint is reached and the relevant cohort is
+   fully observed;
 2. required evidence counts and coverage pass;
 3. all safety rates remain within configured thresholds;
 4. no unexplained authority loss, terminal persistence failure, lock residue,
@@ -262,26 +302,33 @@ rewrite Reservation authority, Ledger occurrences, or TaskHistory.
 
 ## Kill-switch drill
 
-In staging or controlled seed conditions while readiness is healthy and an
-omitted request would otherwise be selected for ENFORCE:
+For a real Seed drill while Readiness is healthy and an omitted request would
+otherwise be selected for ENFORCE:
 
 1. record current `GET /api/v1/diagnostics/reservation/rollout-status`;
-2. enable `RESERVATION_ROLLOUT_KILL_SWITCH` through normal operator config;
-3. re-query rollout-status and prove `state=KILL_SWITCHED`;
-4. submit the next omitted-mode request (ordinary AI Draft → Render) and prove
+2. set `RESERVATION_ROLLOUT_KILL_SWITCH=true` through approved environment
+   control;
+3. perform the controlled backend restart required for environment changes;
+4. re-query rollout-status and prove `state=KILL_SWITCHED`;
+5. submit the next ordinary omitted-mode AI Draft → Render request and prove
    durable effective mode is `OFF` / `DEFAULT_OFF` with null rollout metadata;
-5. prove an explicit ENFORCE request still follows B2 semantics (kill switch
-   does not apply to explicit ENFORCE);
 6. confirm already-running work was not cancelled or rewritten;
 7. record diagnostics and lifecycle outcomes (the omitted OFF task must not
    enter the ENFORCE summary cohort);
-8. disable the switch only through normal operator configuration;
-9. re-query readiness and rollout-status before further canary work.
+8. restore the reviewed kill-switch value only through controlled environment
+   configuration and backend restart;
+9. re-query Readiness and rollout-status before further Canary work.
+
+The kill switch factually does not govern Explicit ENFORCE. Do not submit a
+new Explicit ENFORCE task solely to re-demonstrate that bypass during a real
+P3 Seed drill: such a bypass drill is `STAGING_OR_SYNTHETIC_ONLY`. On a real
+production incident, Explicit ENFORCE is permitted only as a documented
+diagnosis/incident exception approved by the Tech Lead under the 1C policy.
 
 ## Breaker / rollback drill
 
-Use staging or a safe controlled seed window; do not damage real creative work
-to manufacture failures.
+Use staging or synthetic evidence only. Do not inject rollback failures into
+real Philippine creative work.
 
 1. Configure controlled evidence that crosses one existing rollback threshold.
 2. Prove the breaker latches for the current policy and generation.
@@ -293,6 +340,9 @@ to manufacture failures.
    recording assignment secrets or raw HMAC material.
 
 ## Restart drill
+
+Perform this drill on real Seed only after all active tasks are drained;
+otherwise use staging.
 
 1. Record rollout generation, breaker status, and current diagnostic counts.
 2. Restart the application normally.
@@ -317,8 +367,9 @@ values, owner-attempt IDs, or tenant database paths.
 - backup-before-canary and independent verification succeeded;
 - readiness and configured evidence gates remained satisfied;
 - the selected manual stage completed its observation period;
-- kill-switch, restart, and rollback drills produced the expected source-truth
-  behavior;
+- the safe real-Seed kill-switch drill and controlled post-drain restart drill
+  produced expected behavior; destructive breaker/fault evidence remains
+  staging or synthetic;
 - no unresolved authority, terminal persistence, task lifecycle, SQLite lock,
   heartbeat, or cleanup defect remains;
 - evidence is recorded in the seed acceptance template and independently
@@ -326,4 +377,3 @@ values, owner-attempt IDs, or tenant database paths.
 
 Local automated tests and this runbook do not satisfy these production exit
 criteria.
-
