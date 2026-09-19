@@ -21,8 +21,8 @@ from typing import Generator
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 
-from .database import SETTINGS_DB_PATH
 from .delivery_output import get_delivery_root, save_delivery_root
+from .runtime_paths import get_runtime_paths
 from src.services.llm_provider import invalidate_api_key_cache
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
@@ -41,7 +41,7 @@ def _settings_conn() -> Generator[sqlite3.Connection, None, None]:
     Yield 一个到全局 dopamatrix.db 的 sqlite3 连接。
     使用 contextmanager 确保连接在函数退出（含异常路径）时始终关闭。
     """
-    conn = sqlite3.connect(SETTINGS_DB_PATH)
+    conn = sqlite3.connect(get_runtime_paths().settings_db_path)
     conn.row_factory = sqlite3.Row
     try:
         # 确保表存在（幂等，应用首次启动或升级均安全）

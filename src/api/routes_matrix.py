@@ -48,6 +48,7 @@ from .delivery_output import derive_export_delivery_dir, get_delivery_root
 from .models import TaskHistory, VariantApproval
 from .approval_service import batch_update_variant_status, ensure_pending_variant_records
 from .approval_types import VariantStatus
+from .runtime_paths import get_runtime_paths
 from src.services.tracking_adapter import CloudflareKVAdapter
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,6 @@ logger = logging.getLogger(__name__)
 _tracking_adapter = CloudflareKVAdapter()
 
 router = APIRouter(prefix="/matrix", tags=["Matrix Approval"])
-
-EXPORT_DIR = os.path.join(os.getcwd(), "output", "exports")
-os.makedirs(EXPORT_DIR, exist_ok=True)
 
 
 # ── Pydantic 请求体 ────────────────────────────────────────────────────
@@ -246,7 +244,7 @@ def _export_directory_for_tenant(canonical_tenant: str) -> str:
     if delivery_root:
         export_dir = derive_export_delivery_dir(delivery_root, canonical_tenant)
     else:
-        export_dir = os.path.abspath(EXPORT_DIR)
+        export_dir = get_runtime_paths().internal_output_root / "exports"
     os.makedirs(export_dir, exist_ok=True)
     return str(export_dir)
 

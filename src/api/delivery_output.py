@@ -11,7 +11,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .database import SETTINGS_DB_PATH, canonical_tenant_id
+from .database import canonical_tenant_id
+from .runtime_paths import get_runtime_paths
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def normalize_delivery_root(value: str | os.PathLike[str] | None) -> str:
 
 
 def _settings_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(SETTINGS_DB_PATH)
+    connection = sqlite3.connect(get_runtime_paths().settings_db_path)
     connection.row_factory = sqlite3.Row
     connection.execute(
         "CREATE TABLE IF NOT EXISTS app_settings "

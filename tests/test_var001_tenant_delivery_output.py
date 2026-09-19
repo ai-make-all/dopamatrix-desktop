@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.api import delivery_output, routes_dsl, routes_matrix, settings_router
+from src.api.runtime_paths import temporary_test_runtime_paths
 
 
 class DeliveryRootSettingsTests(unittest.TestCase):
@@ -21,19 +22,15 @@ class DeliveryRootSettingsTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.db_path = self.root / "dopamatrix.db"
-        self.db_patch = patch.object(
-            delivery_output,
-            "SETTINGS_DB_PATH",
-            str(self.db_path),
-        )
-        self.db_patch.start()
+        self.runtime_paths = temporary_test_runtime_paths(self.root)
+        self.runtime_paths.__enter__()
         app = FastAPI()
         app.include_router(settings_router.router)
         self.client = TestClient(app)
 
     def tearDown(self):
         self.client.close()
-        self.db_patch.stop()
+        self.runtime_paths.__exit__(None, None, None)
         self.temporary.cleanup()
 
     def test_global_round_trip_and_blank_unset(self):
@@ -376,8 +373,11 @@ class TenantZipTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.temp_root = Path(self.temporary.name)
+        self.runtime_paths = temporary_test_runtime_paths(self.temp_root / "runtime")
+        self.runtime_paths.__enter__()
 
     def tearDown(self):
+        self.runtime_paths.__exit__(None, None, None)
         self.temporary.cleanup()
 
     def test_configured_export_paths_are_tenant_isolated(self):
@@ -500,11 +500,8 @@ class TenantZipTests(unittest.TestCase):
             client.close()
 
     def test_unset_root_preserves_legacy_export_directory(self):
-        legacy = self.temp_root / "output" / "exports"
-        with (
-            patch.object(routes_matrix, "get_delivery_root", return_value=""),
-            patch.object(routes_matrix, "EXPORT_DIR", str(legacy)),
-        ):
+        legacy = self.temp_root / "runtime" / "output" / "exports"
+        with patch.object(routes_matrix, "get_delivery_root", return_value=""):
             resolved = routes_matrix._export_directory_for_tenant("tenant-a")
         self.assertEqual(resolved, str(legacy.resolve()))
 

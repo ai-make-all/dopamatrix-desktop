@@ -64,6 +64,7 @@ from .database import (
 )
 from .delivery_output import publish_render_delivery_assets
 from .dsl_adapter import compile_plan_to_timeline
+from .runtime_paths import get_runtime_paths
 from src.api.ws_manager import manager as ws_manager
 from .dsl_parser import (
     DSLParserNode,
@@ -2794,10 +2795,12 @@ def render_worker(
         context.config["child_index"] = child_index
         context.config["enable_tts"] = enable_tts
         context.config["enable_subtitles"] = enable_subtitles
+        internal_output_root = get_runtime_paths().internal_output_root
+        context.config["internal_output_root"] = str(internal_output_root)
         # render_worker is always a child execution.  The submitted-task
         # terminal event belongs exclusively to render_batch_worker.
         context.config["ws_terminal_managed_by_coordinator"] = True
-        os.makedirs("output", exist_ok=True)
+        internal_output_root.mkdir(parents=True, exist_ok=True)
 
         # ── 4. 动态模态路由 ────────────────────────────────────────────
         if prompt:
@@ -2834,7 +2837,7 @@ def render_worker(
 
             # TTSNode 读取 tts_script，将 MP3 + VTT 写入 context.variants[lang]
             if enable_tts:
-                TTSNode().execute(context)
+                TTSNode(output_dir=str(internal_output_root)).execute(context)
             else:
                 logger.info(
                     "[render_worker] task_id=%s enable_tts=False，跳过 TTS 播音节点，"

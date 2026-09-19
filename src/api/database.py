@@ -8,8 +8,8 @@ SQLAlchemy 数据库配置层 — 多租户动态物理隔离架构。
 
 Engine 实例按租户缓存，避免重复创建；线程锁保证并发安全。
 
-此外，提供全局共享数据库 dopamatrix.db 的路径常量，供 app_settings
-等跨租户表使用（通过原生 sqlite3 直连，不经过 ORM 层）。
+此外，全局共享数据库 dopamatrix.db 与租户 data/ 目录均由
+RuntimePaths 提供绝对路径，供 app_settings 与 ORM 使用。
 """
 
 import json
@@ -22,6 +22,8 @@ from fastapi import Request
 from sqlalchemy import Integer, String, create_engine, event, inspect as sa_inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+from .runtime_paths import get_runtime_paths
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +66,18 @@ def _set_sqlite_foreign_key_pragma(dbapi_connection, connection_record):
     cursor.close()
 
 # ------------------------------------------------------------------ #
-# 确保数据存放目录存在                                                   #
-# ------------------------------------------------------------------ #
-os.makedirs("data", exist_ok=True)
-
-# ------------------------------------------------------------------ #
 # 全局共享数据库（app_settings 等非租户数据存储于此）                     #
 # main.py 中 `from src.api.database import engine, Base` 依赖此变量。  #
 # ------------------------------------------------------------------ #
-SETTINGS_DB_PATH = "dopamatrix.db"
+_runtime_paths = get_runtime_paths()
+
+
+def _sqlite_database_url(path) -> str:
+    return f"sqlite:///{path.as_posix()}"
 
 # 全局默认 Engine（向后兼容，供 main.py 的 Base.metadata.create_all 使用）
 engine = create_engine(
-    f"sqlite:///./{SETTINGS_DB_PATH}",
+    _sqlite_database_url(_runtime_paths.settings_db_path),
     connect_args={"check_same_thread": False},
 )
 
@@ -440,8 +441,11 @@ def get_tenant_engine(tenant_id: str | None):
 
     with _engine_lock:
         if safe_tenant_id not in _tenant_engines:
-            db_path = f"sqlite:///./data/dopamatrix_{safe_tenant_id}.db"
-            engine = create_engine(db_path, connect_args={"check_same_thread": False})
+            db_path = get_runtime_paths().tenant_database_path(safe_tenant_id)
+            engine = create_engine(
+                _sqlite_database_url(db_path),
+                connect_args={"check_same_thread": False},
+            )
             event.listen(engine, "connect", _set_sqlite_foreign_key_pragma)
 
             try:

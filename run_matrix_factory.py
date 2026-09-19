@@ -45,6 +45,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
+from src.api.runtime_paths import get_runtime_paths
 from src.core.logger import logger
 
 
@@ -169,6 +170,9 @@ def _run_single_matrix(execution_id: str, task_id: str, user_prompt: str,
     logger.info(f"[Worker {execution_id}] 线程启动，开始生产矩阵视频...")
 
     try:
+        internal_output_root = get_runtime_paths().internal_output_root
+        clips_output_root = internal_output_root / "clips"
+
         # ── 导入所有节点（在子进程内导入，避免跨进程序列化问题）────────────
         from src.core.context import WorkflowContext
         from src.core.engine import WorkflowEngine
@@ -221,11 +225,14 @@ def _run_single_matrix(execution_id: str, task_id: str, user_prompt: str,
         engine = WorkflowEngine()
         engine.nodes = [
             ScriptGenNode(),                                           # 1. LLM 生成分镜脚本
-            TTSNode(output_dir="output"),                             # 2. 文字转语音
-            AssetSelectNode(pool_dir="assets/matrix_pool/x_main"),   # 3. 本地抽卡
+            TTSNode(output_dir=str(internal_output_root)),              # 2. 文字转语音
+            AssetSelectNode(                                           # 3. 本地抽卡
+                pool_dir="assets/matrix_pool/x_main",
+                output_dir=str(clips_output_root),
+            ),
             TranslationBridgeNode(),                                   # 4. 字幕文本桥接
             SubtitleNode(),                                            # 5. 生成 .ass 字幕
-            AssemblyNode(),                                            # 6. 拼装 Timeline
+            AssemblyNode(output_dir=str(internal_output_root)),         # 6. 拼装 Timeline
             AntiDupNode(),                                             # 7. 防查重注入
             FFmpegCompositorNode(),                                    # 8. FFmpeg 渲染
             CoverNode(),                                               # 9. 封面抽帧 ← NEW
@@ -242,6 +249,7 @@ def _run_single_matrix(execution_id: str, task_id: str, user_prompt: str,
         )
         context.config["execution_id"] = execution_id
         context.config["file_sid"] = execution_id.replace("-", "")[:12]
+        context.config["internal_output_root"] = str(internal_output_root)
         if output_dir:
             context.config["output_dir"] = output_dir
         context.set_asset("script", user_prompt)
@@ -251,8 +259,8 @@ def _run_single_matrix(execution_id: str, task_id: str, user_prompt: str,
         )
 
         # ── 确保输出目录存在 ──────────────────────────────────────────────────
-        os.makedirs("output", exist_ok=True)
-        os.makedirs("output/clips", exist_ok=True)
+        internal_output_root.mkdir(parents=True, exist_ok=True)
+        clips_output_root.mkdir(parents=True, exist_ok=True)
 
         logger.info(
             f"[Worker {execution_id}] Pipeline 节点数: {len(engine.nodes)}"

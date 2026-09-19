@@ -1,6 +1,5 @@
 import tempfile
 import unittest
-import os
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -26,6 +25,7 @@ from src.api.fingerprint_ledger import (
     ensure_fingerprint_ledger_schema,
 )
 from src.api.models import Base, TaskHistory
+from src.api.runtime_paths import temporary_test_runtime_paths
 from src.api.schemas import RenderDSLRequest
 from tests.test_var001_balanced_axis_coverage import (
     _SyntheticParser,
@@ -131,11 +131,8 @@ class FingerprintLedgerSchemaTests(unittest.TestCase):
             ))
 
     def test_tenant_engine_open_applies_ledger_schema_without_global_manifest(self):
-        previous = os.getcwd()
         with tempfile.TemporaryDirectory() as directory:
-            os.chdir(directory)
-            try:
-                Path("data").mkdir()
+            with temporary_test_runtime_paths(directory):
                 with patch.object(database, "_tenant_engines", {}):
                     engine = database.get_tenant_engine("tenant-open")
                     self.assertIn("fingerprint_identities", inspect(engine).get_table_names())
@@ -145,8 +142,6 @@ class FingerprintLedgerSchemaTests(unittest.TestCase):
                             1,
                         )
                     engine.dispose()
-            finally:
-                os.chdir(previous)
 
     def test_ledger_tables_are_not_registered_on_global_database_base(self):
         self.assertNotIn("fingerprint_identities", Base.metadata.tables)

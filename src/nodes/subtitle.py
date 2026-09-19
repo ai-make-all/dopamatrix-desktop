@@ -408,8 +408,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         font_size: int = int(context.config.get("font_size", 42))
         max_chars: int = int(context.config.get("subtitle_max_chars", 22))
 
-        output_dir = Path("output")
-        output_dir.mkdir(exist_ok=True)
+        output_dir = Path(context.config.get("internal_output_root", "output"))
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         target_lang = getattr(context, "test_language", "en") or "en"
         self.log(f"[Test-First] 字幕仅生成语言 '{target_lang}'")

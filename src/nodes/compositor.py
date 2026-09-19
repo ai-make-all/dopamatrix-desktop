@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import List, Tuple
 
 # 隐藏 Windows 下 FFmpeg 子进程的黑色控制台窗口
@@ -78,17 +79,28 @@ class FFmpegCompositorNode(BaseNode):
         # Legacy direct calls without child markers use their task namespace.
         return str(context.task_id)
 
+    @staticmethod
+    def _internal_output_root(context: WorkflowContext) -> Path:
+        """Use the injected runtime authority, preserving direct-node tests."""
+        return Path(context.config.get("internal_output_root", "output"))
+
     @classmethod
     def _master_output_path(cls, context: WorkflowContext) -> str:
         file_sid = cls._resolve_file_sid(context)
         sid_suffix = f"_{file_sid}" if file_sid else ""
-        return f"output/master_video{sid_suffix}.mp4"
+        if "internal_output_root" not in context.config:
+            return f"output/master_video{sid_suffix}.mp4"
+        return str(cls._internal_output_root(context) / f"master_video{sid_suffix}.mp4")
 
     @classmethod
     def _final_output_path(cls, context: WorkflowContext, language: str) -> str:
         file_sid = cls._resolve_file_sid(context)
         sid_suffix = f"_{file_sid}" if file_sid else ""
-        return f"output/final_{language}{sid_suffix}.mp4"
+        if "internal_output_root" not in context.config:
+            return f"output/final_{language}{sid_suffix}.mp4"
+        return str(
+            cls._internal_output_root(context) / f"final_{language}{sid_suffix}.mp4"
+        )
 
     # ------------------------------------------------------------------
     # 事件总线辅助工具

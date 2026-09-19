@@ -18,17 +18,34 @@ import sys
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-# ── 生产环境（PyInstaller 打包）：将工作目录切换到可执行文件所在目录 ──────────
-# 必须在所有其他代码之前执行，确保 dopamatrix.db / .env / output/ 等相对路径
-# 全部解析到安装目录（如 C:\DopaMatrix\），而非系统默认工作目录。
-if getattr(sys, "frozen", False):
-    os.chdir(os.path.dirname(sys.executable))
+from src.api.bootstrap import (
+    apply_server_compatibility_cwd,
+    operator_placeholder_exit_code,
+    prepare_bootstrap,
+)
+
+# Runtime mode/root and future operator dispatch are resolved before importing
+# dotenv, FastAPI, database, routers, Ngrok, logger, or the render graph.
+_bootstrap_decision = prepare_bootstrap(sys.argv)
+if __name__ == "__main__" and _bootstrap_decision.operator_requested:
+    raise SystemExit(operator_placeholder_exit_code())
+
+# Temporary H1 compatibility for packaged non-authoritative resource lookups.
+# All mutable database/output authorities use absolute RuntimePaths instead.
+apply_server_compatibility_cwd(_bootstrap_decision)
 
 # ── 最早加载 .env ─────────────────────────────────────────────────────────────
 # 必须在任何读取 os.environ 的模块（OpenAI SDK、数据库 URL 等）导入之前完成。
 # ThreadPoolExecutor 线程共享同一 os.environ，加载一次即对全部线程生效。
 from src.utils.env_utils import load_env
 load_env()
+
+from src.api.runtime_config import RuntimeConfigProvider
+
+runtime_config_provider = RuntimeConfigProvider.create(
+    paths=_bootstrap_decision.runtime_paths,
+    static_operational_mapping=os.environ,
+)
 
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware

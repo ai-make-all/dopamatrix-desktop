@@ -27,6 +27,8 @@ from abc import ABC, abstractmethod
 
 import openai
 
+from src.api.runtime_paths import get_runtime_paths
+
 
 # ---------------------------------------------------------------------------
 # 多键字典懒加载缓存：支持多模型独立缓存与精准失效
@@ -58,7 +60,7 @@ def _load_api_key_from_db(setting_key: str = "openai_api_key") -> str:
     if setting_key in _api_key_cache:
         return _api_key_cache[setting_key]
 
-    db_path = "dopamatrix.db"
+    db_path = get_runtime_paths().settings_db_path
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(db_path)
