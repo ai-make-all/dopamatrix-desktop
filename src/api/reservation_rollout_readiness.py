@@ -21,6 +21,7 @@ from .reservation_lease import (
     ReservationLeaseConfigurationError,
     load_reservation_lease_configuration,
 )
+from .runtime_config import reservation_runtime_mapping
 
 
 ReservationRolloutPlanningPolicy = Literal[
@@ -90,6 +91,9 @@ _ENVIRONMENT_KEYS = {
         "RESERVATION_ROLLOUT_MAXIMUM_CLEANUP_WARNING_RATE"
     ),
 }
+RESERVATION_ROLLOUT_READINESS_ENVIRONMENT_KEYS = frozenset(
+    _ENVIRONMENT_KEYS.values()
+)
 
 
 class ReservationRolloutReadinessConfigurationError(ValueError):
@@ -324,9 +328,11 @@ def _not_configured_result(
     }
 
 
-def _current_lease_configuration_ready() -> bool:
+def _current_lease_configuration_ready(
+    runtime_mapping: Mapping[str, str],
+) -> bool:
     try:
-        load_reservation_lease_configuration().require_configured()
+        load_reservation_lease_configuration(runtime_mapping).require_configured()
         return True
     except ReservationLeaseConfigurationError:
         return False
@@ -338,12 +344,18 @@ def reservation_rollout_readiness(
     planning_policy: ReservationRolloutPlanningPolicy,
     configuration: ReservationRolloutReadinessConfiguration | None,
     now: datetime | None = None,
+    runtime_mapping: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Evaluate live tenant-local evidence without persisting a decision."""
     if planning_policy not in _ALLOWED_POLICIES:
         raise ValueError("RESERVATION_ROLLOUT_PLANNING_POLICY_INVALID")
     if configuration is None:
         return _not_configured_result(planning_policy)
+    active_runtime_mapping = (
+        reservation_runtime_mapping()
+        if runtime_mapping is None
+        else runtime_mapping
+    )
 
     end = now or datetime.now(timezone.utc)
     if end.tzinfo is None:
@@ -439,7 +451,7 @@ def reservation_rollout_readiness(
     )
     worker_config_rate = _rate(worker_config_count, authoritative_count)
     cleanup_rate = _rate(cleanup_count, authoritative_count)
-    lease_ready = _current_lease_configuration_ready()
+    lease_ready = _current_lease_configuration_ready(active_runtime_mapping)
 
     gates = [
         _minimum_gate(

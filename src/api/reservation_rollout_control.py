@@ -36,6 +36,7 @@ from .reservation_rollout_readiness import (
     load_reservation_rollout_readiness_configuration,
     reservation_rollout_readiness,
 )
+from .runtime_config import reservation_runtime_mapping
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,9 @@ _ENVIRONMENT_KEYS = {
         "RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_CLEANUP_WARNING_RATE"
     ),
 }
+RESERVATION_ROLLOUT_CONTROL_ENVIRONMENT_KEYS = frozenset(
+    _ENVIRONMENT_KEYS.values()
+)
 _ROLLBACK_REASONS = (
     (
         "diagnosticRunCoverageRate",
@@ -657,7 +661,10 @@ def resolve_omitted_reservation_mode(
 ) -> PublicTaskReservationModeDecision:
     """Resolve optional promotion; every control failure returns OFF."""
     try:
-        configuration = load_reservation_rollout_control_configuration()
+        runtime_mapping = reservation_runtime_mapping()
+        configuration = load_reservation_rollout_control_configuration(
+            runtime_mapping
+        )
         if (
             configuration is None
             or not configuration.enabled
@@ -696,12 +703,13 @@ def resolve_omitted_reservation_mode(
                 rollout_generation=configuration.rollout_generation,
             )
             readiness_configuration = (
-                load_reservation_rollout_readiness_configuration()
+                load_reservation_rollout_readiness_configuration(runtime_mapping)
             )
             readiness = reservation_rollout_readiness(
                 session,
                 planning_policy=planning_policy,  # type: ignore[arg-type]
                 configuration=readiness_configuration,
+                runtime_mapping=runtime_mapping,
             )
             readiness_ready = (
                 readiness["state"] == "READY_FOR_CONTROLLED_CANARY"
@@ -737,7 +745,9 @@ def resolve_omitted_reservation_mode(
             return _default_off_decision()
 
         try:
-            load_reservation_lease_configuration().require_configured()
+            load_reservation_lease_configuration(
+                runtime_mapping
+            ).require_configured()
         except ReservationLeaseConfigurationError:
             return _default_off_decision()
         return PublicTaskReservationModeDecision(
@@ -789,6 +799,7 @@ def reservation_rollout_status(
     planning_policy: ReservationRolloutPolicy,
     configuration: ReservationRolloutControlConfiguration | None,
     now: datetime | None = None,
+    runtime_mapping: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Compute operator status without mutating breaker or rollout state."""
     if planning_policy not in _ALLOWED_POLICIES:
@@ -850,14 +861,20 @@ def reservation_rollout_status(
             "readinessState": None,
         }
 
-    readiness_configuration = (
-        load_reservation_rollout_readiness_configuration()
+    active_runtime_mapping = (
+        reservation_runtime_mapping()
+        if runtime_mapping is None
+        else runtime_mapping
+    )
+    readiness_configuration = load_reservation_rollout_readiness_configuration(
+        active_runtime_mapping
     )
     readiness = reservation_rollout_readiness(
         session,
         planning_policy=planning_policy,
         configuration=readiness_configuration,
         now=now,
+        runtime_mapping=active_runtime_mapping,
     )
     readiness_state = readiness["state"]
     if readiness_state != "READY_FOR_CONTROLLED_CANARY":

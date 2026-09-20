@@ -40,12 +40,20 @@ apply_server_compatibility_cwd(_bootstrap_decision)
 from src.utils.env_utils import load_env
 load_env()
 
-from src.api.runtime_config import RuntimeConfigProvider
-
-runtime_config_provider = RuntimeConfigProvider.create(
-    paths=_bootstrap_decision.runtime_paths,
-    static_operational_mapping=os.environ,
+from src.api.runtime_config import (
+    RuntimeConfigProvider,
+    install_runtime_config_provider,
 )
+from src.api.runtime_paths import RuntimeMode
+
+runtime_config_provider: RuntimeConfigProvider | None = None
+if _bootstrap_decision.runtime_paths.mode is RuntimeMode.SOURCE_DEVELOPMENT:
+    runtime_config_provider = install_runtime_config_provider(
+        RuntimeConfigProvider.create(
+            paths=_bootstrap_decision.runtime_paths,
+            static_operational_mapping=os.environ,
+        )
+    )
 
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -117,6 +125,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info(
             "[SecretStore] OpenAI credential state=%s",
             secret_migration.value,
+        )
+
+    # Packaged Seed authority is loaded once after global schema/secret-store
+    # initialization. Missing or invalid state installs an in-memory SAFE-OFF
+    # provider and never falls back to environment or rewrites the database.
+    global runtime_config_provider
+    if _bootstrap_decision.runtime_paths.mode is RuntimeMode.PACKAGED:
+        from src.api.policy_profiles import load_applied_runtime_config_provider
+        from src.api.secret_store import get_default_secret_store
+
+        runtime_config_provider = install_runtime_config_provider(
+            load_applied_runtime_config_provider(
+                _bootstrap_decision.runtime_paths,
+                get_default_secret_store(),
+            )
+        )
+        logger.info(
+            "[RuntimeConfig] operational state=%s error=%s",
+            runtime_config_provider.static_operational_status.value,
+            runtime_config_provider.static_operational_error_code or "NONE",
         )
     logger.info("[DopaMatrix] 数据库就绪 ✓")
 

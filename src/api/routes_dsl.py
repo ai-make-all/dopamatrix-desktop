@@ -102,6 +102,7 @@ from .reservation_lease import (
     ReservationLeaseConfigurationError,
     load_reservation_lease_configuration,
 )
+from .runtime_config import reservation_runtime_mapping
 from .reservation_diagnostics import (
     ReservationPlanningObservation,
     ReservationTerminalObservation,
@@ -423,7 +424,9 @@ def _preflight_public_reservation_policy(payload: RenderDSLRequest) -> None:
             detail=_RESERVATION_ENFORCE_UNSUPPORTED_FOR_LEGACY,
         )
     try:
-        load_reservation_lease_configuration().require_configured()
+        load_reservation_lease_configuration(
+            reservation_runtime_mapping()
+        ).require_configured()
     except ReservationLeaseConfigurationError as exc:
         _invoke_reservation_diagnostic(
             "route_config",
@@ -4148,7 +4151,9 @@ def render_batch_worker(
             )
             try:
                 lease_configuration = (
-                    load_reservation_lease_configuration().require_configured()
+                    load_reservation_lease_configuration(
+                        reservation_runtime_mapping()
+                    ).require_configured()
                 )
             except ReservationLeaseConfigurationError as exc:
                 _invoke_reservation_diagnostic_observation(

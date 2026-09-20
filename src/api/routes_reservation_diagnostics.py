@@ -29,6 +29,7 @@ from .reservation_rollout_control import (
     load_reservation_rollout_control_configuration,
     reservation_rollout_status,
 )
+from .runtime_config import reservation_runtime_mapping
 
 
 logger = logging.getLogger(__name__)
@@ -189,12 +190,16 @@ def get_reservation_rollout_readiness(
 ) -> ReservationRolloutReadinessResponse:
     """Return advisory tenant/policy evidence without changing runtime mode."""
     try:
-        configuration = load_reservation_rollout_readiness_configuration()
+        runtime_mapping = reservation_runtime_mapping()
+        configuration = load_reservation_rollout_readiness_configuration(
+            runtime_mapping
+        )
         return ReservationRolloutReadinessResponse.model_validate(
             reservation_rollout_readiness(
                 db,
                 planning_policy=planning_policy,
                 configuration=configuration,
+                runtime_mapping=runtime_mapping,
             )
         )
     except ReservationRolloutReadinessConfigurationError as exc:
@@ -239,13 +244,17 @@ def get_reservation_rollout_status(
 ) -> ReservationRolloutStatusResponse:
     """Return tenant-local aggregate rollout control state without mutation."""
     try:
-        configuration = load_reservation_rollout_control_configuration()
+        runtime_mapping = reservation_runtime_mapping()
+        configuration = load_reservation_rollout_control_configuration(
+            runtime_mapping
+        )
         return ReservationRolloutStatusResponse.model_validate(
             reservation_rollout_status(
                 db,
                 canonical_tenant=request_tenant_id(request),
                 planning_policy=planning_policy,
                 configuration=configuration,
+                runtime_mapping=runtime_mapping,
             )
         )
     except ReservationRolloutControlConfigurationError as exc:
