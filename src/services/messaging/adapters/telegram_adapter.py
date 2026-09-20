@@ -10,7 +10,7 @@ Telegram 渠道适配器 (TelegramAdapter)
 
 技术选型：
   - 使用 httpx.AsyncClient 直接调用 Telegram Bot API（无额外依赖，轻量可控）
-  - Bot Token 从环境变量 TELEGRAM_BOT_TOKEN 读取
+  - Packaged mode reads the DPAPI secure store; source development may use TELEGRAM_BOT_TOKEN
   - 所有 API 调用带超时保护（默认 10s），网络失败抛出 RuntimeError
 
 Telegram Update 结构参考（仅解析最常用的 message 和 callback_query）：
@@ -27,11 +27,15 @@ Telegram Update 结构参考（仅解析最常用的 message 和 callback_query�
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import httpx
 
+from src.api.secret_store import (
+    TELEGRAM_BOT_TOKEN,
+    SecretStoreError,
+    load_runtime_secret,
+)
 from src.core.logger import logger
 from ..contract import BaseIMAdapter, MessageType, UniversalMessage
 
@@ -43,21 +47,31 @@ _TG_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 _DEFAULT_TIMEOUT = 10.0  # 秒
 
 
+class TelegramRequestFailed(RuntimeError):
+    """Stable boundary for failures that may contain a tokenized request URL."""
+
+    def __init__(self) -> None:
+        super().__init__("TELEGRAM_REQUEST_FAILED")
+
+
 class TelegramAdapter(BaseIMAdapter):
     """
     Telegram Bot Webhook 适配器。
 
-    实例化时读取 TELEGRAM_BOT_TOKEN 环境变量；也可通过构造函数显式传入 token
-    （方便多 Bot 实例并存，如为不同租户分配独立 Bot）。
+    Packaged mode uses the centralized secure source. Source development may
+    retain TELEGRAM_BOT_TOKEN compatibility; callers may also inject a token.
     """
 
     def __init__(self, bot_token: Optional[str] = None) -> None:
-        self._token: str = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        try:
+            self._token = bot_token or load_runtime_secret(
+                TELEGRAM_BOT_TOKEN,
+                development_environment_key="TELEGRAM_BOT_TOKEN",
+            ) or ""
+        except (SecretStoreError, OSError) as exc:
+            raise ValueError("TELEGRAM_SECRET_UNAVAILABLE") from exc
         if not self._token:
-            raise ValueError(
-                "TelegramAdapter: TELEGRAM_BOT_TOKEN 未配置。"
-                "请在 .env 或环境变量中设置 TELEGRAM_BOT_TOKEN=<your_bot_token>。"
-            )
+            raise ValueError("TELEGRAM_SECRET_NOT_CONFIGURED")
 
     # ------------------------------------------------------------------ #
     # 工具方法                                                              #
@@ -68,8 +82,14 @@ class TelegramAdapter(BaseIMAdapter):
     async def _post(self, method: str, payload: Dict[str, Any]) -> dict:
         """向 Telegram Bot API 发 POST 请求，统一处理错误。"""
         url = self._api_url(method)
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-            resp = await client.post(url, json=payload)
+        try:
+            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+        except httpx.HTTPError:
+            # Telegram places the bot token in the URL. Never propagate the
+            # raw httpx exception, request, response, or chained context.
+            raise TelegramRequestFailed() from None
         data = resp.json()
         if not data.get("ok"):
             raise RuntimeError(
@@ -179,7 +199,10 @@ class TelegramAdapter(BaseIMAdapter):
             file_path: str = result.get("file_path", "")
             return f"https://api.telegram.org/file/bot{self._token}/{file_path}"
         except Exception as exc:
-            logger.warning(f"[TelegramAdapter] 解析 file_id={file_id} 失败: {exc}")
+            logger.warning(
+                "[TelegramAdapter] file resolution failed error=%s",
+                type(exc).__name__,
+            )
             return None
 
     # ------------------------------------------------------------------ #

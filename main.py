@@ -56,6 +56,10 @@ from pyngrok import ngrok
 from src.core.logger import setup_logger, logger
 from src.version import APPLICATION_VERSION
 from src.api.database import engine, initialize_application_schema
+from src.api.secret_store import (
+    OpenAISecretMigrationResult,
+    initialize_secret_storage,
+)
 from src.api.schemas import HealthResponse
 from src.api import routes as task_routes
 from src.api import routes_assets
@@ -70,6 +74,7 @@ from src.api import routes_reservation_diagnostics
 from src.api import routes_ws
 from src.api import settings_router
 from src.api.ws_manager import manager as ws_manager
+from src.services.llm_provider import invalidate_api_key_cache
 
 setup_logger()
 
@@ -95,6 +100,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ---- 启动阶段 ---- #
     logger.info("[DopaMatrix] 正在初始化数据库表结构…")
     initialize_application_schema(engine)
+
+    # H2 credential migration is a lifespan action, never import-time work.
+    # Optional-provider failures do not block unrelated application features.
+    secret_migration = initialize_secret_storage()
+    invalidate_api_key_cache("openai_api_key")
+    if secret_migration in {
+        OpenAISecretMigrationResult.ERROR,
+        OpenAISecretMigrationResult.MIGRATION_CONFLICT,
+    }:
+        logger.warning(
+            "[SecretStore] OpenAI credential state=%s",
+            secret_migration.value,
+        )
+    else:
+        logger.info(
+            "[SecretStore] OpenAI credential state=%s",
+            secret_migration.value,
+        )
     logger.info("[DopaMatrix] 数据库就绪 ✓")
 
     # ---- 注入事件循环到 WebSocket 广播中枢 ---- #

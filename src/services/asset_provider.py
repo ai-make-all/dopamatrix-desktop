@@ -10,7 +10,7 @@
   PexelsProvider  — 调用 Pexels 免费视频搜索 API，下载符合要求的 .mp4 素材
 
 环境变量：
-  PEXELS_API_KEY  — 必填（在 pexels.com/api 免费申请）
+  Packaged mode uses secure_settings; source development may use PEXELS_API_KEY.
 """
 
 import hashlib
@@ -30,6 +30,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from src.api.secret_store import PEXELS_API_KEY, SecretStoreError, load_runtime_secret
 from src.utils.env_utils import get_ffmpeg_path
 
 
@@ -104,7 +105,7 @@ class PexelsProvider(BaseAssetProvider):
       3. 流式下载到 output/clips/<关键词哈希>.mp4 并返回本地路径
 
     关键配置（均从环境变量读取）：
-      PEXELS_API_KEY   — 必填，API 密钥
+      PEXELS_API_KEY   — source-development compatibility only
       PEXELS_PER_PAGE  — 选填，单次搜索返回数量，默认 5
     """
 
@@ -119,17 +120,20 @@ class PexelsProvider(BaseAssetProvider):
     ):
         """
         Args:
-            api_key:    Pexels API Key，默认从 PEXELS_API_KEY 环境变量读取
+            api_key:    explicit key, otherwise resolved by the centralized secret source
             output_dir: 下载目录，默认 output/clips
             per_page:   单次搜索返回结果数量（1~80），默认 5
             timeout:    HTTP 请求超时（秒），默认 30
         """
-        self._api_key = api_key or os.getenv("PEXELS_API_KEY", "")
+        try:
+            self._api_key = api_key or load_runtime_secret(
+                PEXELS_API_KEY,
+                development_environment_key="PEXELS_API_KEY",
+            ) or ""
+        except (SecretStoreError, OSError) as exc:
+            raise RuntimeError("PEXELS_SECRET_UNAVAILABLE") from exc
         if not self._api_key:
-            raise RuntimeError(
-                "[PexelsProvider] PEXELS_API_KEY is not set. "
-                "Please add it to your .env file or environment variables."
-            )
+            raise RuntimeError("PEXELS_SECRET_NOT_CONFIGURED")
 
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)

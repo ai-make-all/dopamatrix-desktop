@@ -53,8 +53,10 @@ from src.services.tracking_adapter import CloudflareKVAdapter
 
 logger = logging.getLogger(__name__)
 
-# 模块级单例，复用 httpx 连接池（Mock 模式下无网络开销）
-_tracking_adapter = CloudflareKVAdapter()
+# Optional integration credentials are resolved lazily, never at router import.
+def _create_tracking_adapter() -> CloudflareKVAdapter:
+    """Resolve optional credentials only when an export needs tracking."""
+    return CloudflareKVAdapter()
 
 router = APIRouter(prefix="/matrix", tags=["Matrix Approval"])
 
@@ -249,20 +251,21 @@ def _export_directory_for_tenant(canonical_tenant: str) -> str:
     return str(export_dir)
 
 
-def _fallback_short_link(asset_hash: str) -> str:
-    base_url = getattr(_tracking_adapter, "base_url", "https://dopa.mx/t/")
+def _fallback_short_link(asset_hash: str, adapter=None) -> str:
+    base_url = getattr(adapter, "base_url", "https://dopa.mx/t/")
     return f"{base_url}mock-{(asset_hash or 'export')[:8]}"
 
 
 def _generate_resilient_short_link(long_url: str, asset_hash: str) -> str:
+    adapter = _create_tracking_adapter()
     try:
-        return _tracking_adapter.generate_short_link(long_url, asset_hash or "")
+        return adapter.generate_short_link(long_url, asset_hash or "")
     except Exception as exc:
         logger.warning(
             "[Delivery Hub] short-link fallback error=%s",
             type(exc).__name__,
         )
-        return _fallback_short_link(asset_hash)
+        return _fallback_short_link(asset_hash, adapter)
 
 
 def _build_delivery_zip(

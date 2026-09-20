@@ -82,9 +82,16 @@ class MatrixExportTests(unittest.TestCase):
                 return_value=str(self.delivery_root.resolve()),
             ),
             patch.object(
-                routes_matrix._tracking_adapter,
-                "generate_short_link",
-                side_effect=fake_short_link,
+                routes_matrix,
+                "_create_tracking_adapter",
+                return_value=type(
+                    "FakeTrackingAdapter",
+                    (),
+                    {
+                        "base_url": "https://short.test/",
+                        "generate_short_link": staticmethod(fake_short_link),
+                    },
+                )(),
             ),
         ]
         for item in self.patches:

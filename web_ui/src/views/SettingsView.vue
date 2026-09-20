@@ -9,7 +9,6 @@ const store = useAppStore()
 
 // ── LLM Settings (BYOK) ───────────────────────────────────────────────────
 const llmApiKeyInput  = ref('')
-const llmMaskedKey    = ref('')
 const llmIsConfigured = ref(false)
 const llmSaving       = ref(false)
 const showLlmKeyText  = ref(false)
@@ -17,7 +16,6 @@ const showLlmKeyText  = ref(false)
 async function loadLlmSettings() {
   try {
     const resp = await axios.get(`${store.API_BASE}/api/v1/settings/llm`)
-    llmMaskedKey.value    = resp.data.api_key    || ''
     llmIsConfigured.value = resp.data.is_configured ?? false
   } catch (err) {
     console.error('[LLM Settings] 获取配置失败：', err)
@@ -121,7 +119,7 @@ onMounted(() => {
         <div>
           <div style="font-size:1.05rem; font-weight:800; color:#e2e8f0;">大模型配置 <span style="color:#64748b; font-size:0.78rem; font-weight:400;">LLM Configuration</span></div>
           <div style="font-size:0.75rem; color:#475569; margin-top:0.15rem; line-height:1.5;">
-            采用 BYOK（Bring Your Own Key）零信任架构。Key 仅写入本地 SQLite，绝不外传。
+            采用 BYOK（Bring Your Own Key）架构。Key 使用 Windows 当前用户加密后存入本地安全设置。
           </div>
         </div>
       </div>
@@ -129,7 +127,7 @@ onMounted(() => {
       <div style="margin-bottom:1.25rem;">
         <span v-if="llmIsConfigured" class="llm-status-badge llm-status-badge--ok">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0"><circle cx="5" cy="5" r="5" fill="#4ade80"/></svg>
-          已配置 &nbsp;<code style="font-family:'JetBrains Mono',monospace;font-size:0.7rem;opacity:0.8;">{{ llmMaskedKey }}</code>
+          API Key 已安全配置
         </span>
         <span v-else class="llm-status-badge llm-status-badge--warn">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0"><circle cx="5" cy="5" r="5" fill="#f87171"/></svg>
@@ -155,8 +153,8 @@ onMounted(() => {
             v-model="llmApiKeyInput"
             :type="showLlmKeyText ? 'text' : 'password'"
             :placeholder="llmIsConfigured
-              ? `当前 ${llmMaskedKey}  ·  输入新 Key 可覆盖`
-              : 'sk-...  或兼容 OpenAI Chat Completions 格式的密钥'"
+              ? '输入新的 API Key 可替换当前凭据'
+              : '输入兼容 OpenAI Chat Completions 格式的 API Key'"
             class="llm-key-input"
             autocomplete="off"
             spellcheck="false"

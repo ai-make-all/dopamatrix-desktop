@@ -17,7 +17,7 @@ src/services/reporting.py
 环境变量：
   INTERNAL_OPS_CHAT_ID      — 内部操作员群 chat_id（L1 收件人）
   CLIENT_REPORTING_CHAT_ID  — 默认客户群 chat_id（L2/L3 收件人，MVP 阶段）
-  TELEGRAM_BOT_TOKEN        — Bot Token（由 TelegramAdapter 自动读取）
+  TELEGRAM_BOT_TOKEN        — source-development compatibility only
 """
 
 from __future__ import annotations
@@ -54,7 +54,12 @@ class NotificationRouter:
     """
 
     def __init__(self) -> None:
-        self.adapter = TelegramAdapter()
+        try:
+            self.adapter = TelegramAdapter()
+        except ValueError:
+            # Telegram is optional. Missing/corrupt credentials disable only
+            # notification delivery and never change render/task authority.
+            self.adapter = None
         # L1 收件人：内部运营群（菲律宾团队 / 研发值班）
         self.internal_chat_id = os.getenv("INTERNAL_OPS_CHAT_ID", "").strip() or None
         # L2/L3 默认收件人：客户汇报群（MVP 阶段单租户使用）
@@ -103,6 +108,10 @@ class NotificationRouter:
 
         遍历目标 chat_id 列表逐一发送，单个目标失败不阻断其他目标。
         """
+        if self.adapter is None:
+            logger.warning("[Reporting] Telegram notification is not configured")
+            return
+
         target_chats = await self._get_target_chat_ids(tier, tenant_id)
 
         if not target_chats:
@@ -121,7 +130,11 @@ class NotificationRouter:
                     await self.adapter.send_text(chat_id, text)
                 logger.debug(f"[Reporting] tier={tier.value} → chat_id={chat_id} 发送成功")
             except Exception as exc:
-                logger.error(f"[Reporting] 发送至 chat_id={chat_id} 失败: {exc}")
+                logger.error(
+                    "[Reporting] Telegram delivery failed chat_id=%s error=%s",
+                    chat_id,
+                    type(exc).__name__,
+                )
 
 
 # ================================================================== #

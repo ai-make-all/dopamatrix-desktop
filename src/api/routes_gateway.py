@@ -101,8 +101,8 @@ async def receive_webhook(
         )
 
     # ---- 3. 实例化适配器 ------------------------------------------ #
-    # 注意：适配器的构造依赖环境变量（如 TELEGRAM_BOT_TOKEN），
-    # 若 Token 未配置会在此处抛出 ValueError，返回 500 以触发告警。
+    # The adapter resolves packaged credentials through secure_settings;
+    # missing optional configuration fails only this integration request.
     try:
         adapter = adapter_class()
     except ValueError as exc:
@@ -158,8 +158,12 @@ async def receive_webhook(
         except Exception as exc:
             # 发送失败不影响 Webhook 确认（避免平台重试导致消息重复）
             logger.error(
-                f"[Gateway] 出站发送失败 mode={send_mode} platform={platform} "
-                f"chat_id={msg.reply_channel_id}: {exc}"
+                "[Gateway] outbound delivery failed mode=%s platform=%s "
+                "chat_id=%s error=%s",
+                send_mode,
+                platform,
+                msg.reply_channel_id,
+                type(exc).__name__,
             )
 
     # ---- 7. 向平台返回 200 确认（务必快速响应！）------------------- #
