@@ -259,11 +259,9 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertTrue(err.startswith(f"{OPERATOR_INVALID_ARGUMENT}:"))
 
-    def test_every_frozen_command_grammar_reaches_only_the_placeholder(self):
+    def test_every_later_command_grammar_reaches_only_the_placeholder(self):
         commands = (
-            ("config", "status"),
             ("tenant", "provision", "--tenant", "ph-elv-0001", "--approval-ref", "A-1"),
-            ("seed", "status", "--tenant", "ph-elv-0001"),
             (
                 "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
                 "--generation", "phseed-elv0001-bal-20260921-r1",
@@ -295,7 +293,6 @@ class OperatorParserTests(unittest.TestCase):
                 "--rollback-window", "7d", "--backup-bundle", "X:/backup",
                 "--approval-ref", "A-1",
             ),
-            ("secret", "assignment", "status"),
             (
                 "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
                 "--expected-generation", "phseed-elv0001-bal-20260921-r1",
@@ -315,13 +312,13 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(stdout, "")
                 self.assertTrue(stderr.startswith(f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}:"))
 
-    def test_registered_command_reaches_only_h4_1a_placeholder(self):
-        exit_code, stdout, stderr = self._invoke("config", "status")
+    def test_registered_future_command_reaches_only_h4_1a_placeholder(self):
+        exit_code, stdout, stderr = self._invoke("backup", "verify", "--bundle", "X:/backup")
         self.assertEqual(exit_code, OperatorExitCode.STATE)
         self.assertEqual(stdout, "")
         self.assertEqual(
             stderr,
-            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: config status is registered but not implemented in H4-1A\n",
+            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: backup verify is registered but not implemented in H4-1A\n",
         )
 
 

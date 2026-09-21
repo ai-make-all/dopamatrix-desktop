@@ -465,6 +465,41 @@ def parse_operator_arguments(argv: Sequence[str]) -> tuple[OperatorResult, bool]
         )
 
     command = " ".join(spec.path)
+    if spec.path in {
+        ("config", "status"),
+        ("seed", "status"),
+        ("secret", "assignment", "status"),
+    }:
+        from .operator_status import observe_operator_status
+
+        values = {
+            remaining[index]: remaining[index + 1]
+            for index in range(0, len(remaining), 2)
+        }
+        outcome = observe_operator_status(
+            spec.path,
+            tenant_id=values.get("--tenant"),
+        )
+        if outcome.error_code is None:
+            return (
+                operator_success(
+                    command=command,
+                    status=outcome.status,
+                    message=outcome.message,
+                    data=outcome.data,
+                ),
+                json_mode,
+            )
+        return (
+            operator_failure(
+                command=command,
+                error_code=outcome.error_code,
+                message=outcome.message,
+                exit_code=OperatorExitCode(outcome.exit_code),
+                data=outcome.data,
+            ),
+            json_mode,
+        )
     return (
         operator_failure(
             command=command,

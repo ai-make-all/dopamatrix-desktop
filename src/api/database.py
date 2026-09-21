@@ -12,18 +12,24 @@ Engine 实例按租户缓存，避免重复创建；线程锁保证并发安全�
 RuntimePaths 提供绝对路径，供 app_settings 与 ORM 使用。
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
 import sqlite3
 import threading
 
-from fastapi import Request
 from sqlalchemy import Integer, String, create_engine, event, inspect as sa_inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from starlette.requests import Request
 
-from .runtime_paths import get_runtime_paths
+from .runtime_paths import (
+    get_initialized_runtime_paths,
+    get_runtime_paths,
+    resolve_runtime_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +75,7 @@ def _set_sqlite_foreign_key_pragma(dbapi_connection, connection_record):
 # 全局共享数据库（app_settings 等非租户数据存储于此）                     #
 # main.py 中 `from src.api.database import engine, Base` 依赖此变量。  #
 # ------------------------------------------------------------------ #
-_runtime_paths = get_runtime_paths()
+_runtime_paths = get_initialized_runtime_paths() or resolve_runtime_paths()
 
 
 def _sqlite_database_url(path) -> str:

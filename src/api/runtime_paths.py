@@ -201,6 +201,12 @@ def get_runtime_paths() -> RuntimePaths:
     return current if current is not None else initialize_runtime_paths()
 
 
+def get_initialized_runtime_paths() -> RuntimePaths | None:
+    """Return the installed authority without initializing or creating paths."""
+    with _runtime_paths_lock:
+        return _runtime_paths
+
+
 @contextmanager
 def temporary_test_runtime_paths(
     runtime_root: str | os.PathLike[str],
