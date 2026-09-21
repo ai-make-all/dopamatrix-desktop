@@ -182,6 +182,24 @@ def get_sidecar_filename():
         return f"backend-{triple}"
 
 
+def get_pyinstaller_command() -> list[str]:
+    """Return the single-binary backend build command.
+
+    The console subsystem is required so a direct ``backend.exe operator``
+    invocation inherits terminal stdout/stderr and exposes its exit status.
+    Normal Tauri startup remains windowless because tauri-plugin-shell applies
+    ``CREATE_NO_WINDOW`` when it spawns the same sidecar bytes on Windows.
+    """
+    return [
+        "pyinstaller",
+        "--noconfirm",
+        "--onefile",
+        "--console",
+        "--name", "backend",
+        "main.py",
+    ]
+
+
 def build():
     # ── Step 0: 释放文件锁（关闭正在运行的旧版本） ──────────────────────────
     print("==> [0/4] 终止正在运行的 DopaMatrix 进程（释放文件锁）...")
@@ -197,14 +215,7 @@ def build():
 
     print("==> [1/4] 运行 PyInstaller 打包后端...")
     subprocess.run(
-        [
-            "pyinstaller",
-            "--noconfirm",
-            "--onefile",
-            "--windowed",   # 防止 Windows 上弹出黑色 CMD 窗口
-            "--name", "backend",
-            "main.py",
-        ],
+        get_pyinstaller_command(),
         check=True,
     )
 
