@@ -198,7 +198,7 @@ class BootstrapContractTests(unittest.TestCase):
             result = _run_probe(
                 f"""
                 import json, runpy, sys
-                sys.argv = [r'{REPOSITORY_ROOT / 'main.py'}', 'operator', 'status']
+                sys.argv = [r'{REPOSITORY_ROOT / 'main.py'}', 'operator', '--help']
                 exit_code = None
                 try:
                     runpy.run_path(r'{REPOSITORY_ROOT / 'main.py'}', run_name='__main__')
@@ -216,12 +216,13 @@ class BootstrapContractTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         observed = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(observed["exit_code"], 2)
+        self.assertEqual(observed["exit_code"], 0)
         self.assertFalse(observed["fastapi"])
         self.assertFalse(observed["database"])
         self.assertFalse(observed["routes"])
         self.assertFalse(observed["uvicorn"])
-        self.assertIn("OPERATOR_COMMANDS_NOT_IMPLEMENTED_H1", result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Usage: backend.exe operator", result.stdout)
 
     def test_normal_source_import_constructs_fastapi_app_without_lifespan(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -18,17 +18,20 @@ import sys
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from src.api.bootstrap import (
-    apply_server_compatibility_cwd,
-    operator_placeholder_exit_code,
-    prepare_bootstrap,
-)
+from src.api.bootstrap import is_operator_invocation
 
-# Runtime mode/root and future operator dispatch are resolved before importing
-# dotenv, FastAPI, database, routers, Ngrok, logger, or the render graph.
+# The operator entry is recognized before RuntimePaths initialization, dotenv,
+# FastAPI, database, routers, Ngrok, logger, or the render graph. The command
+# module is imported lazily only for the operator process path.
+if __name__ == "__main__" and is_operator_invocation(sys.argv):
+    from src.api.operator_cli import run_operator_cli
+
+    raise SystemExit(run_operator_cli(sys.argv[2:]))
+
+from src.api.bootstrap import apply_server_compatibility_cwd, prepare_bootstrap
+
+# Only the normal server path initializes RuntimePaths and the application graph.
 _bootstrap_decision = prepare_bootstrap(sys.argv)
-if __name__ == "__main__" and _bootstrap_decision.operator_requested:
-    raise SystemExit(operator_placeholder_exit_code())
 
 # Temporary H1 compatibility for packaged non-authoritative resource lookups.
 # All mutable database/output authorities use absolute RuntimePaths instead.
