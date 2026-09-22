@@ -836,9 +836,8 @@ print(json.dumps({{
         self.assertFalse(observed["ngrok"])
         self.assertEqual(observed["routers"], [])
 
-    def test_all_later_commands_remain_not_implemented_placeholders(self):
+    def test_all_post_h4_4_commands_remain_not_implemented_placeholders(self):
         future_commands = (
-            ("tenant", "provision", "--tenant", "ph-elv-0001", "--approval-ref", "R"),
             ("seed", "apply-safe-off", "--tenant", "ph-elv-0001", "--generation", "G", "--approval-ref", "R"),
             ("seed", "prearm-p3w", "--tenant", "ph-elv-0001", "--generation", "G", "--backup-bundle", "X", "--approval-ref", "R"),
             ("seed", "activate", "--tenant", "ph-elv-0001", "--generation", "G", "--backup-bundle", "X", "--approval-ref", "R"),

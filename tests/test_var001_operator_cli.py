@@ -259,9 +259,8 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertTrue(err.startswith(f"{OPERATOR_INVALID_ARGUMENT}:"))
 
-    def test_every_later_command_grammar_reaches_only_the_placeholder(self):
+    def test_every_post_h4_4_command_grammar_reaches_only_the_placeholder(self):
         commands = (
-            ("tenant", "provision", "--tenant", "ph-elv-0001", "--approval-ref", "A-1"),
             (
                 "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
                 "--generation", "phseed-elv0001-bal-20260921-r1",

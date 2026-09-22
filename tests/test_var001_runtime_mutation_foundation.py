@@ -378,9 +378,8 @@ print(json.dumps({{'failure': failure, 'reacquired': True}}))
             self.assertEqual(seed.exit_code, OperatorExitCode.NOT_FOUND)
             self.assertNotEqual(seed.error_code, "RUNTIME_MUTATION_BARRIER_BUSY")
 
-    def test_all_future_mutation_and_backup_commands_remain_placeholders(self):
+    def test_all_post_h4_4_mutation_and_backup_commands_remain_placeholders(self):
         commands = (
-            ("tenant", "provision", "--tenant", TENANT, "--approval-ref", "A-1"),
             (
                 "seed", "apply-safe-off", "--tenant", TENANT,
                 "--generation", GENERATION, "--approval-ref", "A-1",
