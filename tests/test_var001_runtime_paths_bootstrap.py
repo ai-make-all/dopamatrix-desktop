@@ -229,10 +229,21 @@ class BootstrapContractTests(unittest.TestCase):
             result = _run_probe(
                 f"""
                 import appdirs, dotenv, json, sys
+                from unittest.mock import patch
+                from src.api.bootstrap import BootstrapDecision
+                from src.api.runtime_paths import initialize_runtime_paths, RuntimeMode
                 appdirs.user_log_dir = lambda *args, **kwargs: r'{Path(directory) / 'logs'}'
                 dotenv.load_dotenv = lambda *args, **kwargs: False
                 sys.argv = ['main-import-probe']
-                import main
+                paths = initialize_runtime_paths(
+                    mode=RuntimeMode.SOURCE_DEVELOPMENT,
+                    runtime_root=r'{Path(directory) / 'runtime'}',
+                )
+                with patch(
+                    'src.api.bootstrap.prepare_bootstrap',
+                    return_value=BootstrapDecision(paths, False),
+                ):
+                    import main
                 print(json.dumps({{
                     'app_type': type(main.app).__name__,
                     'mode': main._bootstrap_decision.runtime_paths.mode.value,

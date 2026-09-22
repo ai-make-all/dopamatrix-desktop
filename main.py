@@ -33,6 +33,28 @@ from src.api.bootstrap import apply_server_compatibility_cwd, prepare_bootstrap
 # Only the normal server path initializes RuntimePaths and the application graph.
 _bootstrap_decision = prepare_bootstrap(sys.argv)
 
+# The normal backend owns the same crash-releasing mutation barrier from before
+# the mutable application graph until shutdown. Operator/status paths exit above.
+from src.api.runtime_mutation import (
+    RuntimeMutationBarrierBusy,
+    RuntimeMutationBarrierError,
+    acquire_server_runtime_mutation_barrier,
+    release_server_runtime_mutation_barrier,
+)
+
+try:
+    acquire_server_runtime_mutation_barrier(_bootstrap_decision.runtime_paths)
+except RuntimeMutationBarrierBusy:
+    sys.stderr.write(
+        "RUNTIME_MUTATION_BARRIER_BUSY: another backend or mutation is active\n"
+    )
+    raise SystemExit(4) from None
+except RuntimeMutationBarrierError:
+    sys.stderr.write(
+        "RUNTIME_MUTATION_BARRIER_ERROR: runtime mutation barrier is unavailable\n"
+    )
+    raise SystemExit(8) from None
+
 # Temporary H1 compatibility for packaged non-authoritative resource lookups.
 # All mutable database/output authorities use absolute RuntimePaths instead.
 apply_server_compatibility_cwd(_bootstrap_decision)
@@ -94,7 +116,7 @@ setup_logger()
 # Lifespan — 启动 & 关闭钩子                                           #
 # ================================================================== #
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期管理：启动时建表 + 开启内网穿透，关闭时清理隧道资源。"""
     _public_url: str | None = None
 
@@ -185,6 +207,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:
             logger.warning(f"[内网穿透] Ngrok 关闭时出现异常（可忽略）: {exc}")
     logger.info("[DopaMatrix] 应用已关闭。")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Hold the normal-server mutation barrier through startup and shutdown."""
+    acquire_server_runtime_mutation_barrier(_bootstrap_decision.runtime_paths)
+    try:
+        async with _application_lifespan(app):
+            yield
+    finally:
+        release_server_runtime_mutation_barrier()
 
 
 # ================================================================== #
@@ -307,9 +340,16 @@ if __name__ == "__main__":
 
     is_prod = getattr(sys, "frozen", False)
 
-    if is_prod:
-        # 生产环境（PyInstaller 打包）：直接传 FastAPI 实例，不能传字符串
-        uvicorn.run(app, host="127.0.0.1", port=8000, log_config=None)
-    else:
-        # 开发环境
-        uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    try:
+        if is_prod:
+            # 生产环境（PyInstaller 打包）：直接传 FastAPI 实例，不能传字符串
+            uvicorn.run(app, host="127.0.0.1", port=8000, log_config=None)
+        else:
+            # 开发环境
+            # The source reload parent is not the serving backend. Release
+            # before it spawns the child; the imported child acquires the same
+            # barrier before constructing its application graph.
+            release_server_runtime_mutation_barrier()
+            uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    finally:
+        release_server_runtime_mutation_barrier()

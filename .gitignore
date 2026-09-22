@@ -10,6 +10,7 @@
 /dopamatrix*.db-*
 /data/dopamatrix*.db
 /data/dopamatrix*.db-*
+/dopamatrix-runtime-mutation.lock
 
 # Local Python environment
 venv_build/
