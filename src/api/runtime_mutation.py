@@ -274,4 +274,3 @@ def checked_immediate_transaction(
     except BaseException:
         _rollback_checked_transaction(connection)
         raise
-
