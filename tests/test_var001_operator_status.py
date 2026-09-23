@@ -836,7 +836,7 @@ print(json.dumps({{
         self.assertFalse(observed["ngrok"])
         self.assertEqual(observed["routers"], [])
 
-    def test_all_post_h4_4_commands_remain_not_implemented_placeholders(self):
+    def test_all_post_h4_5_commands_remain_not_implemented_placeholders(self):
         future_commands = (
             ("seed", "apply-safe-off", "--tenant", "ph-elv-0001", "--generation", "G", "--approval-ref", "R"),
             ("seed", "prearm-p3w", "--tenant", "ph-elv-0001", "--generation", "G", "--backup-bundle", "X", "--approval-ref", "R"),
@@ -845,8 +845,6 @@ print(json.dumps({{
             ("seed", "set-balanced-bps", "--tenant", "ph-elv-0001", "--generation", "G", "--bps", "3000", "--backup-bundle", "X", "--approval-ref", "R"),
             ("seed", "transition-p3a", "--tenant", "ph-elv-0001", "--generation", "G", "--rollback-window", "7d", "--backup-bundle", "X", "--approval-ref", "R"),
             ("secret", "assignment", "rotate", "--tenant", "ph-elv-0001", "--expected-generation", "G", "--new-generation", "G2", "--backup-bundle", "X", "--approval-ref", "R"),
-            ("backup", "create", "--tenant", "ph-elv-0001", "--destination", "X"),
-            ("backup", "verify", "--bundle", "X"),
         )
         for arguments in future_commands:
             with self.subTest(arguments=arguments):

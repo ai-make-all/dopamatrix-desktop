@@ -259,7 +259,7 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertTrue(err.startswith(f"{OPERATOR_INVALID_ARGUMENT}:"))
 
-    def test_every_post_h4_4_command_grammar_reaches_only_the_placeholder(self):
+    def test_every_post_h4_5_command_grammar_reaches_only_the_placeholder(self):
         commands = (
             (
                 "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
@@ -298,11 +298,6 @@ class OperatorParserTests(unittest.TestCase):
                 "--new-generation", "phseed-elv0001-bal-20260921-r2",
                 "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
             ),
-            (
-                "backup", "create", "--tenant", "ph-elv-0001",
-                "--destination", "X:/new-backup",
-            ),
-            ("backup", "verify", "--bundle", "X:/backup"),
         )
         for arguments in commands:
             with self.subTest(arguments=arguments):
@@ -312,12 +307,16 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertTrue(stderr.startswith(f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}:"))
 
     def test_registered_future_command_reaches_only_h4_1a_placeholder(self):
-        exit_code, stdout, stderr = self._invoke("backup", "verify", "--bundle", "X:/backup")
+        exit_code, stdout, stderr = self._invoke(
+            "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
+            "--generation", "phseed-elv0001-bal-20260921-r1",
+            "--approval-ref", "A-1",
+        )
         self.assertEqual(exit_code, OperatorExitCode.STATE)
         self.assertEqual(stdout, "")
         self.assertEqual(
             stderr,
-            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: backup verify is registered but not implemented in H4-1A\n",
+            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: seed apply-safe-off is registered but not implemented in H4-1A\n",
         )
 
 

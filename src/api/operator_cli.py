@@ -527,6 +527,36 @@ def parse_operator_arguments(argv: Sequence[str]) -> tuple[OperatorResult, bool]
             ),
             json_mode,
         )
+    if spec.path in {("backup", "create"), ("backup", "verify")}:
+        from .operator_backup import create_operator_backup, verify_operator_backup
+
+        if spec.path == ("backup", "create"):
+            outcome = create_operator_backup(
+                values["--tenant"],
+                values["--destination"],
+            )
+        else:
+            outcome = verify_operator_backup(values["--bundle"])
+        if outcome.error_code is None:
+            return (
+                operator_success(
+                    command=command,
+                    status=outcome.status,
+                    message=outcome.message,
+                    data=outcome.data,
+                ),
+                json_mode,
+            )
+        return (
+            operator_failure(
+                command=command,
+                error_code=outcome.error_code,
+                message=outcome.message,
+                exit_code=OperatorExitCode(outcome.exit_code),
+                data=outcome.data,
+            ),
+            json_mode,
+        )
     return (
         operator_failure(
             command=command,

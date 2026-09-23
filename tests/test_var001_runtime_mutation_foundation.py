@@ -378,7 +378,7 @@ print(json.dumps({{'failure': failure, 'reacquired': True}}))
             self.assertEqual(seed.exit_code, OperatorExitCode.NOT_FOUND)
             self.assertNotEqual(seed.error_code, "RUNTIME_MUTATION_BARRIER_BUSY")
 
-    def test_all_post_h4_4_mutation_and_backup_commands_remain_placeholders(self):
+    def test_all_post_h4_5_mutation_commands_remain_placeholders(self):
         commands = (
             (
                 "seed", "apply-safe-off", "--tenant", TENANT,
@@ -413,11 +413,6 @@ print(json.dumps({{'failure': failure, 'reacquired': True}}))
                 "--new-generation", "phseed-elv0001-bal-20260921-r2",
                 "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
             ),
-            (
-                "backup", "create", "--tenant", TENANT,
-                "--destination", "X:/new-backup",
-            ),
-            ("backup", "verify", "--bundle", "X:/backup"),
         )
         with tempfile.TemporaryDirectory() as directory:
             previous = Path.cwd()

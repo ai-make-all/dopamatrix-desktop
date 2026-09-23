@@ -23,12 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
-from sqlalchemy import create_engine
-
 from src.version import APPLICATION_VERSION
-
-from .database import canonical_tenant_id, initialize_application_schema
-from .fingerprint_ledger import ensure_fingerprint_ledger_schema
 
 
 BACKUP_FORMAT_VERSION = 1
@@ -155,13 +150,34 @@ def _safe_bundle_member(bundle_root: Path, relative_path: PurePosixPath) -> Path
 
 
 def _tenant_database_path(project_root: Path, tenant_id: str) -> tuple[str, Path]:
-    canonical = canonical_tenant_id(tenant_id)
+    canonical = _canonical_tenant_id(tenant_id)
     root = project_root.resolve()
     return canonical, root / "data" / f"dopamatrix_{canonical}.db"
 
 
+def _canonical_tenant_id(tenant_id: str | None) -> str:
+    """Mirror the legacy physical-name sanitizer without importing database.py.
+
+    The backup verifier is a standalone bundle operation.  Importing the
+    application database module would bind a global Engine to RuntimePaths and
+    can initialize runtime directories before verification starts.
+    """
+    raw_tenant_id = tenant_id or "default"
+    safe_tenant_id = "".join(
+        character
+        for character in raw_tenant_id
+        if character.isalnum() or character in ("_", "-")
+    )
+    return os.path.normcase(safe_tenant_id or "default")
+
+
 def _sqlite_read_only_uri(path: Path) -> str:
     return f"{path.resolve().as_uri()}?mode=ro"
+
+
+def _sqlite_immutable_read_only_uri(path: Path) -> str:
+    """Open a completed bundle snapshot without creating SQLite sidecars."""
+    return f"{path.resolve().as_uri()}?mode=ro&immutable=1"
 
 
 def _sqlite_online_backup(source_path: Path, destination_path: Path) -> None:
@@ -264,7 +280,9 @@ def _enumerate_authoritative_assets(
     project_root: Path,
     asset_root: Path,
 ) -> list[_AssetSource]:
-    connection = sqlite3.connect(_sqlite_read_only_uri(snapshot_path), uri=True)
+    connection = sqlite3.connect(
+        _sqlite_immutable_read_only_uri(snapshot_path), uri=True
+    )
     try:
         if "task_history" not in _table_names(connection):
             return []
@@ -374,11 +392,16 @@ def _write_manifest(staging_root: Path, manifest: dict[str, Any]) -> None:
 
 
 def _snapshot_catalog_and_counts(snapshot_path: Path) -> dict[str, int]:
-    connection = sqlite3.connect(_sqlite_read_only_uri(snapshot_path), uri=True)
     try:
-        return _snapshot_counts(connection)
-    finally:
-        connection.close()
+        connection = sqlite3.connect(
+            _sqlite_immutable_read_only_uri(snapshot_path), uri=True
+        )
+        try:
+            return _snapshot_counts(connection)
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as exc:
+        raise BackupIntegrityError() from exc
 
 
 def create_backup_bundle(
@@ -393,8 +416,8 @@ def create_backup_bundle(
     if not source_database.is_file():
         raise BackupSourceNotFoundError()
 
-    final_root = Path(destination).absolute()
-    if final_root.exists():
+    final_root = Path(destination).resolve(strict=False)
+    if os.path.lexists(final_root):
         raise BackupDestinationExistsError()
     final_root.parent.mkdir(parents=True, exist_ok=True)
     staging_root = final_root.parent / f".{final_root.name}.staging-{uuid.uuid4().hex}"
@@ -447,7 +470,7 @@ def create_backup_bundle(
         }
         _write_manifest(staging_root, manifest)
         verify_backup_bundle(staging_root)
-        os.replace(staging_root, final_root)
+        _publish_staging_directory(staging_root, final_root)
         return BackupResult(final_root, canonical, len(asset_entries), counts)
     except Exception:
         shutil.rmtree(staging_root, ignore_errors=True)
@@ -480,17 +503,40 @@ def _read_manifest(bundle_root: Path) -> dict[str, Any]:
     return manifest
 
 
+def _publish_staging_directory(staging_root: Path, final_root: Path) -> None:
+    """Publish without replacing a destination won by a competing process.
+
+    DopaMatrix V1.5 is a Windows product.  ``os.rename`` on Windows fails when
+    the destination exists, unlike ``os.replace`` which deliberately replaces
+    an existing entry.  The immediate lexists check also catches broken links
+    and gives a stable conflict before the rename call.
+    """
+    if os.path.lexists(final_root):
+        raise BackupDestinationExistsError()
+    try:
+        os.rename(staging_root, final_root)
+    except OSError:
+        if os.path.lexists(final_root):
+            raise BackupDestinationExistsError() from None
+        raise
+
+
 def _snapshot_catalog_contract(database_path: Path) -> dict[str, str]:
     """Return every authoritative TaskHistory asset locator and its shape."""
-    connection = sqlite3.connect(_sqlite_read_only_uri(database_path), uri=True)
     try:
-        if "task_history" not in _table_names(connection):
-            return {}
-        rows = connection.execute(
-            "SELECT id, output_assets FROM task_history ORDER BY id"
-        ).fetchall()
-    finally:
-        connection.close()
+        connection = sqlite3.connect(
+            _sqlite_immutable_read_only_uri(database_path), uri=True
+        )
+        try:
+            if "task_history" not in _table_names(connection):
+                return {}
+            rows = connection.execute(
+                "SELECT id, output_assets FROM task_history ORDER BY id"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as exc:
+        raise BackupIntegrityError() from exc
 
     contract: dict[str, str] = {}
     for history_id, encoded_assets in rows:
@@ -525,7 +571,7 @@ def verify_backup_bundle(bundle: str | Path) -> dict[str, Any]:
         raise BackupFormatError()
 
     tenant = manifest.get("canonical_tenant_id")
-    if not isinstance(tenant, str) or not tenant or canonical_tenant_id(tenant) != tenant:
+    if not isinstance(tenant, str) or not tenant or _canonical_tenant_id(tenant) != tenant:
         raise BackupFormatError()
     created = manifest.get("created_at_utc")
     if not isinstance(created, str) or not created.endswith("Z"):
@@ -604,8 +650,12 @@ def verify_backup_bundle(bundle: str | Path) -> dict[str, Any]:
         raise BackupFormatError()
     for value in counts.values():
         _require_int(value)
+    if dict(counts) != _snapshot_catalog_and_counts(database_path):
+        raise BackupIntegrityError()
 
-    connection = sqlite3.connect(_sqlite_read_only_uri(database_path), uri=True)
+    connection = sqlite3.connect(
+        _sqlite_immutable_read_only_uri(database_path), uri=True
+    )
     try:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
@@ -618,6 +668,11 @@ def verify_backup_bundle(bundle: str | Path) -> dict[str, Any]:
 
 
 def _validate_restored_database(database_path: Path) -> None:
+    from sqlalchemy import create_engine
+
+    from .database import initialize_application_schema
+    from .fingerprint_ledger import ensure_fingerprint_ledger_schema
+
     engine = create_engine(
         f"sqlite:///{database_path.as_posix()}",
         connect_args={"check_same_thread": False},

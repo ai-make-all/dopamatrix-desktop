@@ -433,18 +433,6 @@ class NamespaceAuthorityTests(unittest.TestCase):
                 self.assertEqual(result.error_code, OPERATOR_DELIVERY_NAMESPACE_COLLISION)
                 self.assertEqual(marker.read_bytes(), b"unchanged")
 
-    def test_backup_commands_remain_placeholders(self):
-        for arguments in (
-            ("backup", "create", "--tenant", "ph-elv-0001", "--destination", "X:\\new"),
-            ("backup", "verify", "--bundle", "X:\\bundle"),
-        ):
-            with self.subTest(arguments=arguments):
-                stdout, stderr = io.StringIO(), io.StringIO()
-                exit_code = run_operator_cli(arguments, stdout=stdout, stderr=stderr)
-                self.assertEqual(exit_code, 4)
-                self.assertIn(OPERATOR_COMMAND_NOT_IMPLEMENTED, stderr.getvalue())
-
-
 class ProvisioningVerificationAndOutputTests(unittest.TestCase):
     def test_initializer_failure_without_artifact_is_subsystem_failure(self):
         with tempfile.TemporaryDirectory() as directory:
