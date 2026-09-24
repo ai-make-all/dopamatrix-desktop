@@ -15,7 +15,6 @@ from unittest.mock import patch
 from src.api.bootstrap import is_operator_invocation, prepare_bootstrap
 from src.api.operator_cli import (
     JSON_SCHEMA_VERSION,
-    OPERATOR_COMMAND_NOT_IMPLEMENTED,
     OPERATOR_INVALID_ARGUMENT,
     OPERATOR_UNKNOWN_COMMAND,
     OPERATOR_UNKNOWN_NAMESPACE,
@@ -259,34 +258,33 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertTrue(err.startswith(f"{OPERATOR_INVALID_ARGUMENT}:"))
 
-    def test_h4_7_command_grammar_reaches_only_the_placeholder(self):
-        commands = (
-            (
+    def test_h4_7_command_grammar_dispatches_to_rotation_service(self):
+        outcome = SimpleNamespace(
+            status="ROTATED",
+            message="ROTATED",
+            data={"restart_required": True},
+            exit_code=0,
+            error_code=None,
+        )
+        with patch(
+            "src.api.operator_secret.rotate_assignment_secret",
+            return_value=outcome,
+        ) as rotate:
+            exit_code, stdout, stderr = self._invoke(
                 "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
                 "--expected-generation", "phseed-elv0001-bal-20260921-r1",
                 "--new-generation", "phseed-elv0001-bal-20260921-r2",
                 "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-        )
-        for arguments in commands:
-            with self.subTest(arguments=arguments):
-                code, stdout, stderr = self._invoke(*arguments)
-                self.assertEqual(code, OperatorExitCode.STATE)
-                self.assertEqual(stdout, "")
-                self.assertTrue(stderr.startswith(f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}:"))
-
-    def test_registered_h4_7_command_reaches_only_placeholder(self):
-        exit_code, stdout, stderr = self._invoke(
-            "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
-            "--expected-generation", "phseed-elv0001-bal-20260921-r1",
-            "--new-generation", "phseed-elv0001-bal-20260921-r2",
-            "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-        )
-        self.assertEqual(exit_code, OperatorExitCode.STATE)
-        self.assertEqual(stdout, "")
-        self.assertEqual(
-            stderr,
-            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: secret assignment rotate is registered but not implemented in H4-1A\n",
+            )
+        self.assertEqual(exit_code, OperatorExitCode.SUCCESS)
+        self.assertEqual(stdout, "ROTATED\n")
+        self.assertEqual(stderr, "")
+        rotate.assert_called_once_with(
+            "ph-elv-0001",
+            "phseed-elv0001-bal-20260921-r1",
+            "phseed-elv0001-bal-20260921-r2",
+            "X:/backup",
+            "A-1",
         )
 
 

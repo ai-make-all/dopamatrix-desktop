@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.api.operator_cli import OPERATOR_COMMAND_NOT_IMPLEMENTED, run_operator_cli
+from src.api.operator_cli import run_operator_cli
 from src.api.operator_tenant_provision import (
     BACKUP_NAMESPACE_NOT_CONFIGURED,
     OPERATOR_APPROVAL_REF_INVALID,

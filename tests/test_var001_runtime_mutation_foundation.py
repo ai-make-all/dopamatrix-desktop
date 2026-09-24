@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import runpy
@@ -16,11 +15,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.api.operator_cli import (
-    OPERATOR_COMMAND_NOT_IMPLEMENTED,
-    OperatorExitCode,
-    run_operator_cli,
-)
+from src.api.operator_cli import OperatorExitCode
 from src.api.operator_status import observe_operator_status
 from src.api.policy_profiles import (
     OPERATIONAL_SNAPSHOT_SETTING_KEY,
@@ -377,40 +372,6 @@ print(json.dumps({{'failure': failure, 'reacquired': True}}))
             self.assertEqual((secret.exit_code, secret.status), (0, "ABSENT"))
             self.assertEqual(seed.exit_code, OperatorExitCode.NOT_FOUND)
             self.assertNotEqual(seed.error_code, "RUNTIME_MUTATION_BARRIER_BUSY")
-
-    def test_h4_7_mutation_command_remains_placeholder(self):
-        commands = (
-            (
-                "secret", "assignment", "rotate", "--tenant", TENANT,
-                "--expected-generation", GENERATION,
-                "--new-generation", "phseed-elv0001-bal-20260921-r2",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            previous = Path.cwd()
-            os.chdir(directory)
-            try:
-                for command in commands:
-                    with self.subTest(command=command):
-                        stdout = io.StringIO()
-                        stderr = io.StringIO()
-                        code = run_operator_cli(
-                            command, stdout=stdout, stderr=stderr
-                        )
-                        self.assertEqual(code, OperatorExitCode.STATE)
-                        self.assertEqual(stdout.getvalue(), "")
-                        self.assertTrue(
-                            stderr.getvalue().startswith(
-                                f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}:"
-                            )
-                        )
-                self.assertFalse(
-                    (Path(directory) / RUNTIME_MUTATION_LOCK_FILENAME).exists()
-                )
-            finally:
-                os.chdir(previous)
-
 
 class CheckedImmediateTransactionTests(unittest.TestCase):
     def _database(self, root: Path) -> Path:

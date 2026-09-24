@@ -36,7 +36,7 @@ from src.api.operator_backup import (
     create_operator_backup,
     verify_operator_backup,
 )
-from src.api.operator_cli import OPERATOR_COMMAND_NOT_IMPLEMENTED, run_operator_cli
+from src.api.operator_cli import run_operator_cli
 from src.api.runtime_paths import (
     LegacyRuntimeMigrationRequired,
     RuntimeMode,
@@ -986,7 +986,7 @@ print('STDERR_EMPTY=' + str(stderr.getvalue() == ''))
 
 
 class OperatorBackupOutputTests(unittest.TestCase):
-    def test_human_json_and_placeholder_contracts(self) -> None:
+    def test_human_and_json_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             paths = _paths(base / "runtime")
@@ -1013,21 +1013,6 @@ class OperatorBackupOutputTests(unittest.TestCase):
                 self.assertEqual(payload["status"], "VALID")
                 self.assertIsNone(payload["error_code"])
                 self.assertEqual(payload["data"]["tenant"], "ph-elv-0001")
-
-        placeholders = (
-            (
-                "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
-                "--expected-generation", "phseed-elv0001-bal-20260921-r1",
-                "--new-generation", "phseed-elv0001-bal-20260921-r2",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-        )
-        for command in placeholders:
-            with self.subTest(command=command):
-                code, stdout, stderr = _invoke(*command)
-                self.assertEqual(code, 4)
-                self.assertEqual(stdout, "")
-                self.assertIn(OPERATOR_COMMAND_NOT_IMPLEMENTED, stderr)
 
     def test_json_failures_cover_validation_state_not_found_integrity_and_subsystem(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -836,17 +836,5 @@ print(json.dumps({{
         self.assertFalse(observed["ngrok"])
         self.assertEqual(observed["routers"], [])
 
-    def test_h4_7_command_remains_not_implemented_placeholder(self):
-        future_commands = (
-            ("secret", "assignment", "rotate", "--tenant", "ph-elv-0001", "--expected-generation", "G", "--new-generation", "G2", "--backup-bundle", "X", "--approval-ref", "R"),
-        )
-        for arguments in future_commands:
-            with self.subTest(arguments=arguments):
-                code, stdout, stderr = _run_cli(arguments, self.paths, self.protector)
-                self.assertEqual(code, 4)
-                self.assertEqual(stdout, "")
-                self.assertIn("OPERATOR_COMMAND_NOT_IMPLEMENTED", stderr)
-
-
 if __name__ == "__main__":
     unittest.main()
