@@ -259,39 +259,8 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertTrue(err.startswith(f"{OPERATOR_INVALID_ARGUMENT}:"))
 
-    def test_every_post_h4_5_command_grammar_reaches_only_the_placeholder(self):
+    def test_h4_7_command_grammar_reaches_only_the_placeholder(self):
         commands = (
-            (
-                "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--approval-ref", "A-1", "--lease-profile", "180-45",
-            ),
-            (
-                "seed", "prearm-p3w", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "activate", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "kill", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--reason-code", "INCIDENT",
-            ),
-            (
-                "seed", "set-balanced-bps", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1", "--bps", "3000",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "transition-p3a", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--rollback-window", "7d", "--backup-bundle", "X:/backup",
-                "--approval-ref", "A-1",
-            ),
             (
                 "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
                 "--expected-generation", "phseed-elv0001-bal-20260921-r1",
@@ -306,17 +275,18 @@ class OperatorParserTests(unittest.TestCase):
                 self.assertEqual(stdout, "")
                 self.assertTrue(stderr.startswith(f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}:"))
 
-    def test_registered_future_command_reaches_only_h4_1a_placeholder(self):
+    def test_registered_h4_7_command_reaches_only_placeholder(self):
         exit_code, stdout, stderr = self._invoke(
-            "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
-            "--generation", "phseed-elv0001-bal-20260921-r1",
-            "--approval-ref", "A-1",
+            "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
+            "--expected-generation", "phseed-elv0001-bal-20260921-r1",
+            "--new-generation", "phseed-elv0001-bal-20260921-r2",
+            "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
         )
         self.assertEqual(exit_code, OperatorExitCode.STATE)
         self.assertEqual(stdout, "")
         self.assertEqual(
             stderr,
-            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: seed apply-safe-off is registered but not implemented in H4-1A\n",
+            f"{OPERATOR_COMMAND_NOT_IMPLEMENTED}: secret assignment rotate is registered but not implemented in H4-1A\n",
         )
 
 

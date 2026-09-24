@@ -836,14 +836,8 @@ print(json.dumps({{
         self.assertFalse(observed["ngrok"])
         self.assertEqual(observed["routers"], [])
 
-    def test_all_post_h4_5_commands_remain_not_implemented_placeholders(self):
+    def test_h4_7_command_remains_not_implemented_placeholder(self):
         future_commands = (
-            ("seed", "apply-safe-off", "--tenant", "ph-elv-0001", "--generation", "G", "--approval-ref", "R"),
-            ("seed", "prearm-p3w", "--tenant", "ph-elv-0001", "--generation", "G", "--backup-bundle", "X", "--approval-ref", "R"),
-            ("seed", "activate", "--tenant", "ph-elv-0001", "--generation", "G", "--backup-bundle", "X", "--approval-ref", "R"),
-            ("seed", "kill", "--tenant", "ph-elv-0001", "--generation", "G", "--reason-code", "R"),
-            ("seed", "set-balanced-bps", "--tenant", "ph-elv-0001", "--generation", "G", "--bps", "3000", "--backup-bundle", "X", "--approval-ref", "R"),
-            ("seed", "transition-p3a", "--tenant", "ph-elv-0001", "--generation", "G", "--rollback-window", "7d", "--backup-bundle", "X", "--approval-ref", "R"),
             ("secret", "assignment", "rotate", "--tenant", "ph-elv-0001", "--expected-generation", "G", "--new-generation", "G2", "--backup-bundle", "X", "--approval-ref", "R"),
         )
         for arguments in future_commands:

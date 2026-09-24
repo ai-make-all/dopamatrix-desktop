@@ -1016,16 +1016,6 @@ class OperatorBackupOutputTests(unittest.TestCase):
 
         placeholders = (
             (
-                "seed", "apply-safe-off", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "prearm-p3w", "--tenant", "ph-elv-0001",
-                "--generation", "phseed-elv0001-bal-20260921-r1",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-            (
                 "secret", "assignment", "rotate", "--tenant", "ph-elv-0001",
                 "--expected-generation", "phseed-elv0001-bal-20260921-r1",
                 "--new-generation", "phseed-elv0001-bal-20260921-r2",

@@ -1881,6 +1881,7 @@ class ReservationRolloutControlTests(unittest.TestCase):
         self.assertEqual(
             set(readiness_importers),
             {
+                "operator_seed.py",
                 "policy_profiles.py",
                 "reservation_rollout_control.py",
                 "routes_reservation_diagnostics.py",

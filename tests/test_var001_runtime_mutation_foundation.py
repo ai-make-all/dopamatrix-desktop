@@ -378,35 +378,8 @@ print(json.dumps({{'failure': failure, 'reacquired': True}}))
             self.assertEqual(seed.exit_code, OperatorExitCode.NOT_FOUND)
             self.assertNotEqual(seed.error_code, "RUNTIME_MUTATION_BARRIER_BUSY")
 
-    def test_all_post_h4_5_mutation_commands_remain_placeholders(self):
+    def test_h4_7_mutation_command_remains_placeholder(self):
         commands = (
-            (
-                "seed", "apply-safe-off", "--tenant", TENANT,
-                "--generation", GENERATION, "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "prearm-p3w", "--tenant", TENANT,
-                "--generation", GENERATION, "--backup-bundle", "X:/backup",
-                "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "activate", "--tenant", TENANT, "--generation", GENERATION,
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "kill", "--tenant", TENANT, "--generation", GENERATION,
-                "--reason-code", "INCIDENT",
-            ),
-            (
-                "seed", "set-balanced-bps", "--tenant", TENANT,
-                "--generation", GENERATION, "--bps", "3000",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
-            (
-                "seed", "transition-p3a", "--tenant", TENANT,
-                "--generation", GENERATION, "--rollback-window", "7d",
-                "--backup-bundle", "X:/backup", "--approval-ref", "A-1",
-            ),
             (
                 "secret", "assignment", "rotate", "--tenant", TENANT,
                 "--expected-generation", GENERATION,

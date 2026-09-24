@@ -557,6 +557,49 @@ def parse_operator_arguments(argv: Sequence[str]) -> tuple[OperatorResult, bool]
             ),
             json_mode,
         )
+    if spec.path in {
+        ("seed", "apply-safe-off"),
+        ("seed", "prearm-p3w"),
+        ("seed", "activate"),
+        ("seed", "kill"),
+        ("seed", "set-balanced-bps"),
+        ("seed", "transition-p3a"),
+    }:
+        from .operator_seed import execute_seed_transition
+
+        outcome = execute_seed_transition(
+            spec.path[1],
+            values["--tenant"],
+            values["--generation"],
+            approval_ref=values.get("--approval-ref"),
+            reason_code=values.get("--reason-code"),
+            lease_profile=values.get("--lease-profile"),
+            balanced_basis_points=(
+                int(values["--bps"]) if "--bps" in values else None
+            ),
+            rollback_window=values.get("--rollback-window"),
+            backup_bundle=values.get("--backup-bundle"),
+        )
+        if outcome.error_code is None:
+            return (
+                operator_success(
+                    command=command,
+                    status=outcome.status,
+                    message=outcome.message,
+                    data=outcome.data,
+                ),
+                json_mode,
+            )
+        return (
+            operator_failure(
+                command=command,
+                error_code=outcome.error_code,
+                message=outcome.message,
+                exit_code=OperatorExitCode(outcome.exit_code),
+                data=outcome.data,
+            ),
+            json_mode,
+        )
     return (
         operator_failure(
             command=command,
