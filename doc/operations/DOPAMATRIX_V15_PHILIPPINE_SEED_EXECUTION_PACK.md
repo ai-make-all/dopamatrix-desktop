@@ -16,20 +16,37 @@ content, HMAC input, owner-attempt IDs, SQL, or tenant database paths here.
 | Field | Operator entry |
 |---|---|
 | Application commit | `<APPLICATION_COMMIT>` |
-| Application tag | `<APPLICATION_TAG>` |
+| Application tag / release identifier | `<APPLICATION_TAG_OR_RELEASE>` |
 | Execution date | `<EXECUTION_DATE>` |
 | Staffed block | `<STAFFED_BLOCK>` |
 | Selected canonical tenant | `<CANONICAL_TENANT>` |
 | Tenant business type | `[ ] elevator  [ ] beauty  [ ] villa / water-heating` |
 | Tech Lead | `<TECH_LEAD>` |
 | Execution operator | `<OPERATOR>` |
-| Generation | `<GENERATION>` |
+| Current generation | `<GENERATION>` |
+| Approval/change references | `<APPROVAL_OR_CHANGE_REFERENCES>` |
+| Tenant provision result | `<PROVISIONED_OR_EXISTING_WITH_EVIDENCE>` |
+| Config status | `<STATUS_OR_BOUNDED_ERROR>` |
+| Seed status | `<STATUS_OR_BOUNDED_ERROR>` |
+| Assignment Secret status | `[ ] PRESENT  [ ] ABSENT  [ ] ERROR` |
+| SAFE_OFF apply result | `<APPLIED_OR_ALREADY_APPLIED>` |
+| Controlled restart completed after SAFE_OFF | `[ ] YES  [ ] NO` |
 | Delivery Root | `<DELIVERY_ROOT>` |
-| Backup identifier/path | `<BACKUP_ID>` |
+| Delivery verification | `[ ] PASS  [ ] FAIL` |
+| Backup create result/path | `<RESULT>` / `<ABSOLUTE_BUNDLE>` |
 | Backup verification result | `[ ] VALID  [ ] FAILED` |
-| Assignment secret loaded from secure channel | `[ ] YES  [ ] NO` |
+| P3-W prearm result | `<RESULT_OR_NOT_RUN>` |
+| Activation result | `<RESULT_OR_NOT_RUN>` |
+| Kill containment result | `<RESULT_OR_NOT_RUN>` |
+| Balanced BPS change result | `<RESULT_OR_NOT_RUN>` |
+| P3-A / 7d transition result | `<RESULT_OR_NOT_RUN>` |
+| Secret rotation incident/change record | `<OLD_GENERATION>` → `<NEW_GENERATION>` / `<REFERENCE>` |
+| Post-rotation restart completed | `[ ] YES  [ ] NO  [ ] NOT_APPLICABLE` |
+| Diagnostic evidence identifier | `<EVIDENCE_REFERENCE>` |
 
-Never paste the assignment secret into this pack. Generation must match:
+Never add an Assignment Secret value, length, hash, prefix, suffix, ciphertext,
+DPAPI blob, or HMAC intermediate to this pack. Only
+`PRESENT`/`ABSENT`/`ERROR` is permitted. Generation must match:
 
 ```text
 phseed-<tenantcode>-bal-YYYYMMDD-rN
@@ -56,22 +73,27 @@ All boxes must pass before P1.
 
 - [ ] Application commit and tag recorded.
 - [ ] Canonical tenant confirmed from the authoritative tenant identity.
-- [ ] Tenant backup completed.
-- [ ] Backup independently verified as `VALID`.
+- [ ] Approval/change references and responsible humans recorded.
+- [ ] Server quiesced before each mutation command.
+- [ ] Approved tenant explicitly provisioned with
+  `backend.exe operator tenant provision`, or existing-tenant evidence
+  independently confirmed.
+- [ ] `seed apply-safe-off` returned `APPLIED` or exact no-write
+  `ALREADY_APPLIED`.
+- [ ] Assignment Secret status recorded only as `PRESENT`, `ABSENT`, or
+  `ERROR`; no Secret material recorded.
+- [ ] Controlled backend restart completed after an applied mutation.
+- [ ] `config status` and tenant `seed status` recorded separately as
+  read-only evidence.
+- [ ] Packaged tenant backup completed to a new absolute destination outside
+  RuntimePaths, internal output, and Delivery.
+- [ ] Packaged `backup verify` independently returned `VALID`.
 - [ ] Delivery Root configured and GET-confirmed.
 - [ ] Derived tenant path verified:
   `<DELIVERY_ROOT>/tenants/<CANONICAL_TENANT>/projects/_default/`.
 - [ ] Two-Root boundary confirmed: internal `output/` remains authority.
-- [ ] Lease configured as TTL `180`, heartbeat `45`.
-- [ ] Complete Readiness environment key set configured.
-- [ ] Complete Rollout environment key set configured.
-- [ ] Exact Canary bps is `0`.
-- [ ] Balanced Canary bps is `0`.
-- [ ] Kill switch is `true`.
-- [ ] Only the selected tenant is in the active allowlist.
-- [ ] Generation matches `phseed-<tenantcode>-bal-YYYYMMDD-rN`.
-- [ ] Assignment secret loaded securely and never printed.
-- [ ] Controlled backend restart completed after environment changes.
+- [ ] Packaged Seed projection confirms lease `180/45`, Exact bps `0`,
+  Balanced bps `0`, kill `true`, one tenant, and reviewed generation.
 - [ ] Readiness endpoint returns a bounded non-error response.
 - [ ] Rollout-status endpoint returns a bounded non-error response.
 - [ ] Summary endpoint returns a bounded non-error response.
@@ -85,89 +107,74 @@ Backup operator / independent verifier: `<OPERATOR>` / `<VERIFIER>`
 
 P0 result: `[ ] PASS  [ ] STOP`
 
-## 4. Source-Valid Environment Manifest
+## 4. Packaged Operator Evidence Manifest
 
-Every environment change in this table requires a controlled backend restart.
-The loaders inspect the running process environment, but `.env` is loaded only
-at process startup and there is no supported hot-reload/mutation API.
+Every mutation requires server quiescence because the running server holds the
+H4 mutation barrier. `restart_required=true` means a controlled restart must
+follow; it does not mean the CLI performed one.
 
-`Dynamic CC` means the value may change only within the 1C Change-Control
-envelope. Rollout and Readiness key sets are all-or-none.
+| Checkpoint | Packaged command / evidence | Result | Exit | Approval/change reference | Restart completed? |
+|---|---|---|---:|---|---|
+| Tenant provision | `backend.exe operator tenant provision --tenant <TENANT> --approval-ref <REF>` | `<RESULT>` | `<EXIT>` | `<REF>` | N/A |
+| Config status | `backend.exe operator config status` | `<STATUS_OR_ERROR>` | `<EXIT>` | N/A | N/A |
+| Seed status | `backend.exe operator seed status --tenant <TENANT>` | `<STATUS_OR_ERROR>` | `<EXIT>` | N/A | N/A |
+| Assignment Secret status | `backend.exe operator secret assignment status` | `<PRESENT_ABSENT_ERROR>` | `<EXIT>` | N/A | N/A |
+| SAFE_OFF | `backend.exe operator seed apply-safe-off --tenant <TENANT> --generation <GENERATION> --approval-ref <REF>` | `<APPLIED_OR_ALREADY_APPLIED>` | `<EXIT>` | `<REF>` | `[ ]` |
+| Backup create | `backend.exe operator backup create --tenant <TENANT> --destination <ABSOLUTE_NEW_DIRECTORY>` | `<RESULT_AND_PATH>` | `<EXIT>` | `<CHANGE_REF>` | N/A |
+| Backup verify | `backend.exe operator backup verify --bundle <ABSOLUTE_BUNDLE>` | `<VALID_OR_ERROR>` | `<EXIT>` | `<VERIFIER>` | N/A |
+| P3-W prearm | `backend.exe operator seed prearm-p3w --tenant <TENANT> --generation <GENERATION> --backup-bundle <BUNDLE> --approval-ref <REF>` | `<RESULT>` | `<EXIT>` | `<REF>` | `[ ]` |
+| Activate | `backend.exe operator seed activate --tenant <TENANT> --generation <GENERATION> --backup-bundle <BUNDLE> --approval-ref <REF>` | `<RESULT>` | `<EXIT>` | `<REF>` | `[ ]` |
+| Kill containment | `backend.exe operator seed kill --tenant <TENANT> --generation <GENERATION> --reason-code <CODE>` | `<RESULT>` | `<EXIT>` | `<INCIDENT_REF>` | `[ ]` |
+| Balanced BPS | `backend.exe operator seed set-balanced-bps --tenant <TENANT> --generation <GENERATION> --bps <N> --backup-bundle <BUNDLE> --approval-ref <REF>` | `<RESULT>` | `<EXIT>` | `<REF>` | `[ ]` |
+| P3-A / 7d | `backend.exe operator seed transition-p3a --tenant <TENANT> --generation <GENERATION> --rollback-window 7d --backup-bundle <BUNDLE> --approval-ref <REF>` | `<RESULT>` | `<EXIT>` | `<REF>` | `[ ]` |
 
-### Lease
+The paired lease profiles remain indivisible: `180/45` or reviewed `300/60`.
+P3-W is Balanced `3000`, Exact `0`, kill `true`. P3-A / 7d retains the frozen
+coverage/safety thresholds and tightens zero-plan/partial/cleanup to
+`.30/.20/.20`. `P3_A/24h` is not machine-authorized through H4-6 and has no
+working operator recipe in this pack.
 
-| Exact key | P0/P1/P2 | P3-W | P3-A | Restart? | Secret? | Dynamic CC? |
-|---|---|---|---|---|---|---|
-| `RESERVATION_LEASE_TTL_SECONDS` | `180` | `180` | `180` | YES | NO | YES: profile may become 300 |
-| `RESERVATION_HEARTBEAT_INTERVAL_SECONDS` | `45` | `45` | `45` | YES | NO | YES: paired profile may become 60 |
+### Assignment Secret rotation incident/change record
 
-Lease profiles are indivisible: `180/45` or `300/60` only.
+| Field | Entry |
+|---|---|
+| Tenant | `<CANONICAL_TENANT>` |
+| Old generation | `<OLD_GENERATION>` |
+| New generation | `<NEW_GENERATION>` |
+| Verified backup bundle | `<ABSOLUTE_BUNDLE>` |
+| Approval/change reference | `<REFERENCE>` |
+| Rotation result | `<ROTATED_OR_BOUNDED_ERROR>` |
+| Kill containment confirmed | `[ ] true` |
+| Assignment Secret status | `[ ] PRESENT  [ ] ABSENT  [ ] ERROR` |
+| `restart_required` | `<true_or_false>` |
+| Controlled post-rotation restart completed | `[ ] YES  [ ] NO` |
 
-### Readiness
+Rotation is contained, backup-backed, and new-generation only. It is not
+routine cohort reset, Secret recovery/export/import, or permission to record
+Secret material.
 
-| Exact key | P0/P1/P2 | P3-W | P3-A | Restart? | Secret? | Dynamic CC? |
-|---|---|---|---|---|---|---|
-| `RESERVATION_ROLLOUT_READINESS_WINDOW` | `7d` | `7d` | `7d` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MINIMUM_AUTHORITATIVE_ENFORCE_TASKS` | `10` | `10` | `10` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MINIMUM_PLANNING_OBSERVED_TASKS` | `10` | `10` | `10` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MINIMUM_CONFLICT_TASKS` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MINIMUM_DIAGNOSTIC_RUN_COVERAGE_RATE` | `1.0` | `1.0` | `1.0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MINIMUM_PLANNING_OBSERVATION_COVERAGE_RATE` | `1.0` | `1.0` | `1.0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MINIMUM_TERMINAL_OBSERVATION_COVERAGE_RATE` | `1.0` | `1.0` | `1.0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MAXIMUM_ZERO_PLAN_CONFLICT_RATE` | `0.30` | `0.30` | `0.30` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MAXIMUM_PARTIAL_PLAN_RATE` | `0.20` | `0.20` | `0.20` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MAXIMUM_AUTHORITY_LOSS_RATE` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MAXIMUM_TERMINAL_PERSIST_FAILURE_RATE` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MAXIMUM_WORKER_LEASE_CONFIG_FAILURE_RATE` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_MAXIMUM_CLEANUP_WARNING_RATE` | `0.10` | `0.10` | `0.10` | YES | NO | NO |
+## 5. Packaged Mutation / Restart Procedure
 
-### Rollout control
+For SAFE_OFF, prearm, activation, containment, BPS change, P3-A / 7d, or
+Secret rotation:
 
-| Exact key | P0/P1/P2 | P3-W | P3-A | Restart? | Secret? | Dynamic CC? |
-|---|---|---|---|---|---|---|
-| `RESERVATION_ROLLOUT_CONTROL_ENABLED` | `true` | `true` | `true` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_GENERATION` | `<GENERATION>` | same | same | YES | NO | YES: governed epoch only |
-| `RESERVATION_ROLLOUT_TENANT_ALLOWLIST` | `<CANONICAL_TENANT>` | same single tenant | same single tenant | YES | NO | YES: one-at-a-time stagger |
-| `RESERVATION_ROLLOUT_EXACT_CANARY_BASIS_POINTS` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_BALANCED_CANARY_BASIS_POINTS` | `0` | `3000` | `3000` unless reviewed | YES | NO | YES: 1000--4000, <=1000/review |
-| `RESERVATION_ROLLOUT_ASSIGNMENT_SECRET` | `<LOAD_FROM_SECURE_OPERATOR_CHANNEL>` | unchanged | unchanged | YES | **YES** | Custodian only; never record value |
-| `RESERVATION_ROLLOUT_KILL_SWITCH` | `true` | `false` last | `false` unless containment | YES | NO | YES |
-| `RESERVATION_ROLLOUT_ROLLBACK_WINDOW` | `7d` | `7d` | `7d` initially | YES | NO | YES: `24h` only after eligibility |
-| `RESERVATION_ROLLOUT_MINIMUM_CANARY_TASKS` | `5` | `5` | `5` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MINIMUM_DIAGNOSTIC_COVERAGE_RATE` | `1.0` | `1.0` | `1.0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MINIMUM_PLANNING_COVERAGE_RATE` | `1.0` | `1.0` | `1.0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MINIMUM_TERMINAL_COVERAGE_RATE` | `1.0` | `1.0` | `1.0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_ZERO_PLAN_CONFLICT_RATE` | `1.0` | `1.0` | `0.30` after review | YES | NO | YES: defined P3 transition |
-| `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_PARTIAL_PLAN_RATE` | `1.0` | `1.0` | `0.20` after review | YES | NO | YES: defined P3 transition |
-| `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_AUTHORITY_LOSS_RATE` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_TERMINAL_PERSIST_FAILURE_RATE` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_WORKER_CONFIG_FAILURE_RATE` | `0` | `0` | `0` | YES | NO | NO |
-| `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_CLEANUP_WARNING_RATE` | `1.0` | `1.0` | `0.20` after review | YES | NO | YES: defined P3 transition |
+1. Record tenant, generation, exact packaged command, approval/change
+   reference, operator, approver, and pre-change evidence.
+2. Verify the command's required backup with packaged `backup verify`.
+   Backup-bearing mutation commands reverify it again synchronously.
+3. Drain active work and quiesce the normal server.
+4. Run the one reviewed packaged mutation command.
+5. Record exact exit, bounded status/error, and `restart_required`.
+6. For a successful write, perform the controlled backend restart; there is
+   no supported hot reload and the CLI did not restart it.
+7. Query packaged status separately, then Readiness, rollout status, and
+   summary.
+8. If activation is intended, use separate `seed activate` only after all
+   external gates pass, then restart and re-query before omitted traffic.
+9. Record the post-change result in the Change-Control Log.
 
-Do not confuse the two worker keys:
-
-- Readiness: `RESERVATION_ROLLOUT_MAXIMUM_WORKER_LEASE_CONFIG_FAILURE_RATE`
-- Rollback: `RESERVATION_ROLLOUT_ROLLBACK_MAXIMUM_WORKER_CONFIG_FAILURE_RATE`
-
-## 5. Environment Apply / Restart Procedure
-
-For each P0, P3-W activation, P3-A tightening, or later Change-Control edit:
-
-1. Record old/new values without recording the secret.
-2. Confirm the complete Rollout and Readiness key sets remain present.
-3. Keep or set kill switch `true` before risk-increasing changes.
-4. Drain active work for a controlled restart when required by the runbook.
-5. Update the deployment environment / `.env` through the approved operator
-   channel.
-6. Restart the backend. There is no supported production hot reload.
-7. Query Readiness, rollout status, and summary.
-8. Confirm generation, allowlist, BPS, breaker, and lease readiness.
-9. If activation is intended, disable kill switch last, restart again, and
-   re-query before ordinary omitted traffic.
-10. Record the post-change result in the Change-Control Log.
-
-Do not mutate `os.environ` through a debug console and do not depend on
-development `uvicorn --reload` as an operator mechanism.
+The current pre-H5 `.env` resource is release-hardening debt, not Seed
+configuration authority. This pack does not claim H5 NO-`.env` completion.
 
 ## 6. P1 — EXPLICIT_ENFORCE_BOOTSTRAP
 
@@ -225,12 +232,11 @@ P1 result: `[ ] PASS TO P2  [ ] HOLD  [ ] KILL`
 - [ ] Recommendation is `ELIGIBLE_FOR_CONTROLLED_DEFAULT_ON_CANARY`.
 - [ ] Every individual Readiness gate below is `PASS`.
 - [ ] Breaker is not latched.
-- [ ] Kill switch remains `true`.
-- [ ] Generation equals `<GENERATION>`.
-- [ ] Allowlist contains only `<CANONICAL_TENANT>`.
-- [ ] Exact bps is `0`.
-- [ ] Balanced bps remains `0`, or has been prepared at `3000` while kill
-  switch remains `true`.
+- [ ] Packaged Seed status confirms kill remains `true`.
+- [ ] Packaged Seed status confirms generation `<GENERATION>`.
+- [ ] Packaged Seed status confirms only `<CANONICAL_TENANT>`.
+- [ ] Exact bps is `0`; Balanced bps is `0`, or P3-W prearm has prepared
+  `3000` while kill remains `true`.
 - [ ] Rollout state reflects containment (`KILL_SWITCHED` while killed).
 - [ ] Backup and Delivery verification remain current.
 - [ ] Tech Lead approved P3-W activation.
@@ -259,19 +265,21 @@ P2 approval UTC / Tech Lead: `<UTC_TIMESTAMP>` / `<TECH_LEAD>`
 
 Complete in order; stop on any failed check.
 
-1. [ ] Confirm verified backup remains valid.
+1. [ ] Re-run packaged `backup verify`; record `VALID`.
 2. [ ] Confirm Delivery Root and tenant subtree remain valid.
 3. [ ] Confirm `<CANONICAL_TENANT>` and `<GENERATION>`.
 4. [ ] Confirm Readiness is READY.
 5. [ ] Confirm breaker is not latched.
 6. [ ] Confirm Exact bps is 0.
-7. [ ] Set Balanced bps to 3000.
-8. [ ] Keep kill switch `true`.
-9. [ ] Controlled backend restart.
+7. [ ] Quiesce the server and run packaged `seed prearm-p3w` with the verified
+   bundle and approval reference.
+8. [ ] Record Balanced bps 3000, Exact 0, and kill `true` from the result.
+9. [ ] Complete the controlled backend restart required by prearm.
 10. [ ] Re-query Readiness and rollout status.
 11. [ ] Verify rollout state is `KILL_SWITCHED` and omitted traffic remains OFF.
-12. [ ] Set kill switch `false` **last**.
-13. [ ] Controlled backend restart.
+12. [ ] Quiesce the server and run packaged `seed activate` with the verified
+    bundle **last**.
+13. [ ] Complete the controlled backend restart required by activation.
 14. [ ] Re-query rollout status and record state.
 15. [ ] Ordinary operator submits omitted-mode AI Draft -> Tactical Board -> Render.
 16. [ ] Verify selected task has `ROLLOUT_CANARY`, current generation, bucket,
@@ -320,10 +328,14 @@ If any post-warmup threshold would fail, select one and do not rotate:
 If all pass:
 
 - [ ] Keep the same generation.
-- [ ] Set rollback zero-plan `.30`, partial `.20`, cleanup `.20`.
-- [ ] Keep safety maxima `0` and coverage minima `1.0`.
-- [ ] Keep kill switch true while editing.
-- [ ] Restart backend, re-query, then disable kill switch last and restart.
+- [ ] Reverify the backup bundle.
+- [ ] Quiesce the server and run packaged
+  `seed transition-p3a --rollback-window 7d`.
+- [ ] Record rollback zero-plan `.30`, partial `.20`, cleanup `.20`; safety
+  maxima remain `0` and coverage minima remain `1.0`.
+- [ ] Complete the controlled restart while kill remains true.
+- [ ] Re-query, then use separate packaged `seed activate` only after all
+  gates pass again; restart after activation.
 - [ ] Record post-change state.
 
 ## 11. Reusable Three-Day Review
@@ -354,9 +366,9 @@ If all pass:
 
 If BPS changes:
 
-| Old | New | Reason | Operator | Approval | Post-change staffed observation |
-|---:|---:|---|---|---|---|
-| `<BPS>` | `<BPS>` | `<REASON>` | `<OPERATOR>` | `<TECH_LEAD_OR_NA>` | `<RESULT>` |
+| Old | New | Packaged command result | Reason | Operator | Approval | Restart complete | Post-change staffed observation |
+|---:|---:|---|---|---|---|---|---|
+| `<BPS>` | `<BPS>` | `<RESULT>` | `<REASON>` | `<OPERATOR>` | `<TECH_LEAD_OR_NA>` | `[ ]` | `<RESULT>` |
 
 Rules: remain within 1000--4000; move by at most 1000 per review; no
 automatic ramp; KEEP is preferred when 5--10 fully observed tasks/7d are
@@ -366,12 +378,13 @@ healthy.
 
 Never place secret values in this table.
 
-| Timestamp | Tenant | Generation | Parameter | Old Value | New Value | Reason | Pre-change Evidence | Operator | Approver | Restart Required? | Post-change Check | Result |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `<UTC>` | `<CANONICAL_TENANT>` | `<GENERATION>` | `<BPS_or_lease_or_window_or_threshold_or_kill_or_allowlist_or_delivery_root_or_generation>` | `<OLD>` | `<NEW>` | `<REASON>` | `<EVIDENCE>` | `<OPERATOR>` | `<APPROVER>` | `<YES_OR_NO>` | `<CHECK>` | `<RESULT>` |
+| Timestamp | Tenant | Generation | Packaged command / governed change | Old projection | New projection | Reason | Pre-change evidence | Operator | Approver | `restart_required` | Restart completed | Post-change check | Result |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `<UTC>` | `<CANONICAL_TENANT>` | `<GENERATION>` | `<COMMAND_OR_DELIVERY_CHANGE>` | `<OLD>` | `<NEW>` | `<REASON>` | `<EVIDENCE>` | `<OPERATOR>` | `<APPROVER>` | `<true_false_NA>` | `[ ]` | `<CHECK>` | `<RESULT>` |
 
-Environment-backed changes require restart. Delivery Root uses its app-setting
-API and does not itself require backend restart.
+Successful Seed/Secret mutations require controlled restart before the loaded
+provider sees the new snapshot. Delivery Root uses its app-setting API and
+does not itself require backend restart.
 
 ## 13. KILL / Safety Card
 
@@ -384,17 +397,20 @@ Immediate `KILL` conditions:
 
 Actions:
 
-1. Set kill switch `true` through approved environment control.
-2. Stop routine Explicit ENFORCE.
-3. Restart backend so the environment change is loaded.
+1. Stop routine Explicit ENFORCE and quiesce the server.
+2. Run packaged `seed kill --tenant <TENANT> --generation <GENERATION>
+   --reason-code <CODE>`.
+3. Complete the controlled backend restart required by containment.
 4. Preserve all evidence; record tenant and generation.
 5. Query summary, Readiness, and rollout status.
 6. Do not rotate generation.
 7. Investigate and remediate root cause.
 
 New generation is allowed only after remediation, evidence review, Tech Lead
-approval, and a backup checkpoint. A cleanup warning alone requires
-investigation but is not automatically authority loss.
+approval, containment, and a verified backup checkpoint, using the separate
+`secret assignment rotate` incident workflow. It is not a routine cohort or
+breaker reset. A cleanup warning alone requires investigation but is not
+automatically authority loss.
 
 ## 14. HOLD_ASSET Card
 
@@ -416,9 +432,9 @@ No risk-increasing changes during:
 - 17:00--19:00
 - 21:00--09:00
 
-Do not increase BPS, tighten thresholds, change generation/lease, or expand
-allowlist. Authorized risk-reducing kill, de-ramp, or BPS-zero action may occur
-when needed.
+Do not increase BPS, tighten thresholds, change generation/lease, or change
+the active tenant selection. Authorized risk-reducing kill, de-ramp, or
+BPS-zero action may occur when needed.
 
 ## 16. Delivery Root Card
 
@@ -440,15 +456,15 @@ Two-Root contract remains intact.
 
 ## 17. Backup Card
 
-From the installation/project root, using the current accepted CLI:
+Using the installed packaged backend:
 
 ```powershell
-.\venv_build\Scripts\python.exe -m src.api.backup_restore backup `
+.\backend.exe operator backup create `
   --tenant <CANONICAL_TENANT> `
   --destination <NEW_BACKUP_DIRECTORY>
 
-.\venv_build\Scripts\python.exe -m src.api.backup_restore verify `
-  --bundle <BACKUP_ID>
+.\backend.exe operator backup verify `
+  --bundle <ABSOLUTE_BUNDLE>
 ```
 
 Record:
