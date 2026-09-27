@@ -56,11 +56,24 @@ class CloudflareKVAdapter:
         base_url: str | None = None,
     ) -> None:
         mode = get_runtime_paths().mode
-        self.base_url = (
-            base_url or os.getenv("SHORT_LINK_BASE_URL", _DEFAULT_BASE_URL)
-        ).rstrip("/") + "/"
-        self._account_id: Optional[str] = account_id or os.getenv("CF_ACCOUNT_ID")
-        self._namespace_id: Optional[str] = namespace_id or os.getenv("CF_NAMESPACE_ID")
+        if mode is RuntimeMode.PACKAGED:
+            resolved_base_url = base_url or _DEFAULT_BASE_URL
+            resolved_account_id = account_id
+            resolved_namespace_id = namespace_id
+        elif mode is RuntimeMode.SOURCE_DEVELOPMENT:
+            resolved_base_url = base_url or os.getenv(
+                "SHORT_LINK_BASE_URL", _DEFAULT_BASE_URL
+            )
+            resolved_account_id = account_id or os.getenv("CF_ACCOUNT_ID")
+            resolved_namespace_id = namespace_id or os.getenv("CF_NAMESPACE_ID")
+        else:
+            resolved_base_url = base_url or _DEFAULT_BASE_URL
+            resolved_account_id = account_id
+            resolved_namespace_id = namespace_id
+
+        self.base_url = resolved_base_url.rstrip("/") + "/"
+        self._account_id: Optional[str] = resolved_account_id
+        self._namespace_id: Optional[str] = resolved_namespace_id
 
         if mode is RuntimeMode.PACKAGED:
             self._enabled = _is_enabled(

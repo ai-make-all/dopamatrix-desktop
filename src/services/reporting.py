@@ -14,7 +14,7 @@ src/services/reporting.py
   L2_MILESTONE → CLIENT_REPORTING_CHAT_ID + INTERNAL_OPS_CHAT_ID（抄送）
   L3_ANALYTIC  → CLIENT_REPORTING_CHAT_ID + INTERNAL_OPS_CHAT_ID（抄送）
 
-环境变量：
+Source-development 环境兼容：
   INTERNAL_OPS_CHAT_ID      — 内部操作员群 chat_id（L1 收件人）
   CLIENT_REPORTING_CHAT_ID  — 默认客户群 chat_id（L2/L3 收件人，MVP 阶段）
   TELEGRAM_BOT_TOKEN        — source-development compatibility only
@@ -23,11 +23,26 @@ src/services/reporting.py
 from __future__ import annotations
 
 import os
+import sys
 from enum import Enum
 from typing import Dict, List, Optional
 
 from src.core.logger import logger
 from src.services.messaging.adapters.telegram_adapter import TelegramAdapter
+
+
+def _resolve_reporting_chat_ids(
+    *,
+    frozen: bool | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve chat destinations only from source-development environment."""
+    is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_packaged:
+        return None, None
+    return (
+        os.getenv("INTERNAL_OPS_CHAT_ID", "").strip() or None,
+        os.getenv("CLIENT_REPORTING_CHAT_ID", "").strip() or None,
+    )
 
 
 # ================================================================== #
@@ -61,9 +76,10 @@ class NotificationRouter:
             # notification delivery and never change render/task authority.
             self.adapter = None
         # L1 收件人：内部运营群（菲律宾团队 / 研发值班）
-        self.internal_chat_id = os.getenv("INTERNAL_OPS_CHAT_ID", "").strip() or None
+        internal_chat_id, client_chat_id = _resolve_reporting_chat_ids()
+        self.internal_chat_id = internal_chat_id
         # L2/L3 默认收件人：客户汇报群（MVP 阶段单租户使用）
-        self.default_client_chat_id = os.getenv("CLIENT_REPORTING_CHAT_ID", "").strip() or None
+        self.default_client_chat_id = client_chat_id
 
     async def _get_target_chat_ids(
         self,
@@ -74,7 +90,7 @@ class NotificationRouter:
         核心路由逻辑：根据事件层级和租户返回目标 chat_id 列表。
 
         扩展说明：
-          L2/L3 的客户群目前从 CLIENT_REPORTING_CHAT_ID 环境变量读取。
+          Source development 的 L2/L3 客户群可从 CLIENT_REPORTING_CHAT_ID 读取。
           多租户上线后，替换为：
             client_chat = await db.get_client_chat_group(tenant_id)
         """
@@ -118,7 +134,7 @@ class NotificationRouter:
             logger.warning(
                 f"[Reporting] tier={tier.value} tenant={tenant_id or 'default'} "
                 f"— 无可用目标 chat_id，跳过发送。"
-                f"请检查 INTERNAL_OPS_CHAT_ID / CLIENT_REPORTING_CHAT_ID 环境变量。"
+                "notification chat destinations are not configured"
             )
             return
 

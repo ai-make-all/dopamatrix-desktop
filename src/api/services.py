@@ -51,10 +51,24 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 # ------------------------------------------------------------------ #
-# 成本费率常量（可通过 .env 覆盖）                                      #
+# 成本费率：packaged 固定；仅 source development 可通过环境变量覆盖。    #
 # ------------------------------------------------------------------ #
-_LLM_COST_PER_TOKEN: float = float(os.getenv("LLM_COST_PER_TOKEN", "0.000002"))   # USD/token
-_TTS_COST_PER_SEC:   float = float(os.getenv("TTS_COST_PER_SEC",   "0.000016"))   # USD/sec
+_DEFAULT_LLM_COST_PER_TOKEN = 0.000002
+_DEFAULT_TTS_COST_PER_SEC = 0.000016
+
+
+def _resolve_cost_rates(*, frozen: bool | None = None) -> tuple[float, float]:
+    """Resolve cost rates without packaged process-environment authority."""
+    is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_packaged:
+        return _DEFAULT_LLM_COST_PER_TOKEN, _DEFAULT_TTS_COST_PER_SEC
+    return (
+        float(os.getenv("LLM_COST_PER_TOKEN", str(_DEFAULT_LLM_COST_PER_TOKEN))),
+        float(os.getenv("TTS_COST_PER_SEC", str(_DEFAULT_TTS_COST_PER_SEC))),
+    )
+
+
+_LLM_COST_PER_TOKEN, _TTS_COST_PER_SEC = _resolve_cost_rates()
 
 
 # ------------------------------------------------------------------ #

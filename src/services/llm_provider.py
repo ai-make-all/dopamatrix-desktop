@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from abc import ABC, abstractmethod
 
 import openai
@@ -19,6 +20,35 @@ from src.api.secret_store import (
 # provider. It is never represented in API status or logs and is explicitly
 # invalidated after Settings replacement.
 _api_key_cache: dict[str, str] = {}
+_DEFAULT_LLM_MODEL = "gpt-4o-mini"
+
+
+def _resolve_openai_base_url(
+    explicit_base_url: str | None,
+    *,
+    frozen: bool | None = None,
+) -> str | None:
+    """Keep endpoint env compatibility development-only."""
+    if explicit_base_url:
+        return explicit_base_url
+    is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_packaged:
+        return None
+    return os.getenv("OPENAI_BASE_URL") or None
+
+
+def _resolve_llm_model(
+    explicit_model: str | None,
+    *,
+    frozen: bool | None = None,
+) -> str:
+    """Keep the packaged model fixed unless the caller explicitly selects one."""
+    if explicit_model:
+        return explicit_model
+    is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_packaged:
+        return _DEFAULT_LLM_MODEL
+    return os.getenv("LLM_MODEL", _DEFAULT_LLM_MODEL)
 
 
 def _load_api_key_from_db(setting_key: str = "openai_api_key") -> str:
@@ -60,8 +90,8 @@ class OpenAIProvider(BaseLLMProvider):
     """OpenAI/compatible chat-completions provider.
 
     The API key is resolved from ``secure_settings`` at request time (through
-    the bounded cache). Non-secret endpoint/model development compatibility
-    remains environment-backed until its later configuration phase.
+    the bounded cache). Non-secret endpoint/model environment compatibility is
+    source-development-only; packaged V1.5 uses caller arguments or defaults.
     """
 
     def __init__(
@@ -69,8 +99,8 @@ class OpenAIProvider(BaseLLMProvider):
         base_url: str | None = None,
         model: str | None = None,
     ) -> None:
-        self._base_url = base_url or os.getenv("OPENAI_BASE_URL") or None
-        self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
+        self._base_url = _resolve_openai_base_url(base_url)
+        self.model = _resolve_llm_model(model)
 
     def generate_script(
         self,
