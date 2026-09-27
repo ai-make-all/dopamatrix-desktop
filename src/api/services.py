@@ -32,6 +32,17 @@ from src.core.logger import logger
 from src.services.reporting import notify_task_result
 from src.api.ws_manager import manager as ws_manager
 
+
+_LOCAL_SERVER_BASE_URL = "http://127.0.0.1:8000"
+
+
+def _resolve_matrix_base_url(*, frozen: bool | None = None) -> str:
+    """Resolve matrix asset URLs without packaged process-env authority."""
+    is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_packaged:
+        return _LOCAL_SERVER_BASE_URL
+    return os.getenv("PUBLIC_BASE_URL", _LOCAL_SERVER_BASE_URL).rstrip("/")
+
 # ── 确保子进程输出兼容 Windows GBK 终端 ──────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -104,8 +115,8 @@ def run_matrix_job(
         webhook_url:        保留参数，暂未使用（预留外部回调扩展口）
         client_payload:     调用方透传上下文，战报中原样展示触发用户信息（可选）
     """
-    # load_env() 在 main.py 启动时已全局加载一次；此处补充调用确保
-    # 直接调用本函数（如测试场景）时也能正确获取环境变量。
+    # Source development loads dotenv once in main.py; this preserves direct
+    # development/test calls. Packaged mode is an explicit no-op.
     from src.utils.env_utils import load_env
     load_env()
 
@@ -114,7 +125,7 @@ def run_matrix_job(
     from src.api.models import VideoTask, VideoAsset, LocalAsset, TaskHistory
     from sqlalchemy.orm import sessionmaker
 
-    base_url = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    base_url = _resolve_matrix_base_url()
 
     engine = get_tenant_engine(tenant_id)
     TenantSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

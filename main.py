@@ -59,9 +59,8 @@ except RuntimeMutationBarrierError:
 # All mutable database/output authorities use absolute RuntimePaths instead.
 apply_server_compatibility_cwd(_bootstrap_decision)
 
-# ── 最早加载 .env ─────────────────────────────────────────────────────────────
-# 必须在任何读取 os.environ 的模块（OpenAI SDK、数据库 URL 等）导入之前完成。
-# ThreadPoolExecutor 线程共享同一 os.environ，加载一次即对全部线程生效。
+# ── source-development dotenv adapter ─────────────────────────────────────────
+# Frozen/packaged mode returns before importing dotenv and has no .env authority.
 from src.utils.env_utils import load_env
 load_env()
 
@@ -83,8 +82,6 @@ if _bootstrap_decision.runtime_paths.mode is RuntimeMode.SOURCE_DEVELOPMENT:
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
-from pyngrok import ngrok
 
 from src.core.logger import setup_logger, logger
 from src.version import APPLICATION_VERSION
@@ -117,18 +114,9 @@ setup_logger()
 # ================================================================== #
 @asynccontextmanager
 async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期管理：启动时建表 + 开启内网穿透，关闭时清理隧道资源。"""
+    """Initialize application state; Ngrok remains development-only."""
     _public_url: str | None = None
-
-    # ---- Zero Trust：生产包启动时静默销毁 .env（防止 API Key 泄露） ---- #
-    if getattr(sys, "frozen", False):
-        _env_path = os.path.join(os.path.dirname(sys.executable), ".env")
-        if os.path.exists(_env_path):
-            try:
-                os.remove(_env_path)
-                logger.info("[Zero Trust] 检测到生产环境中残留的 .env 文件，已自动销毁。")
-            except Exception as _e:
-                logger.warning(f"[Zero Trust] 尝试销毁 .env 时出现异常（已忽略）: {_e}")
+    _ngrok_client = None
 
     # ---- 启动阶段 ---- #
     logger.info("[DopaMatrix] 正在初始化数据库表结构…")
@@ -180,29 +168,32 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
     ws_manager.set_event_loop(asyncio.get_running_loop())
     logger.info("[DopaMatrix] WebSocket 事件总线事件循环已注入 ✓")
 
-    # ---- Ngrok 内网穿透 ---- #
-    # ngrok.connect 是同步调用，在 lifespan 启动阶段（服务器尚未接受请求时）
-    # 执行不会影响请求处理；若需严格非阻塞可改用 run_in_executor。
-    try:
-        loop = asyncio.get_event_loop()
-        http_tunnel = await loop.run_in_executor(
-            None, lambda: ngrok.connect(8000, bind_tls=True)
-        )
-        _public_url = http_tunnel.public_url
-        os.environ["PUBLIC_BASE_URL"] = _public_url
-        logger.info("=" * 60)
-        logger.info(f"🌍 [内网穿透] Ngrok 公网地址已映射: {_public_url}")
-        logger.info("=" * 60)
-    except Exception as exc:
-        logger.warning(f"[内网穿透] Ngrok 启动失败，将继续使用本地地址: {exc}")
+    # Ngrok is an explicit source-development adapter. Packaged production
+    # neither imports pyngrok nor attempts a tunnel or requires its token.
+    if _bootstrap_decision.runtime_paths.mode is RuntimeMode.SOURCE_DEVELOPMENT:
+        from pyngrok import ngrok as _ngrok_client
+
+        try:
+            loop = asyncio.get_event_loop()
+            http_tunnel = await loop.run_in_executor(
+                None, lambda: _ngrok_client.connect(8000, bind_tls=True)
+            )
+            _public_url = http_tunnel.public_url
+            # Development-only compatibility for matrix asset URLs.
+            os.environ["PUBLIC_BASE_URL"] = _public_url
+            logger.info("=" * 60)
+            logger.info(f"🌍 [内网穿透] Ngrok 公网地址已映射: {_public_url}")
+            logger.info("=" * 60)
+        except Exception as exc:
+            logger.warning(f"[内网穿透] Ngrok 启动失败，将继续使用本地地址: {exc}")
 
     yield  # 应用运行中
 
     # ---- 关闭阶段 ---- #
-    if _public_url:
+    if _public_url and _ngrok_client is not None:
         try:
-            ngrok.disconnect(_public_url)
-            ngrok.kill()
+            _ngrok_client.disconnect(_public_url)
+            _ngrok_client.kill()
             logger.info("[内网穿透] Ngrok 隧道已断开，进程已清理。")
         except Exception as exc:
             logger.warning(f"[内网穿透] Ngrok 关闭时出现异常（可忽略）: {exc}")
