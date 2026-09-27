@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import src.api.operator_seed as operator_seed_module
 from src.api.operator_backup import OperatorBackupOutcome
 from src.api.operator_cli import run_operator_cli
 from src.api.operator_seed import (
@@ -24,6 +25,8 @@ from src.api.operator_seed import (
     OPERATOR_SEED_DELIVERY_NOT_CONFIGURED,
     OPERATOR_SEED_GENERATION_INVALID,
     OPERATOR_SEED_READINESS_NOT_READY,
+    OPERATOR_SEED_SNAPSHOT_INTEGRITY_FAILED,
+    OPERATOR_SEED_SNAPSHOT_STATE_INVALID,
     OPERATOR_SEED_SUBSYSTEM_FAILED,
     P3A_24H_ELIGIBILITY_NOT_PROVABLE,
     SeedSourceEvidence,
@@ -61,6 +64,7 @@ from src.api.secret_store import (
 
 TENANT = "ph-elv-0001"
 GENERATION = "phseed-elv0001-bal-20260921-r1"
+GENERATION_G2 = "phseed-elv0001-bal-20260921-r2"
 FIXED_TIME = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
 FIXTURE_SECRET = "fixture-assignment-secret"
 NEW_SECRET = "new-assignment-secret"
@@ -114,6 +118,7 @@ def _apply_fixture(
     paths: RuntimePaths,
     stage: PhilippineSeedStage,
     *,
+    generation: str = GENERATION,
     balanced_bps: int | None = None,
     kill_switch: bool | None = None,
     rollback_window: str = "7d",
@@ -121,7 +126,7 @@ def _apply_fixture(
     apply_philippine_seed_profile(
         _store(paths),
         tenant_id=TENANT,
-        generation=GENERATION,
+        generation=generation,
         stage=stage,
         balanced_basis_points=balanced_bps,
         kill_switch=kill_switch,
@@ -741,6 +746,107 @@ class OperatorSeedTransitionTests(unittest.TestCase):
                 ),
                 secret_before,
             )
+
+    def test_safe_off_transition_p3a_rejects_state_before_target_and_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _paths(Path(directory))
+            _apply_fixture(paths, PhilippineSeedStage.SAFE_OFF)
+            before = _database_rows(paths)
+            evidence_reader = Mock(
+                side_effect=AssertionError("invalid prestate must precede evidence")
+            )
+            with patch(
+                "src.api.operator_seed._target_values",
+                wraps=operator_seed_module._target_values,
+            ) as target_builder:
+                result = _invoke(
+                    paths,
+                    "transition-p3a",
+                    rollback_window="7d",
+                    backup_bundle=str(paths.runtime_root / "backup"),
+                    evidence_reader=evidence_reader,
+                )
+
+            self.assertEqual(
+                (result.exit_code, result.error_code),
+                (4, OPERATOR_SEED_SNAPSHOT_STATE_INVALID),
+            )
+            target_builder.assert_not_called()
+            evidence_reader.assert_not_called()
+            self.assertEqual(_database_rows(paths), before)
+
+    def test_post_rotation_shaped_g2_safe_off_p3a_is_state_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _paths(Path(directory))
+            _apply_fixture(
+                paths,
+                PhilippineSeedStage.SAFE_OFF,
+                generation=GENERATION_G2,
+            )
+            before = _database_rows(paths)
+            snapshot_before = _snapshot(paths)
+            self.assertEqual(snapshot_before.generation, GENERATION_G2)
+            self.assertEqual(snapshot_before.stage, PhilippineSeedStage.SAFE_OFF)
+            self.assertEqual(snapshot_before.effective_values[_BALANCED_BPS], "0")
+            self.assertEqual(snapshot_before.effective_values[_EXACT_BPS], "0")
+            self.assertEqual(snapshot_before.effective_values[_KILL], "true")
+            evidence_reader = Mock(
+                side_effect=AssertionError("invalid prestate must precede evidence")
+            )
+            with patch(
+                "src.api.operator_seed._target_values",
+                wraps=operator_seed_module._target_values,
+            ) as target_builder:
+                result = _invoke(
+                    paths,
+                    "transition-p3a",
+                    generation=GENERATION_G2,
+                    rollback_window="7d",
+                    backup_bundle=str(paths.runtime_root / "backup"),
+                    evidence_reader=evidence_reader,
+                )
+
+            self.assertEqual(
+                (result.exit_code, result.error_code),
+                (4, OPERATOR_SEED_SNAPSHOT_STATE_INVALID),
+            )
+            target_builder.assert_not_called()
+            evidence_reader.assert_not_called()
+            self.assertEqual(_database_rows(paths), before)
+
+    def test_corrupt_snapshot_remains_integrity_exit_six(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _paths(Path(directory))
+            _apply_fixture(
+                paths,
+                PhilippineSeedStage.P3_W,
+                balanced_bps=3000,
+                kill_switch=True,
+            )
+            with closing(sqlite3.connect(paths.settings_db_path)) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE app_settings SET key_value = ? WHERE key_name = ?;",
+                        ("not-a-canonical-snapshot", OPERATIONAL_SNAPSHOT_SETTING_KEY),
+                    )
+            before = _database_rows(paths)
+            evidence_reader = Mock(
+                side_effect=AssertionError("corrupt snapshot must precede evidence")
+            )
+            result = _invoke(
+                paths,
+                "transition-p3a",
+                rollback_window="7d",
+                backup_bundle=str(paths.runtime_root / "backup"),
+                evidence_reader=evidence_reader,
+            )
+
+            self.assertEqual(
+                (result.exit_code, result.error_code),
+                (6, OPERATOR_SEED_SNAPSHOT_INTEGRITY_FAILED),
+            )
+            evidence_reader.assert_not_called()
+            self.assertEqual(_database_rows(paths), before)
 
     def test_four_authority_closure_noops_verify_evidence_and_write_nothing(self):
         cases = (

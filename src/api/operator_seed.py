@@ -576,6 +576,19 @@ def _build_plan(
         )
 
     if command == "transition-p3a":
+        if snapshot.stage is PhilippineSeedStage.P3_A:
+            if current_window != "7d" or not current_kill:
+                raise _failure(
+                    OPERATOR_SEED_SNAPSHOT_STATE_INVALID,
+                    4,
+                    "P3-A transition requires contained P3-W",
+                )
+        elif snapshot.stage is not PhilippineSeedStage.P3_W or not current_kill:
+            raise _failure(
+                OPERATOR_SEED_SNAPSHOT_STATE_INVALID,
+                4,
+                "P3-A transition requires contained P3-W",
+            )
         target = _target_values(
             tenant=tenant,
             generation=generation,
@@ -587,7 +600,7 @@ def _build_plan(
         )
         if _same_target(snapshot, stage=PhilippineSeedStage.P3_A, values=target):
             return _SeedPlan(PhilippineSeedStage.P3_A, target, True)
-        if snapshot.stage is not PhilippineSeedStage.P3_W or not current_kill:
+        if snapshot.stage is not PhilippineSeedStage.P3_W:
             raise _failure(
                 OPERATOR_SEED_SNAPSHOT_STATE_INVALID,
                 4,

@@ -409,3 +409,65 @@ Superseding R1 validation:
 The skips and warnings remain existing platform/framework/cache conditions.
 No protected H3/H4 production module, operator grammar, dependency, package,
 commit, or remote state changed. H4-7 remains unstarted.
+
+## 25. H4-6-R2 P3-A Invalid-Prestate Ordering Fixup
+
+H4-8-R3 packaged integration exposed one narrow cross-slice compatibility
+defect after the independently accepted H4-7 rotation. The post-rotation
+snapshot and Assignment Secret were valid: generation G2, `SAFE_OFF`,
+Balanced 0, Exact 0, kill true, rollback window 7d, and a valid Secret binding.
+H4-7 remains closed and unchanged.
+
+The defect was control-flow ordering in `_build_plan("transition-p3a")`.
+The previous implementation constructed a P3_A target from the current
+snapshot before checking that the source was contained P3_W. For SAFE_OFF,
+the current Balanced value is zero, so canonical P3_A materialization rejected
+the target before the source-state guard ran. The unchanged generic integrity
+mapper consequently returned exit 6 with
+`OPERATOR_SEED_SNAPSHOT_INTEGRITY_FAILED` instead of the frozen state error.
+
+R2 first added direct regressions and reproduced the old behavior twice:
+ordinary SAFE_OFF and a valid post-rotation-shaped G2 SAFE_OFF both returned
+exit 6/integrity. The production correction is local to
+`src/api/operator_seed.py`: transition-p3a now rejects a source that is not
+contained P3_W before P3_A target materialization, while retaining the narrow
+contained P3_A/7d exact-target path needed to determine
+`ALREADY_TRANSITIONED`. No exception class or generic integrity mapping was
+changed, and `policy_profiles` validation remains strict.
+
+The final source/test evidence proves:
+
+- SAFE_OFF and post-rotation-shaped G2 SAFE_OFF return exit 4 with
+  `OPERATOR_SEED_SNAPSHOT_STATE_INVALID` before target construction or source
+  evidence reading, with snapshot, audit metadata, and Secret row unchanged;
+- exact contained P3_A/7d still reverifies the backup, executes the accepted
+  Readiness/breaker/cohort evidence gates, returns `ALREADY_TRANSITIONED`, and
+  performs no write;
+- contained P3_W still transitions successfully to P3_A/7d while preserving
+  tenant, generation, Balanced BPS, Exact 0, Lease, kill containment, and the
+  Assignment Secret;
+- an actually malformed persisted snapshot still returns exit 6 with
+  `OPERATOR_SEED_SNAPSHOT_INTEGRITY_FAILED` and no write;
+- P3_A/24h remains parser-valid but operationally rejected with
+  `P3A_24H_ELIGIBILITY_NOT_PROVABLE`, exit 4, after backup verification and
+  before mutation;
+- `src/api/operator_secret.py` and the H4-7 test suite were not edited.
+
+R2 validation:
+
+- pre-fix reproduction: `2 failed`; both observed exit 6/integrity instead of
+  the required exit 4/state-invalid;
+- five direct transition/integrity/no-op/success nodes:
+  `5 passed, 4 subtests passed`;
+- full focused H4-6 transition suite:
+  `33 passed, 155 subtests passed`;
+- relevant H4-6/H4-7/operator/status/backup/mutation/Reservation regression:
+  `170 passed, 1 skipped, 352 subtests passed`;
+- full backend regression using a fresh isolated pytest basetemp:
+  `762 passed, 2 skipped, 580 subtests passed`, zero failures/errors;
+- changed Python files: `py_compile` exit 0;
+- `git diff --check`: exit 0.
+
+The current H4-8 Runbook, Execution Pack, and tracked packaged-smoke report
+were not modified by R2. No packaging, Tauri build, Windows temporary user,
+H4-8-R4, H5, or H6 work was started. No commit or push was performed.
