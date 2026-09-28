@@ -173,8 +173,11 @@ Secret rotation:
    external gates pass, then restart and re-query before omitted traffic.
 9. Record the post-change result in the Change-Control Log.
 
-The current pre-H5 `.env` resource is release-hardening debt, not Seed
-configuration authority. This pack does not claim H5 NO-`.env` completion.
+Packaged production does not bundle, search or load a `.env` file. Packaged
+configuration authority is limited to RuntimePaths, the global database, the
+versioned operational profile/snapshot, DPAPI secure settings and reviewed
+fixed defaults. Delivery Root remains an existing reviewed machine setting.
+Source-development environment adapters are not packaged field authority.
 
 ## 6. P1 — EXPLICIT_ENFORCE_BOOTSTRAP
 

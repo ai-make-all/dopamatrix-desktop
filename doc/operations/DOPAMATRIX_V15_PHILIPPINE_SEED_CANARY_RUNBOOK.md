@@ -267,11 +267,12 @@ ENFORCE requests retain their existing B2 semantics; the canary governs
 omitted/default mode assignment. Do not reuse Phase 3D-2I-A2 local test values
 as Philippine defaults.
 
-The current pre-H5 package still contains legacy `.env` resource behavior.
-That is release-hardening debt, not Seed configuration authority, and this
-runbook does not claim H5 NO-`.env` completion. Delivery Root remains the
-machine-global `delivery_root` app setting managed by
-`GET/POST /api/v1/settings/delivery-root`.
+Packaged production does not bundle, search or load a `.env` file. Packaged
+configuration authority is limited to RuntimePaths, the global database, the
+versioned operational profile/snapshot, DPAPI secure settings and reviewed
+fixed defaults. Delivery Root remains the machine-global `delivery_root` app
+setting managed by `GET/POST /api/v1/settings/delivery-root`.
+Source-development environment adapters are not packaged field authority.
 
 ## Seed activation sequence
 

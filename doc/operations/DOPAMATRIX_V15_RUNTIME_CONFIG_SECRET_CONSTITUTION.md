@@ -29,11 +29,16 @@ Source development may opt into process environment and local dotenv. Tests may 
 |---|---|---|---|
 | Build/release identity | version, tag, channel, architecture | source, build metadata, release manifest | no |
 | Product profile | universal DopaMatrix product behavior | source-defined product profile | no |
-| Machine/user settings | Delivery Root, LLM endpoint/model | global runtime DB | only when a normal operator genuinely chooses it |
+| Machine/user settings | Delivery Root | global runtime DB | only when a normal operator genuinely chooses it |
 | Operational policy definition | `philippine-seed-v1`, bounds and stage defaults | reviewed version-controlled profile | no raw-field UI |
 | Operational state | active profile/version, tenant, generation, BPS, kill, allowlist, normalized snapshot | global runtime DB | field CLI; future restricted admin UI only |
 | Secrets | provider credentials, Assignment Secret | DPAPI-protected `secure_settings` | secret-entry/status actions only |
 | Development/test configuration | local overrides and fixtures | explicit dev/test adapter | not packaged |
+
+LLM endpoint/model values are non-secret provider parameters, but they are not
+persisted packaged machine settings in Philippine V1.5. They use explicit
+caller arguments when supplied and otherwise use the reviewed packaged
+defaults described in Section 12.
 
 ## 4. Definition vs State
 
@@ -60,9 +65,16 @@ Current production source contains no `APP_MODE` read or consumer. Vue submits `
 
 ## 7. Machine Runtime Settings
 
-Reuse global `app_settings` for non-secret machine choices such as Delivery Root and reviewed LLM endpoint/model settings. Values are validated and accessed through the runtime configuration provider rather than ad hoc SQL or environment reads.
+Reuse global `app_settings` only for implemented, reviewed non-secret machine
+choices such as Delivery Root. Those values are validated and accessed through
+the runtime configuration provider rather than ad hoc SQL or environment
+reads.
 
-Machine settings are independent of tenant logout. They are never stored in tenant databases. Settings that are implementation constants or obsolete variables are removed rather than persisted.
+Machine settings are independent of tenant logout. They are never stored in
+tenant databases. Philippine V1.5 does not persist LLM endpoint/model values
+merely to preserve legacy environment configurability. Settings that are
+implementation constants, fixed defaults or obsolete variables are removed
+rather than persisted.
 
 ## 8. Operational Policy Profile
 
@@ -107,7 +119,23 @@ Minimum current registry:
 | `telegram_bot_token` | secure setting when Telegram is enabled |
 | `cf_api_token` | secure setting when Cloudflare tracking is enabled |
 
-`deepseek_api_key` is not an active current credential; add it only with a real provider implementation. Chat IDs, account IDs, namespaces, URLs, models, and Delivery Root are non-secret settings, though some remain operationally sensitive.
+`deepseek_api_key` is not an active current credential; add it only with a real
+provider implementation. Chat IDs, account IDs, namespace IDs, URLs and model
+names are generally non-secret values, although some remain operationally
+sensitive. Non-secret classification does not imply that a value is a
+persisted packaged machine setting.
+
+For Philippine V1.5:
+
+- Delivery Root is an existing packaged machine setting;
+- LLM endpoint/model use explicit caller arguments or packaged defaults and
+  have no packaged database rows;
+- reporting chat IDs are empty/disabled unless a future reviewed
+  non-environment authority is introduced;
+- Cloudflare account/namespace values are explicit values or absent;
+- the short-link base is an explicit value or the fixed packaged default
+  `https://dopa.mx/t/`;
+- any future persistence for these values requires a separate reviewed design.
 
 ## 11. Windows DPAPI Contract
 
@@ -123,7 +151,19 @@ Loss of the Windows profile makes secrets unrecoverable. Assignment Secret regen
 
 `GET /api/v1/settings/llm` returns only `is_configured`/`configured` status. It no longer returns even a prefix/suffix mask. The existing Settings card and request shape can remain; the frontend removes masked-key display.
 
-Provider base URL and model are non-secret machine settings. OpenAI-compatible branding does not imply that a separate DeepSeek credential exists today.
+Provider base URL and model are non-secret provider parameters.
+
+For packaged Philippine V1.5:
+
+- explicit caller arguments take precedence;
+- absent an explicit base URL, the OpenAI SDK default is used;
+- absent an explicit model, the fixed default is `gpt-4o-mini`;
+- process-environment overrides are ignored;
+- no packaged endpoint/model database rows exist.
+
+Source-development execution may retain explicit environment compatibility for
+these parameters. OpenAI-compatible branding does not imply that a separate
+DeepSeek credential exists today.
 
 ## 13. Seed Runtime Configuration
 
@@ -147,7 +187,11 @@ The value, length, hash, prefix, suffix, HMAC intermediate, and ciphertext are n
 One `RuntimeConfigProvider` separates consumers from storage while exposing two deliberately different lifecycles:
 
 1. **Static operational snapshot.** Seed, Reservation, Readiness, Rollout, and Assignment Secret participation are loaded and validated during controlled backend startup. The resulting typed configuration is immutable for that backend process generation. Changes activate only after a controlled restart.
-2. **Dynamic machine settings.** Delivery Root, OpenAI credential, and—where the implementing source supports bounded reads or cache invalidation—LLM endpoint/model and optional integration settings may use bounded read-through or explicit cache invalidation. They are not members of the immutable Seed policy snapshot.
+2. **Dynamic packaged values.** Delivery Root uses its existing reviewed
+   machine-setting path. The OpenAI credential uses its existing
+   secure-settings/cache path. Neither is a member of the immutable Seed policy
+   snapshot. `RuntimeConfigProvider` does not provide DB-backed LLM
+   endpoint/model authority in Philippine V1.5.
 
 The provider therefore:
 
@@ -190,7 +234,10 @@ Logs remain under the existing per-user log root. Binaries, FFmpeg, FFprobe, and
 
 Seed changes are written and validated transactionally while work is drained, then activated only by controlled backend restart. Startup creates one immutable static operational `RuntimeConfigSnapshot`; Readiness, Rollout, and summary are re-queried after restart.
 
-V1.5 does not introduce live Seed-policy mutation during active tasks. Delivery Root and an LLM key may retain their existing immediate Settings behavior, and bounded dynamic handling may be added for LLM endpoint/model or optional integration configuration, when those values do not alter a running task's authoritative Seed policy snapshot.
+V1.5 does not introduce live Seed-policy mutation during active tasks. Delivery
+Root and the OpenAI credential may retain their existing immediate Settings
+behavior. Any future persisted endpoint/model configuration requires a
+separate reviewed design; it is not current Philippine V1.5 authority.
 
 ## 19. Field Operator Configuration
 
@@ -198,10 +245,10 @@ The packaged backend hosts an operator mode before Uvicorn startup, for example:
 
 ```text
 backend.exe operator config status
-backend.exe operator seed-config apply-safe-off \
+backend.exe operator seed apply-safe-off \
   --tenant ph-elv-0001 \
   --generation phseed-elv0001-bal-YYYYMMDD-rN
-backend.exe operator secret status
+backend.exe operator secret assignment status
 ```
 
 `apply-safe-off` selects `philippine-seed-v1`, validates the approved tenant/generation, writes the complete normalized snapshot, sets Exact/Balanced to `0/0`, kill to `true`, allowlist to exactly the tenant, creates the Assignment Secret if absent, and commits atomically. It never starts Uvicorn or prints a secret.
@@ -253,7 +300,10 @@ This automatic bounded migration is preferable to requiring a field operator to 
 
 ## 23. Release / Handoff Contract
 
-Remove `.env` from Tauri resources. A release build must succeed with no `web_ui/src-tauri/.env` and final artifact scanning must prove there is no `.env`, `config.env`, `runtime.env`, `settings.json`/YAML/TOML secret substitute, or plaintext secret file.
+`.env` is not a Tauri resource. A release build must succeed with no
+`web_ui/src-tauri/.env`, and final artifact scanning must prove there is no
+`.env`, `config.env`, `runtime.env`, `settings.json`/YAML/TOML secret
+substitute, or plaintext secret file.
 
 Replace the prior “safe field `.env` template” handoff item with:
 
