@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,7 @@ TAURI_CONFIG_PATH = REPOSITORY_ROOT / "web_ui/src-tauri/tauri.conf.json"
 PACKAGE_JSON_PATH = REPOSITORY_ROOT / "web_ui/package.json"
 VERSION_SOURCE_PATH = REPOSITORY_ROOT / "src/version.py"
 LOGIN_SOURCE_PATH = REPOSITORY_ROOT / "web_ui/src/components/Login.vue"
+CARGO_MANIFEST_PATH = REPOSITORY_ROOT / "web_ui/src-tauri/Cargo.toml"
 
 
 def _application_version() -> str:
@@ -46,6 +48,8 @@ class H6InstallerContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tauri = json.loads(TAURI_CONFIG_PATH.read_text(encoding="utf-8"))
         cls.package = json.loads(PACKAGE_JSON_PATH.read_text(encoding="utf-8"))
+        with CARGO_MANIFEST_PATH.open("rb") as cargo_manifest:
+            cls.cargo = tomllib.load(cargo_manifest)
         cls.login = LOGIN_SOURCE_PATH.read_text(encoding="utf-8")
 
     def test_bundle_is_nsis_only_current_user(self):
@@ -85,6 +89,7 @@ class H6InstallerContractTests(unittest.TestCase):
         self.assertEqual(self.tauri["version"], "1.5.0-rc1")
         self.assertEqual(self.package["version"], "1.5.0-rc1")
         self.assertEqual(_application_version(), "1.5.0-rc1")
+        self.assertEqual(self.cargo["package"]["version"], "1.5.0-rc1")
 
     def test_login_displays_current_release_identity_only(self):
         self.assertIn("SYSTEM READY · v1.5.0-rc1", self.login)
