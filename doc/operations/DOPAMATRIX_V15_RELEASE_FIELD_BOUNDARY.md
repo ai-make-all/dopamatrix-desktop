@@ -13,7 +13,7 @@ The release boundary ends at a verified, clean installer and its non-secret hand
 
 ```text
 Development release
-  -> signed-off installer + hashes + manifest + safe documentation
+  -> review-approved installer + hashes + manifest + safe documentation
   -> Philippine installation and release verification
   -> PH-P0-A INSTALL_AND_SAFE_OFF
   -> REAL_ASSET_INGESTION
@@ -29,9 +29,11 @@ Development-machine provisioning acceptance proves only that the schema/identity
 
 Development owns:
 
-- freezing application source at an immutable release tag;
+- freezing application source at an exact reviewed commit, with an immutable
+  release tag assigned only after explicit release-tag authorization;
 - aligning application and product-facing versions;
-- building the PyInstaller backend sidecar and Tauri frontend/installer from an isolated tag-based release staging area;
+- building the reviewed release inputs and Tauri frontend/installer from an
+  isolated commit-pinned release staging area;
 - proving that ignored development files cannot enter the package;
 - producing a clean installer, SHA-256 checksum, and release manifest;
 - providing a packaged runtime configuration procedure using the reviewed
@@ -75,6 +77,26 @@ The installer and handoff package must exclude:
 - local logs, test fixtures, tests, build caches, debug-only evidence, and developer absolute paths.
 
 Legitimate application components are the Tauri application, frontend bundle, backend sidecar, required runtime libraries, FFmpeg, FFprobe, icons, and other explicitly reviewed non-secret resources. Final inclusion is verified from the built artifact, not inferred from `.gitignore`.
+
+### 5.1 Windows Installer and Release Identity Contract
+
+The Windows x86_64 Philippine Seed installer target is NSIS only, using
+`currentUser` install mode. MSI/WiX and `perMachine` installation are not part
+of V1.5 Philippine Seed acceptance, and a normal current-user installation
+does not require administrator elevation.
+
+The installer-facing release identity remains `1.5.0-rc1`. Updater,
+upgrade, and downgrade acceptance are outside H6 V1.5 scope. An unsigned
+installer is acceptable only for controlled Philippine Seed release-candidate
+acceptance; this does not establish public-production signing readiness.
+
+Uninstall removes installed application components but must not intentionally
+delete field/user mutable data outside the installation root. RuntimePaths,
+the global database, tenant databases, internal output, logs, DPAPI-backed
+state, Delivery Root content, and backups are preserved through uninstall.
+
+The NSIS installer, its checksum, and the release manifest remain required
+release artifacts.
 
 ## 6. Secret Boundary
 
@@ -158,15 +180,21 @@ The future manifest minimally records:
 
 - Product: `DopaMatrix`;
 - application version;
-- immutable application tag and commit;
+- exact source commit;
+- immutable release tag when one has been explicitly authorized and assigned;
 - UTC build timestamp;
 - Windows architecture/target triple;
 - installer type and filename;
 - installer SHA-256;
 - backend sidecar SHA-256 when independently useful;
 - clean-staging and exclusion verification result;
-- source-tag verification result;
+- source-commit verification result;
+- release-tag verification result when a release tag has been assigned;
 - build procedure/toolchain classification when operationally required.
+
+Release-candidate build evidence does not require a pre-existing new release
+tag. The final field handoff manifest may record the final immutable tag after
+explicit release-tag authorization and assignment.
 
 The manifest never records secrets, customer content, local absolute Delivery/Backup paths, or development database state.
 
