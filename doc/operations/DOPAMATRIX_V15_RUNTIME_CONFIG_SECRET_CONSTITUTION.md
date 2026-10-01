@@ -29,16 +29,16 @@ Source development may opt into process environment and local dotenv. Tests may 
 |---|---|---|---|
 | Build/release identity | version, tag, channel, architecture | source, build metadata, release manifest | no |
 | Product profile | universal DopaMatrix product behavior | source-defined product profile | no |
-| Machine/user settings | Delivery Root | global runtime DB | only when a normal operator genuinely chooses it |
+| Machine/user settings | Delivery Root, LLM Base URL/model | global runtime DB | only when a normal operator genuinely chooses it |
 | Operational policy definition | `philippine-seed-v1`, bounds and stage defaults | reviewed version-controlled profile | no raw-field UI |
 | Operational state | active profile/version, tenant, generation, BPS, kill, allowlist, normalized snapshot | global runtime DB | field CLI; future restricted admin UI only |
 | Secrets | provider credentials, Assignment Secret | DPAPI-protected `secure_settings` | secret-entry/status actions only |
 | Development/test configuration | local overrides and fixtures | explicit dev/test adapter | not packaged |
 
-LLM endpoint/model values are non-secret provider parameters, but they are not
-persisted packaged machine settings in Philippine V1.5. They use explicit
-caller arguments when supplied and otherwise use the reviewed packaged
-defaults described in Section 12.
+LLM endpoint/model values are non-secret provider parameters. Beginning with
+V1.5 RC2, packaged runtime persists them through the existing global
+`app_settings`/RuntimeConfig authority. They are not members of the Seed
+snapshot and never contain the API Key.
 
 ## 4. Definition vs State
 
@@ -66,15 +66,15 @@ Current production source contains no `APP_MODE` read or consumer. Vue submits `
 ## 7. Machine Runtime Settings
 
 Reuse global `app_settings` only for implemented, reviewed non-secret machine
-choices such as Delivery Root. Those values are validated and accessed through
-the runtime configuration provider rather than ad hoc SQL or environment
-reads.
+choices such as Delivery Root and the LLM Base URL/model. Those values are
+validated and accessed through the runtime configuration provider rather than
+ad hoc SQL or environment reads.
 
 Machine settings are independent of tenant logout. They are never stored in
-tenant databases. Philippine V1.5 does not persist LLM endpoint/model values
-merely to preserve legacy environment configurability. Settings that are
-implementation constants, fixed defaults or obsolete variables are removed
-rather than persisted.
+tenant databases. V1.5 RC2 persists LLM endpoint/model only as explicit
+operator choices needed by compatible providers; it does not restore legacy
+environment configurability. Settings that are implementation constants,
+fixed defaults or obsolete variables are removed rather than persisted.
 
 ## 8. Operational Policy Profile
 
@@ -128,14 +128,16 @@ persisted packaged machine setting.
 For Philippine V1.5:
 
 - Delivery Root is an existing packaged machine setting;
-- LLM endpoint/model use explicit caller arguments or packaged defaults and
-  have no packaged database rows;
+- LLM endpoint/model are startup-loaded non-secret `app_settings` values;
+  explicit caller arguments still take precedence, and absent rows use the
+  reviewed packaged defaults;
 - reporting chat IDs are empty/disabled unless a future reviewed
   non-environment authority is introduced;
 - Cloudflare account/namespace values are explicit values or absent;
 - the short-link base is an explicit value or the fixed packaged default
   `https://dopa.mx/t/`;
-- any future persistence for these values requires a separate reviewed design.
+- future persistence for other non-secret provider parameters requires a
+  separate reviewed design.
 
 ## 11. Windows DPAPI Contract
 
@@ -149,17 +151,25 @@ Loss of the Windows profile makes secrets unrecoverable. Assignment Secret regen
 
 `POST /api/v1/settings/llm` receives the key, encrypts it with DPAPI, writes `secure_settings`, commits, and invalidates the provider cache. It never returns the value.
 
-`GET /api/v1/settings/llm` returns only `is_configured`/`configured` status. It no longer returns even a prefix/suffix mask. The existing Settings card and request shape can remain; the frontend removes masked-key display.
+`GET /api/v1/settings/llm` returns non-secret provider/Base URL/model values
+plus API-key configured/status state. It never returns the key, ciphertext, or
+even a prefix/suffix mask. `POST /api/v1/settings/llm/config` writes only the
+validated non-secret Base URL/model; the existing key endpoint remains the
+separate secure write path.
 
 Provider base URL and model are non-secret provider parameters.
 
 For packaged Philippine V1.5:
 
 - explicit caller arguments take precedence;
-- absent an explicit base URL, the OpenAI SDK default is used;
-- absent an explicit model, the fixed default is `gpt-4o-mini`;
+- the startup-loaded operational Base URL/model are next in precedence;
+- absent a configured base URL, packaged code explicitly supplies the reviewed
+  official endpoint `https://api.openai.com/v1` so the SDK cannot consult an
+  ambient `OPENAI_BASE_URL`;
+- absent a configured model, the fixed default is `gpt-4o-mini`;
 - process-environment overrides are ignored;
-- no packaged endpoint/model database rows exist.
+- `.env` remains ignored;
+- the API Key remains DPAPI-backed and is never stored with these rows.
 
 Source-development execution may retain explicit environment compatibility for
 these parameters. OpenAI-compatible branding does not imply that a separate
@@ -187,11 +197,11 @@ The value, length, hash, prefix, suffix, HMAC intermediate, and ciphertext are n
 One `RuntimeConfigProvider` separates consumers from storage while exposing two deliberately different lifecycles:
 
 1. **Static operational snapshot.** Seed, Reservation, Readiness, Rollout, and Assignment Secret participation are loaded and validated during controlled backend startup. The resulting typed configuration is immutable for that backend process generation. Changes activate only after a controlled restart.
-2. **Dynamic packaged values.** Delivery Root uses its existing reviewed
+2. **Other packaged values.** Delivery Root uses its existing dynamic reviewed
    machine-setting path. The OpenAI credential uses its existing
-   secure-settings/cache path. Neither is a member of the immutable Seed policy
-   snapshot. `RuntimeConfigProvider` does not provide DB-backed LLM
-   endpoint/model authority in Philippine V1.5.
+   secure-settings/cache path. LLM Base URL/model use `app_settings` but are
+   copied into the immutable provider mapping at startup, so their changes
+   require restart. None is a member of the Seed policy snapshot.
 
 The provider therefore:
 
@@ -235,9 +245,9 @@ Logs remain under the existing per-user log root. Binaries, FFmpeg, FFprobe, and
 Seed changes are written and validated transactionally while work is drained, then activated only by controlled backend restart. Startup creates one immutable static operational `RuntimeConfigSnapshot`; Readiness, Rollout, and summary are re-queried after restart.
 
 V1.5 does not introduce live Seed-policy mutation during active tasks. Delivery
-Root and the OpenAI credential may retain their existing immediate Settings
-behavior. Any future persisted endpoint/model configuration requires a
-separate reviewed design; it is not current Philippine V1.5 authority.
+Root and the OpenAI credential retain their existing immediate Settings
+behavior. LLM Base URL/model writes are persisted immediately but take effect
+only after DopaMatrix restarts and installs a new immutable RuntimeConfigProvider.
 
 ## 19. Field Operator Configuration
 

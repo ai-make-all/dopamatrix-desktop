@@ -131,12 +131,12 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         OpenAISecretMigrationResult.MIGRATION_CONFLICT,
     }:
         logger.warning(
-            "[SecretStore] OpenAI credential state=%s",
+            "[SecretStore] OpenAI credential state={}",
             secret_migration.value,
         )
     else:
         logger.info(
-            "[SecretStore] OpenAI credential state=%s",
+            "[SecretStore] OpenAI credential state={}",
             secret_migration.value,
         )
 
@@ -155,7 +155,7 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         )
         logger.info(
-            "[RuntimeConfig] operational state=%s error=%s",
+            "[RuntimeConfig] operational state={} error={}",
             runtime_config_provider.static_operational_status.value,
             runtime_config_provider.static_operational_error_code or "NONE",
         )

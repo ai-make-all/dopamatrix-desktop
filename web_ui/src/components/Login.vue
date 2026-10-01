@@ -64,7 +64,7 @@ function onKeydown(e) {
 
       <!-- Slogan -->
       <div class="slogan-wrap">
-        <div class="slogan-eyebrow">SYSTEM READY · v1.5.0-rc1</div>
+        <div class="slogan-eyebrow">SYSTEM READY · v1.5.0-rc2</div>
         <h1 class="slogan-text">The Next-Gen<br><span class="slogan-accent">Attention Engine</span></h1>
         <p class="slogan-sub">Multi-account · Isolated · Autonomous</p>
       </div>
@@ -127,7 +127,7 @@ function onKeydown(e) {
     </div>
 
     <!-- Version watermark -->
-    <div class="version-watermark">DOPAMATRIX // DESKTOP // v1.5.0-rc1</div>
+    <div class="version-watermark">DOPAMATRIX // DESKTOP // v1.5.0-rc2</div>
   </div>
 </template>
 

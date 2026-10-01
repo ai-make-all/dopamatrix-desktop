@@ -822,7 +822,7 @@ class V15BackupRestoreTests(unittest.TestCase):
         tauri = json.loads(
             (repository / "web_ui" / "src-tauri" / "tauri.conf.json").read_text("utf-8")
         )
-        self.assertEqual(APPLICATION_VERSION, "1.5.0-rc1")
+        self.assertEqual(APPLICATION_VERSION, "1.5.0-rc2")
         self.assertEqual(package["version"], APPLICATION_VERSION)
         self.assertEqual(lock["version"], APPLICATION_VERSION)
         self.assertEqual(lock["packages"][""]["version"], APPLICATION_VERSION)

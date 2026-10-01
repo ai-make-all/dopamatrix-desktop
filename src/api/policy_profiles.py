@@ -35,8 +35,10 @@ from .reservation_rollout_readiness import (
     load_reservation_rollout_readiness_configuration,
 )
 from .runtime_config import (
+    LlmOperationalSettingsError,
     RuntimeConfigProvider,
     StaticOperationalStatus,
+    _read_llm_operational_mapping,
 )
 from .runtime_paths import RuntimePaths
 from .secret_store import (
@@ -645,10 +647,11 @@ def _safe_off_provider(
     *,
     status: StaticOperationalStatus,
     error_code: str,
+    operational_mapping: Mapping[str, str] | None = None,
 ) -> RuntimeConfigProvider:
     return RuntimeConfigProvider.create(
         paths=paths,
-        static_operational_mapping={},
+        static_operational_mapping=operational_mapping or {},
         static_operational_status=status,
         static_operational_error_code=error_code,
     )
@@ -659,6 +662,7 @@ def load_applied_runtime_config_provider(
     store: SecretStore,
 ) -> RuntimeConfigProvider:
     """Load one packaged/test process snapshot; never consult environment."""
+    llm_operational_mapping: dict[str, str] = {}
     try:
         with closing(store._connect()) as conn:
             table = conn.execute(
@@ -670,6 +674,7 @@ def load_applied_runtime_config_provider(
                     status=StaticOperationalStatus.SAFE_OFF_MISSING,
                     error_code=OPERATIONAL_SNAPSHOT_MISSING,
                 )
+            llm_operational_mapping = _read_llm_operational_mapping(conn)
             row = conn.execute(
                 "SELECT key_value FROM app_settings WHERE key_name = ?;",
                 (OPERATIONAL_SNAPSHOT_SETTING_KEY,),
@@ -679,6 +684,7 @@ def load_applied_runtime_config_provider(
                 paths,
                 status=StaticOperationalStatus.SAFE_OFF_MISSING,
                 error_code=OPERATIONAL_SNAPSHOT_MISSING,
+                operational_mapping=llm_operational_mapping,
             )
         try:
             assignment_secret = store.get_secret(
@@ -698,6 +704,7 @@ def load_applied_runtime_config_provider(
         )
         runtime_mapping = dict(snapshot.effective_values)
         runtime_mapping[ASSIGNMENT_SECRET_ENVIRONMENT_KEY] = assignment_secret
+        runtime_mapping.update(llm_operational_mapping)
         return RuntimeConfigProvider.create(
             paths=paths,
             static_operational_mapping=runtime_mapping,
@@ -708,10 +715,18 @@ def load_applied_runtime_config_provider(
             paths,
             status=StaticOperationalStatus.SAFE_OFF_INVALID,
             error_code=str(exc),
+            operational_mapping=llm_operational_mapping,
         )
-    except (SecretStoreError, sqlite3.Error, OSError, TypeError):
+    except (
+        LlmOperationalSettingsError,
+        SecretStoreError,
+        sqlite3.Error,
+        OSError,
+        TypeError,
+    ):
         return _safe_off_provider(
             paths,
             status=StaticOperationalStatus.SAFE_OFF_INVALID,
             error_code=OPERATIONAL_SNAPSHOT_INVALID,
+            operational_mapping=llm_operational_mapping,
         )

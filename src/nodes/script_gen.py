@@ -82,7 +82,7 @@ class ScriptGenNode(BaseNode):
         """
         Args:
             name:     节点名称（用于日志）
-            provider: LLM 服务适配器实例；为 None 时自动创建 OpenAIProvider（读取环境变量）
+            provider: LLM 服务适配器实例；为 None 时自动创建 OpenAIProvider（按运行模式解析配置）
         """
         super().__init__(name)
         self._provider: BaseLLMProvider = provider or OpenAIProvider()

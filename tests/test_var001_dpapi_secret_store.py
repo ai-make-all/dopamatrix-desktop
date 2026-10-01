@@ -324,6 +324,9 @@ class OpenAISettingsAndProviderTests(unittest.TestCase):
         self.assertEqual(
             payload,
             {
+                "provider": "OpenAI / Compatible API",
+                "openai_base_url": None,
+                "llm_model": "gpt-4o-mini",
                 "is_configured": True,
                 "secret_status": "PRESENT",
                 "migration_required": False,

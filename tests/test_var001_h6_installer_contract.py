@@ -10,9 +10,11 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 TAURI_CONFIG_PATH = REPOSITORY_ROOT / "web_ui/src-tauri/tauri.conf.json"
 PACKAGE_JSON_PATH = REPOSITORY_ROOT / "web_ui/package.json"
+PACKAGE_LOCK_PATH = REPOSITORY_ROOT / "web_ui/package-lock.json"
 VERSION_SOURCE_PATH = REPOSITORY_ROOT / "src/version.py"
 LOGIN_SOURCE_PATH = REPOSITORY_ROOT / "web_ui/src/components/Login.vue"
 CARGO_MANIFEST_PATH = REPOSITORY_ROOT / "web_ui/src-tauri/Cargo.toml"
+CARGO_LOCK_PATH = REPOSITORY_ROOT / "web_ui/src-tauri/Cargo.lock"
 
 
 def _application_version() -> str:
@@ -48,8 +50,11 @@ class H6InstallerContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tauri = json.loads(TAURI_CONFIG_PATH.read_text(encoding="utf-8"))
         cls.package = json.loads(PACKAGE_JSON_PATH.read_text(encoding="utf-8"))
+        cls.package_lock = json.loads(PACKAGE_LOCK_PATH.read_text(encoding="utf-8"))
         with CARGO_MANIFEST_PATH.open("rb") as cargo_manifest:
             cls.cargo = tomllib.load(cargo_manifest)
+        with CARGO_LOCK_PATH.open("rb") as cargo_lock:
+            cls.cargo_lock = tomllib.load(cargo_lock)
         cls.login = LOGIN_SOURCE_PATH.read_text(encoding="utf-8")
 
     def test_bundle_is_nsis_only_current_user(self):
@@ -86,14 +91,26 @@ class H6InstallerContractTests(unittest.TestCase):
         self.assertNotIn("updater", all_keys)
 
     def test_release_identity_is_aligned(self):
-        self.assertEqual(self.tauri["version"], "1.5.0-rc1")
-        self.assertEqual(self.package["version"], "1.5.0-rc1")
-        self.assertEqual(_application_version(), "1.5.0-rc1")
-        self.assertEqual(self.cargo["package"]["version"], "1.5.0-rc1")
+        self.assertEqual(self.tauri["version"], "1.5.0-rc2")
+        self.assertEqual(self.package["version"], "1.5.0-rc2")
+        self.assertEqual(self.package_lock["version"], "1.5.0-rc2")
+        self.assertEqual(
+            self.package_lock["packages"][""]["version"],
+            "1.5.0-rc2",
+        )
+        self.assertEqual(_application_version(), "1.5.0-rc2")
+        self.assertEqual(self.cargo["package"]["version"], "1.5.0-rc2")
+        local_app = [
+            package
+            for package in self.cargo_lock["package"]
+            if package["name"] == "app"
+        ]
+        self.assertEqual(len(local_app), 1)
+        self.assertEqual(local_app[0]["version"], "1.5.0-rc2")
 
     def test_login_displays_current_release_identity_only(self):
-        self.assertIn("SYSTEM READY · v1.5.0-rc1", self.login)
-        self.assertIn("DOPAMATRIX // DESKTOP // v1.5.0-rc1", self.login)
+        self.assertIn("SYSTEM READY · v1.5.0-rc2", self.login)
+        self.assertIn("DOPAMATRIX // DESKTOP // v1.5.0-rc2", self.login)
         self.assertNotIn("v1.1-ALPHA", self.login)
         self.assertNotIn("BUILD 001", self.login)
         self.assertNotIn("DESKTOP ALPHA", self.login)

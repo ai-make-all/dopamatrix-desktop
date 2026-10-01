@@ -9,6 +9,13 @@ from abc import ABC, abstractmethod
 
 import openai
 
+from src.api.runtime_config import (
+    DEFAULT_LLM_MODEL,
+    DEFAULT_OPENAI_BASE_URL,
+    LLM_MODEL_SETTING_KEY,
+    OPENAI_BASE_URL_SETTING_KEY,
+    get_runtime_config_provider,
+)
 from src.api.secret_store import (
     SecretStoreError,
     get_default_secret_store,
@@ -20,7 +27,17 @@ from src.api.secret_store import (
 # provider. It is never represented in API status or logs and is explicitly
 # invalidated after Settings replacement.
 _api_key_cache: dict[str, str] = {}
-_DEFAULT_LLM_MODEL = "gpt-4o-mini"
+
+
+def _packaged_operational_setting(key: str) -> str | None:
+    provider = get_runtime_config_provider()
+    if provider is None:
+        return None
+    value = provider.static_operational_mapping.get(key)
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 def _resolve_openai_base_url(
@@ -29,11 +46,14 @@ def _resolve_openai_base_url(
     frozen: bool | None = None,
 ) -> str | None:
     """Keep endpoint env compatibility development-only."""
-    if explicit_base_url:
-        return explicit_base_url
+    if explicit_base_url is not None and explicit_base_url.strip():
+        return explicit_base_url.strip()
     is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
     if is_packaged:
-        return None
+        return (
+            _packaged_operational_setting(OPENAI_BASE_URL_SETTING_KEY)
+            or DEFAULT_OPENAI_BASE_URL
+        )
     return os.getenv("OPENAI_BASE_URL") or None
 
 
@@ -43,12 +63,15 @@ def _resolve_llm_model(
     frozen: bool | None = None,
 ) -> str:
     """Keep the packaged model fixed unless the caller explicitly selects one."""
-    if explicit_model:
-        return explicit_model
+    if explicit_model is not None and explicit_model.strip():
+        return explicit_model.strip()
     is_packaged = getattr(sys, "frozen", False) if frozen is None else frozen
     if is_packaged:
-        return _DEFAULT_LLM_MODEL
-    return os.getenv("LLM_MODEL", _DEFAULT_LLM_MODEL)
+        return (
+            _packaged_operational_setting(LLM_MODEL_SETTING_KEY)
+            or DEFAULT_LLM_MODEL
+        )
+    return os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL)
 
 
 def _load_api_key_from_db(setting_key: str = "openai_api_key") -> str:
@@ -91,7 +114,8 @@ class OpenAIProvider(BaseLLMProvider):
 
     The API key is resolved from ``secure_settings`` at request time (through
     the bounded cache). Non-secret endpoint/model environment compatibility is
-    source-development-only; packaged V1.5 uses caller arguments or defaults.
+    source-development-only. Packaged runtime uses caller arguments, then the
+    startup-loaded operational mapping, then reviewed defaults.
     """
 
     def __init__(

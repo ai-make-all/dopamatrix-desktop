@@ -101,7 +101,7 @@ class LlmNonSecretAuthorityTests(unittest.TestCase):
                 model="explicit-model",
             )
 
-        self.assertIsNone(default_provider._base_url)
+        self.assertEqual(default_provider._base_url, "https://api.openai.com/v1")
         self.assertEqual(default_provider.model, "gpt-4o-mini")
         self.assertEqual(
             explicit_provider._base_url,

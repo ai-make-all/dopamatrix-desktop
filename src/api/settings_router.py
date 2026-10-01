@@ -1,6 +1,8 @@
 """Machine-global settings routes.
 
 OpenAI credentials are stored only through the DPAPI-backed secure store.
+LLM endpoint/model settings use the existing non-secret app_settings authority
+and are applied to the immutable RuntimeConfigProvider on backend restart.
 Delivery Root remains a non-secret dynamic machine setting.
 """
 
@@ -10,6 +12,12 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 
 from .delivery_output import get_delivery_root, save_delivery_root
+from .runtime_config import (
+    LLM_PROVIDER_NAME,
+    LlmOperationalSettingsError,
+    read_llm_operational_settings,
+    save_llm_operational_settings,
+)
 from .secret_store import (
     SecretStoreError,
     get_default_secret_store,
@@ -36,9 +44,24 @@ class LLMKeyPayload(BaseModel):
 
 
 class LLMKeyResponse(BaseModel):
+    provider: str
+    openai_base_url: str | None
+    llm_model: str
     is_configured: bool
     secret_status: str
     migration_required: bool = False
+
+
+class LLMOperationalSettingsPayload(BaseModel):
+    openai_base_url: str = ""
+    llm_model: str = ""
+
+
+class LLMOperationalSettingsResponse(BaseModel):
+    provider: str
+    openai_base_url: str | None
+    llm_model: str
+    restart_required: bool = True
 
 
 class DeliveryRootPayload(BaseModel):
@@ -53,12 +76,23 @@ class DeliveryRootResponse(BaseModel):
 @router.get(
     "/llm",
     response_model=LLMKeyResponse,
-    summary="Get LLM API-key configuration status",
+    summary="Get non-secret LLM configuration and API-key status",
 )
 def get_llm_key() -> LLMKeyResponse:
-    """Return presence/error state only; never secret-derived metadata."""
-    state = inspect_openai_secret_state(get_default_secret_store())
+    """Return non-secret settings and secret status, never secret-derived data."""
+    store = get_default_secret_store()
+    state = inspect_openai_secret_state(store)
+    try:
+        operational = read_llm_operational_settings(store.db_path)
+    except (LlmOperationalSettingsError, sqlite3.Error, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LLM_OPERATIONAL_SETTINGS_READ_FAILED",
+        ) from exc
     return LLMKeyResponse(
+        provider=LLM_PROVIDER_NAME,
+        openai_base_url=operational.openai_base_url,
+        llm_model=operational.llm_model,
         is_configured=state.is_configured,
         secret_status=state.secret_status.value,
         migration_required=state.migration_required,
@@ -83,6 +117,39 @@ def save_llm_key(payload: LLMKeyPayload) -> dict:
 
     invalidate_api_key_cache(_KEY_OPENAI)
     return {"status": "ok"}
+
+
+@router.post(
+    "/llm/config",
+    response_model=LLMOperationalSettingsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Save non-secret LLM provider configuration",
+)
+def save_llm_config(
+    payload: LLMOperationalSettingsPayload,
+) -> LLMOperationalSettingsResponse:
+    """Persist validated endpoint/model settings for the next backend start."""
+    try:
+        operational = save_llm_operational_settings(
+            get_default_secret_store().db_path,
+            openai_base_url=payload.openai_base_url,
+            llm_model=payload.llm_model,
+        )
+    except LlmOperationalSettingsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LLM_OPERATIONAL_SETTINGS_SAVE_FAILED",
+        ) from exc
+    return LLMOperationalSettingsResponse(
+        provider=LLM_PROVIDER_NAME,
+        openai_base_url=operational.openai_base_url,
+        llm_model=operational.llm_model,
+    )
 
 
 @router.get(

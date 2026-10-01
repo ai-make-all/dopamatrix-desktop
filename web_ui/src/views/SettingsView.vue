@@ -11,12 +11,19 @@ const store = useAppStore()
 const llmApiKeyInput  = ref('')
 const llmIsConfigured = ref(false)
 const llmSaving       = ref(false)
+const llmConfigSaving = ref(false)
+const llmProvider     = ref('OpenAI / Compatible API')
+const llmBaseUrl      = ref('')
+const llmModel        = ref('gpt-4o-mini')
 const showLlmKeyText  = ref(false)
 
 async function loadLlmSettings() {
   try {
     const resp = await axios.get(`${store.API_BASE}/api/v1/settings/llm`)
     llmIsConfigured.value = resp.data.is_configured ?? false
+    llmProvider.value = resp.data.provider || 'OpenAI / Compatible API'
+    llmBaseUrl.value = resp.data.openai_base_url || ''
+    llmModel.value = resp.data.llm_model || 'gpt-4o-mini'
   } catch (err) {
     console.error('[LLM Settings] 获取配置失败：', err)
   }
@@ -34,7 +41,7 @@ async function saveLlmSettings() {
     llmApiKeyInput.value = ''
     showLlmKeyText.value = false
     await loadLlmSettings()
-    store.showToast('✅ API Key 保存成功！大模型配置已生效。')
+    store.showToast('✅ API Key 已安全保存。')
   } catch (err) {
     store.showToast(`❌ 保存失败：${err.response?.data?.detail || err.message}`)
   } finally {
@@ -52,6 +59,23 @@ async function pickGlobalOutputFolder() {
     }
   } catch (err) {
     console.error('[Tauri Dialog] 设置目录打开失败：', err)
+  }
+}
+
+async function saveLlmOperationalSettings() {
+  llmConfigSaving.value = true
+  try {
+    const resp = await axios.post(`${store.API_BASE}/api/v1/settings/llm/config`, {
+      openai_base_url: llmBaseUrl.value,
+      llm_model: llmModel.value,
+    })
+    llmBaseUrl.value = resp.data.openai_base_url || ''
+    llmModel.value = resp.data.llm_model || 'gpt-4o-mini'
+    store.showToast('Configuration saved. Restart DopaMatrix to apply LLM endpoint/model changes.')
+  } catch (err) {
+    store.showToast(`❌ 配置保存失败：${err.response?.data?.detail || err.message}`)
+  } finally {
+    llmConfigSaving.value = false
   }
 }
 
@@ -140,10 +164,53 @@ onMounted(() => {
         <div class="tool-select-wrap" style="width:fit-content; opacity:0.6; pointer-events:none; cursor:default;">
           <span class="tool-select-icon">🧠</span>
           <select class="tool-select" style="font-size:0.82rem; padding:0.1rem 0; min-width:14rem;">
-            <option>OpenAI / Compatible API（DeepSeek · Moonshot · 通义）</option>
+            <option>{{ llmProvider }}</option>
           </select>
         </div>
         <p class="settings-hint">后续版本将支持多服务商切换</p>
+      </div>
+
+      <div class="settings-field">
+        <label class="settings-label">API Base URL</label>
+        <div class="llm-key-input-wrap">
+          <input
+            v-model="llmBaseUrl"
+            type="url"
+            placeholder="SDK default (for example, https://api.example.com/v1)"
+            class="llm-key-input"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+        <p class="settings-hint">留空时使用 OpenAI SDK 默认端点；不会自动追加 /v1。</p>
+      </div>
+
+      <div class="settings-field">
+        <label class="settings-label">Model</label>
+        <div class="llm-key-input-wrap">
+          <input
+            v-model="llmModel"
+            type="text"
+            placeholder="gpt-4o-mini"
+            class="llm-key-input"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+        <p class="settings-hint">留空时使用 gpt-4o-mini。</p>
+      </div>
+
+      <div style="margin-bottom:1.25rem;">
+        <button
+          @click="saveLlmOperationalSettings"
+          :disabled="llmConfigSaving"
+          class="cta-glow-btn llm-save-btn"
+        >
+          {{ llmConfigSaving ? '保存中...' : '保存 API Base URL / Model' }}
+        </button>
+        <p class="settings-hint" style="margin-top:0.65rem;">
+          Configuration changes require restarting DopaMatrix before the LLM endpoint/model takes effect.
+        </p>
       </div>
 
       <div class="settings-field">
