@@ -102,7 +102,9 @@ from src.api import routes_media
 from src.api import routes_video
 from src.api import routes_reservation_diagnostics
 from src.api import routes_ws
-from src.api import settings_router
+from src.api import settings_router, tenant_router
+from src.api.tenant_policy import TenantPolicyError
+from src.api.tenant_router import TenantHeaderAuthorityMiddleware
 from src.api.ws_manager import manager as ws_manager
 from src.services.llm_provider import invalidate_api_key_cache
 
@@ -228,12 +230,23 @@ app = FastAPI(
 
 # ---- CORS（允许本地前端 & GrowthOS 直接调用）-------------------- #
 app.add_middleware(
+    TenantHeaderAuthorityMiddleware,
+    paths=_bootstrap_decision.runtime_paths,
+)
+# CORS is installed last so it wraps tenant-policy error responses.
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],        # 生产环境请收紧为具体域名
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(TenantPolicyError)
+async def tenant_policy_error_handler(_, exc: TenantPolicyError) -> JSONResponse:
+    return JSONResponse(status_code=exc.http_status, content={"detail": exc.code})
+
 
 # ================================================================== #
 # 路由 — 健康检查                                                        #
@@ -278,6 +291,7 @@ app.include_router(routes_reservation_diagnostics.router, prefix="/api/v1")
 app.include_router(routes_gateway.router, prefix="/api/v1")
 # BYOK 设置接口 — 前端写入 / 读取 LLM API Key
 app.include_router(settings_router.router, prefix="/api/v1")
+app.include_router(tenant_router.router, prefix="/api/v1")
 # 统一事件总线 — 鉴权 REST 接口（买票：POST /api/v1/auth/ws-ticket）
 app.include_router(routes_ws.auth_router, prefix="/api/v1")
 # 统一事件总线 — WebSocket 实时推送端点（持票上船：WS /ws/events?ticket=xxx，无 /api/v1 前缀）

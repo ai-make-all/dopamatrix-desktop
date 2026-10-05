@@ -233,6 +233,8 @@ class FingerprintLedgerSchemaTests(unittest.TestCase):
         engine_cache = {}
         try:
             with (
+                tempfile.TemporaryDirectory() as directory,
+                temporary_test_runtime_paths(directory),
                 patch.object(database, "_tenant_engines", engine_cache),
                 patch.object(
                     database,
@@ -412,29 +414,31 @@ class TenantAuthorityTests(unittest.TestCase):
             yield Mock()
 
         app.dependency_overrides[database.get_db] = fake_db
-        response = TestClient(app).post(
-            "/api/v1/tasks/submit-dsl",
-            headers={"X-Local-User": "tenant-a"},
-            json={
-                "engine_type": "content",
-                "timeline": [],
-                "prompt": "blind",
-                "tenant_id": "tenant-b",
-            },
-        )
+        with tempfile.TemporaryDirectory() as directory, temporary_test_runtime_paths(directory):
+            response = TestClient(app).post(
+                "/api/v1/tasks/submit-dsl",
+                headers={"X-Local-User": "ph-elv-0001"},
+                json={
+                    "engine_type": "content",
+                    "timeline": [],
+                    "prompt": "blind",
+                    "tenant_id": "ph-bty-0001",
+                },
+            )
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["detail"], "TENANT_AUTHORITY_MISMATCH")
 
     def test_omitted_body_uses_header_and_explicit_mismatch_is_rejected(self):
-        header_request = _request({"X-Local-User": "tenant-a"})
+        header_request = _request({"X-Local-User": "ph-elv-0001"})
         omitted = RenderDSLRequest(engine_type="content", timeline=[], tenant_id=None)
-        self.assertEqual(
-            routes_dsl._authoritative_request_tenant(omitted, header_request),
-            "tenant-a",
-        )
-        mismatched = omitted.model_copy(update={"tenant_id": "tenant-b"})
-        with self.assertRaises(HTTPException) as raised:
-            routes_dsl._authoritative_request_tenant(mismatched, header_request)
+        with tempfile.TemporaryDirectory() as directory, temporary_test_runtime_paths(directory):
+            self.assertEqual(
+                routes_dsl._authoritative_request_tenant(omitted, header_request),
+                "ph-elv-0001",
+            )
+            mismatched = omitted.model_copy(update={"tenant_id": "ph-bty-0001"})
+            with self.assertRaises(HTTPException) as raised:
+                routes_dsl._authoritative_request_tenant(mismatched, header_request)
         self.assertEqual(raised.exception.status_code, 422)
         self.assertEqual(raised.exception.detail, "TENANT_AUTHORITY_MISMATCH")
 
@@ -445,7 +449,7 @@ class TenantAuthorityTests(unittest.TestCase):
         request_model = RenderDSLRequest(
             engine_type=payload.engine_type,
             timeline=list(payload.timeline),
-            tenant_id="tenant-a",
+            tenant_id="ph-elv-0001",
             variant_planning_policy="exact_main_visual",
         )
         background = Mock()
@@ -462,14 +466,15 @@ class TenantAuthorityTests(unittest.TestCase):
                 ),
             ),
         ):
-            routes_dsl.submit_dsl(
-                request_model,
-                background,
-                db=Mock(),
-                request=_request({"X-Local-User": "tenant-a"}),
-            )
+            with tempfile.TemporaryDirectory() as directory, temporary_test_runtime_paths(directory):
+                routes_dsl.submit_dsl(
+                    request_model,
+                    background,
+                    db=Mock(),
+                    request=_request({"X-Local-User": "ph-elv-0001"}),
+                )
         scheduled = background.add_task.call_args
-        self.assertEqual(scheduled.args[5], "tenant-a")
+        self.assertEqual(scheduled.args[5], "ph-elv-0001")
 
 
 class FingerprintLedgerCoordinatorTests(unittest.TestCase):

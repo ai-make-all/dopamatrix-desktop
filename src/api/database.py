@@ -26,9 +26,15 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from starlette.requests import Request
 
 from .runtime_paths import (
+    RuntimeMode,
     get_initialized_runtime_paths,
     get_runtime_paths,
     resolve_runtime_paths,
+)
+from .tenant_policy import (
+    TenantIdentityMalformed,
+    parse_approved_tenant_identity,
+    require_provisioned_tenant,
 )
 
 logger = logging.getLogger(__name__)
@@ -438,16 +444,21 @@ def canonical_tenant_id(tenant_id: str | None) -> str:
 
 def request_tenant_id(request: Request) -> str:
     """Resolve the canonical tenant selected by the security-boundary header."""
-    return canonical_tenant_id(request.headers.get("X-Local-User", "default"))
+    raw_tenant_id = request.headers.get("X-Local-User")
+    current_paths = get_initialized_runtime_paths()
+    if current_paths is not None and current_paths.mode is RuntimeMode.TEST:
+        return canonical_tenant_id(raw_tenant_id)
+    if raw_tenant_id is None:
+        raise TenantIdentityMalformed()
+    identity = parse_approved_tenant_identity(raw_tenant_id)
+    paths = current_paths or get_runtime_paths()
+    return require_provisioned_tenant(identity.canonical_id, paths).canonical_id
 
 
-def get_tenant_engine(tenant_id: str | None):
-    """根据 tenant_id 动态获取或创建专属数据库 Engine。"""
-    safe_tenant_id = canonical_tenant_id(tenant_id)
-
+def _open_tenant_engine(safe_tenant_id: str, paths):
     with _engine_lock:
         if safe_tenant_id not in _tenant_engines:
-            db_path = get_runtime_paths().tenant_database_path(safe_tenant_id)
+            db_path = paths.tenant_database_path(safe_tenant_id)
             engine = create_engine(
                 _sqlite_database_url(db_path),
                 connect_args={"check_same_thread": False},
@@ -467,6 +478,29 @@ def get_tenant_engine(tenant_id: str | None):
             _tenant_engines[safe_tenant_id] = engine
 
         return _tenant_engines[safe_tenant_id]
+
+
+def get_tenant_engine(tenant_id: str | None):
+    """Open an authorized, operator-provisioned tenant database authority."""
+    current_paths = get_initialized_runtime_paths()
+    if current_paths is not None and current_paths.mode is RuntimeMode.TEST:
+        # Explicit TEST RuntimePaths preserve isolated legacy test identifiers.
+        # RuntimeMode.TEST cannot be selected by packaged environment input.
+        safe_tenant_id = canonical_tenant_id(tenant_id)
+        paths = current_paths
+    else:
+        identity = parse_approved_tenant_identity(tenant_id)
+        paths = current_paths or get_runtime_paths()
+        safe_tenant_id = require_provisioned_tenant(
+            identity.canonical_id, paths
+        ).canonical_id
+    return _open_tenant_engine(safe_tenant_id, paths)
+
+
+def provision_tenant_engine(tenant_id: str):
+    """Create one approved tenant authority for the operator provision command."""
+    identity = parse_approved_tenant_identity(tenant_id)
+    return _open_tenant_engine(identity.canonical_id, get_runtime_paths())
 
 
 # ------------------------------------------------------------------ #

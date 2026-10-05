@@ -1,23 +1,39 @@
 <script setup>
 import { ref } from 'vue'
+import { useAppStore } from '../stores/appStore'
 
 const emit = defineEmits(['login-success'])
+const store = useAppStore()
 
 const username = ref('')
 const isEntering = ref(false)
 const errorShake = ref(false)
+const errorMessage = ref('')
 
 async function handleEnter() {
   const name = username.value.trim()
   if (!name) {
+    errorMessage.value = 'Please enter your authorized Tenant ID.'
     errorShake.value = true
     setTimeout(() => { errorShake.value = false }, 600)
     return
   }
   isEntering.value = true
-  // Simulate brief auth "handshake" animation
-  await new Promise(r => setTimeout(r, 900))
-  emit('login-success', name)
+  errorMessage.value = ''
+  try {
+    const tenant = await store.handleLogin(name)
+    emit('login-success', tenant)
+  } catch (error) {
+    errorMessage.value = (
+      error?.response?.status === 400 || error?.response?.status === 403
+        ? 'Workspace not authorized for this Seed release. Please check your Tenant ID.'
+        : 'Tenant authorization service is unavailable. Please try again.'
+    )
+    errorShake.value = true
+    setTimeout(() => { errorShake.value = false }, 600)
+  } finally {
+    isEntering.value = false
+  }
 }
 
 function onKeydown(e) {
@@ -95,7 +111,8 @@ function onKeydown(e) {
           />
           <span class="input-cursor" aria-hidden="true">_</span>
         </div>
-        <p class="input-hint">任意代号皆可，此为本机离线工作区隔离标识</p>
+        <p class="input-hint">Enter an authorized, provisioned Philippine Seed Tenant ID.</p>
+        <p v-if="errorMessage" class="input-error" role="alert">{{ errorMessage }}</p>
       </div>
 
       <!-- CTA button -->
@@ -430,6 +447,13 @@ function onKeydown(e) {
   font-size: 0.65rem;
   color: #1e3a5f;
   font-family: 'JetBrains Mono', monospace;
+}
+
+.input-error {
+  margin: 10px 0 0;
+  color: #fb7185;
+  font-size: 0.76rem;
+  line-height: 1.4;
 }
 
 /* ── Enter button ────────────────────────────────────────────────────────── */

@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import axios from 'axios'
+import {
+  TENANT_SESSION_STORAGE_KEY,
+  clearTenantSession,
+  establishTenantSession,
+  restoreTenantSession,
+} from '../utils/tenantSession.js'
 
 export const API_BASE = 'http://127.0.0.1:8000'
 const POLL_INTERVAL_MS = 3000
@@ -10,29 +16,48 @@ export const useAppStore = defineStore('app', () => {
   const isLoggedIn   = ref(false)
   const loggedInUser = ref('')
 
-  function initAuth() {
-    const stored = localStorage.getItem('dopamatrix_user')
+  async function initAuth() {
+    const stored = localStorage.getItem(TENANT_SESSION_STORAGE_KEY)
     if (stored) {
-      loggedInUser.value = stored
-      isLoggedIn.value   = true
-      axios.defaults.headers.common['X-Local-User'] = stored
+      try {
+        const tenant = await restoreTenantSession({
+          httpClient: axios,
+          apiBase: API_BASE,
+          storage: localStorage,
+          headers: axios.defaults.headers.common,
+          tenantId: stored,
+        })
+        loggedInUser.value = tenant
+        isLoggedIn.value = true
+      } catch (error) {
+        loggedInUser.value = ''
+        isLoggedIn.value = false
+        delete axios.defaults.headers.common['X-Local-User']
+        return false
+      }
     }
     hydrateDeliveryRoot()
+    return isLoggedIn.value
   }
 
-  function handleLogin(username) {
-    localStorage.setItem('dopamatrix_user', username)
-    loggedInUser.value = username
+  async function handleLogin(username) {
+    const tenant = await establishTenantSession({
+      httpClient: axios,
+      apiBase: API_BASE,
+      storage: localStorage,
+      headers: axios.defaults.headers.common,
+      tenantId: username,
+    })
+    loggedInUser.value = tenant
     isLoggedIn.value   = true
-    axios.defaults.headers.common['X-Local-User'] = username
     hydrateDeliveryRoot()
+    return tenant
   }
 
   function handleLogout() {
-    localStorage.removeItem('dopamatrix_user')
+    clearTenantSession(localStorage, axios.defaults.headers.common)
     loggedInUser.value = ''
     isLoggedIn.value   = false
-    delete axios.defaults.headers.common['X-Local-User']
   }
 
   // ── Toast ─────────────────────────────────────────────────────────────────

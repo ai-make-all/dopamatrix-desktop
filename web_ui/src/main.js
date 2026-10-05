@@ -12,10 +12,14 @@ const app   = createApp(App)
 
 app.use(pinia)
 
-// Hydrate auth state from localStorage before first navigation guard runs
-const appStore = useAppStore()
-appStore.initAuth()
+async function bootstrap() {
+  // Backend authorization, not localStorage, establishes restored tenant state.
+  const appStore = useAppStore()
+  await appStore.initAuth()
 
-app.use(VueVirtualScroller)
-app.use(router)
-app.mount('#app')
+  app.use(VueVirtualScroller)
+  app.use(router)
+  app.mount('#app')
+}
+
+bootstrap()

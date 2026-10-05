@@ -19,8 +19,7 @@ onUnmounted(() => {
   store.clearPollTimer()
 })
 
-function handleLogin(username) {
-  store.handleLogin(username)
+function handleLogin() {
   router.push('/dashboard')
 }
 

@@ -15,12 +15,15 @@ from sqlalchemy.pool import StaticPool
 from src.api import routes_matrix
 from src.api.approval_types import VariantStatus
 from src.api.models import Base, TaskHistory, VariantApproval
+from src.api.runtime_paths import temporary_test_runtime_paths
 
 
 class MatrixExportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.temp_root = Path(self.temporary.name)
+        self.runtime_paths = temporary_test_runtime_paths(self.temp_root / "runtime")
+        self.runtime_paths.__enter__()
         self.delivery_root = self.temp_root / "delivery"
         self.engine = create_engine(
             "sqlite://",
@@ -106,6 +109,7 @@ class MatrixExportTests(unittest.TestCase):
             item.stop()
         self.session.close()
         self.engine.dispose()
+        self.runtime_paths.__exit__(None, None, None)
         self.temporary.cleanup()
 
     def test_export_requires_hashes(self):

@@ -8,7 +8,6 @@ this module never resolves or creates a backup root.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 import stat
 import unicodedata
@@ -27,6 +26,13 @@ from .runtime_paths import (
     RuntimePaths,
     get_initialized_runtime_paths,
     initialize_runtime_paths,
+)
+from .tenant_policy import (
+    ApprovedTenantIdentity,
+    TenantPolicyError,
+    parse_approved_tenant_identity,
+    tenant_business_table_names,
+    verify_tenant_schema_readiness,
 )
 
 
@@ -51,70 +57,7 @@ OPERATOR_TENANT_PROVISION_INTERNAL_FAILED = (
 BACKUP_NAMESPACE_NOT_CONFIGURED = "NOT_CONFIGURED"
 DELIVERY_NAMESPACE_NOT_CONFIGURED = "NOT_CONFIGURED"
 
-_TENANT_PATTERN = re.compile(
-    r"^(?P<country>[a-z]{2})-(?P<vertical>[a-z0-9]{3,5})-(?P<sequence>[0-9]{4})$",
-    re.ASCII,
-)
-_APPROVED_TENANTS = MappingProxyType(
-    {
-        "ph-elv-0001": "elv0001",
-        "ph-bty-0001": "bty0001",
-        "ph-hwh-0001": "hwh0001",
-    }
-)
-_APPROVED_VERTICALS = frozenset({"elv", "bty", "hwh"})
-_RESERVED_IDENTITIES = frozenset({"default", "test", "dev", "demo", "v15_acceptance"})
 _TARGET_SUFFIXES = ("", "-wal", "-shm")
-
-_APPLICATION_TABLES = frozenset(
-    {
-        "video_tasks",
-        "reservation_run_diagnostics",
-        "reservation_rollout_breakers",
-        "video_assets",
-        "local_assets_inventory",
-        "task_history",
-        "variant_approvals",
-        "variant_status_audits",
-    }
-)
-_LEDGER_TABLES = frozenset(
-    {
-        "fingerprint_ledger_schema_version",
-        "fingerprint_identities",
-        "fingerprint_occurrences",
-        "fingerprint_reservations",
-    }
-)
-_ZERO_BUSINESS_TABLES = tuple(sorted(_APPLICATION_TABLES | (_LEDGER_TABLES - {"fingerprint_ledger_schema_version"})))
-_ROLLOUT_COLUMNS = frozenset(
-    {
-        "reservation_conflict_mode",
-        "planning_policy",
-        "reservation_mode_source",
-        "rollout_generation",
-        "rollout_bucket",
-        "rollout_canary_basis_points",
-    }
-)
-_ROLLOUT_INDEX_COLUMNS = frozenset(
-    {
-        ("reservation_conflict_mode", "planning_policy", "created_at"),
-        (
-            "reservation_mode_source",
-            "planning_policy",
-            "rollout_generation",
-            "created_at",
-        ),
-    }
-)
-
-
-@dataclass(frozen=True)
-class ApprovedTenantIdentity:
-    canonical_id: str
-    short_code: str
-
 
 @dataclass(frozen=True)
 class TenantProvisionOutcome:
@@ -146,20 +89,10 @@ def _failure(error_code: str, exit_code: int, message: str) -> _ProvisionFailure
 
 def validate_approved_tenant_identity(raw: str) -> ApprovedTenantIdentity:
     """Validate the frozen V1.5 identity without sanitizer acceptance."""
-    if not isinstance(raw, str) or not raw or not raw.isascii() or raw != raw.lower():
+    try:
+        return parse_approved_tenant_identity(raw)
+    except TenantPolicyError:
         raise _failure(OPERATOR_TENANT_INVALID, 3, "tenant identity is not approved")
-    match = _TENANT_PATTERN.fullmatch(raw)
-    if match is None:
-        raise _failure(OPERATOR_TENANT_INVALID, 3, "tenant identity is not approved")
-    sequence = int(match.group("sequence"))
-    if (
-        not 1 <= sequence <= 9999
-        or raw in _RESERVED_IDENTITIES
-        or match.group("vertical") not in _APPROVED_VERTICALS
-        or raw not in _APPROVED_TENANTS
-    ):
-        raise _failure(OPERATOR_TENANT_INVALID, 3, "tenant identity is not approved")
-    return ApprovedTenantIdentity(raw, _APPROVED_TENANTS[raw])
 
 
 def validate_approval_ref(value: str) -> str:
@@ -273,9 +206,9 @@ def _check_delivery_namespace(delivery_root: str | None, tenant: str) -> str:
 
 
 def _default_initializer(tenant: str) -> None:
-    from .database import get_tenant_engine
+    from .database import provision_tenant_engine
 
-    engine = get_tenant_engine(tenant)
+    engine = provision_tenant_engine(tenant)
     try:
         with engine.connect() as connection:
             connection.exec_driver_sql("SELECT 1").scalar_one()
@@ -285,15 +218,6 @@ def _default_initializer(tenant: str) -> None:
 
 def _initialize_operator_runtime_paths() -> RuntimePaths:
     return get_initialized_runtime_paths() or initialize_runtime_paths()
-
-
-def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
-    return frozenset(
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table';"
-        ).fetchall()
-    )
 
 
 def _default_verifier(database: Path) -> None:
@@ -308,49 +232,8 @@ def _default_verifier(database: Path) -> None:
     with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON;")
-        connection.execute("PRAGMA foreign_keys=ON;")
-        if connection.execute("PRAGMA foreign_keys;").fetchone()[0] != 1:
-            raise ValueError("TENANT_FOREIGN_KEYS_DISABLED")
-        integrity = connection.execute("PRAGMA integrity_check;").fetchall()
-        if [str(row[0]).lower() for row in integrity] != ["ok"]:
-            raise ValueError("TENANT_INTEGRITY_FAILED")
-        if connection.execute("PRAGMA foreign_key_check;").fetchone() is not None:
-            raise ValueError("TENANT_FOREIGN_KEY_CHECK_FAILED")
-
-        tables = _table_names(connection)
-        if not (_APPLICATION_TABLES | _LEDGER_TABLES).issubset(tables):
-            raise ValueError("TENANT_SCHEMA_INCOMPLETE")
-        from .models import Base as ApplicationModelBase
-
-        expected_application_columns = {
-            table.name: frozenset(column.name for column in table.columns)
-            for table in ApplicationModelBase.metadata.sorted_tables
-        }
-        for table_name, expected_columns in expected_application_columns.items():
-            actual_columns = frozenset(
-                str(row[1])
-                for row in connection.execute(f'PRAGMA table_info("{table_name}");')
-            )
-            if not expected_columns.issubset(actual_columns):
-                raise ValueError("TENANT_SCHEMA_INCOMPLETE")
-        video_columns = frozenset(
-            str(row[1]) for row in connection.execute("PRAGMA table_info('video_tasks');")
-        )
-        if not _ROLLOUT_COLUMNS.issubset(video_columns):
-            raise ValueError("TENANT_ROLLOUT_SCHEMA_INCOMPLETE")
-        rollout_indexes = frozenset(
-            tuple(str(column[2]) for column in connection.execute(f"PRAGMA index_info('{row[1]}');"))
-            for row in connection.execute("PRAGMA index_list('video_tasks');")
-        )
-        if not _ROLLOUT_INDEX_COLUMNS.issubset(rollout_indexes):
-            raise ValueError("TENANT_ROLLOUT_SCHEMA_INCOMPLETE")
-        ledger = connection.execute(
-            "SELECT schema_version FROM fingerprint_ledger_schema_version WHERE component=?;",
-            ("fingerprint_ledger",),
-        ).fetchone()
-        if ledger is None or int(ledger[0]) != 2:
-            raise ValueError("TENANT_LEDGER_V2_INVALID")
-        for table in _ZERO_BUSINESS_TABLES:
+        verify_tenant_schema_readiness(connection)
+        for table in tenant_business_table_names():
             if int(connection.execute(f'SELECT COUNT(*) FROM "{table}";').fetchone()[0]) != 0:
                 raise ValueError("TENANT_BUSINESS_DATA_NOT_EMPTY")
     after = database.stat()

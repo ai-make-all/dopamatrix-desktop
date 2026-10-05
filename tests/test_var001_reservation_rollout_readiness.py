@@ -33,6 +33,7 @@ from src.api.public_task_admission import (
     transition_public_task_status,
 )
 from src.api.reservation_lease import ReservationLeaseConfiguration
+from src.api.runtime_paths import temporary_test_runtime_paths
 from src.api.reservation_rollout_readiness import (
     RESERVATION_ROLLOUT_READINESS_CONFIGURATION_INVALID,
     RESERVATION_ROLLOUT_READINESS_UNAVAILABLE,
@@ -79,6 +80,10 @@ class _Background:
 class ReservationRolloutReadinessTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self.runtime_paths = temporary_test_runtime_paths(
+            Path(self.temporary.name) / "runtime"
+        )
+        self.runtime_paths.__enter__()
         self.engines = []
         self.now = datetime.now(timezone.utc)
         self.engine, self.Session = self._database("tenant-a.db")
@@ -86,6 +91,7 @@ class ReservationRolloutReadinessTests(unittest.TestCase):
     def tearDown(self):
         for engine in reversed(self.engines):
             engine.dispose()
+        self.runtime_paths.__exit__(None, None, None)
         self.temporary.cleanup()
 
     def _database(self, name):

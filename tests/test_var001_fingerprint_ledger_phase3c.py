@@ -26,6 +26,7 @@ from src.api.fingerprint_ledger import (
     ensure_fingerprint_ledger_schema,
 )
 from src.api.models import Base
+from src.api.runtime_paths import temporary_test_runtime_paths
 from tests.test_var001_balanced_axis_coverage import (
     _SyntheticParser,
     _payload,
@@ -177,6 +178,8 @@ class FingerprintLedgerV2MigrationTests(unittest.TestCase):
         engine_cache = {}
         try:
             with (
+                tempfile.TemporaryDirectory() as directory,
+                temporary_test_runtime_paths(directory),
                 patch.object(database, "_tenant_engines", engine_cache),
                 patch.object(
                     database,
