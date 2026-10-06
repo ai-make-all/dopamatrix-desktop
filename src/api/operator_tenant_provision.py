@@ -9,7 +9,6 @@ this module never resolves or creates a backup root.
 from __future__ import annotations
 
 import sqlite3
-import stat
 import unicodedata
 from contextlib import closing
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
+from .delivery_output import DeliverySettingsReadError, read_current_delivery_root
 from .runtime_mutation import (
     RuntimeMutationBarrierBusy,
     RuntimeMutationBarrierError,
@@ -129,45 +129,19 @@ def _existing_target_artifacts(paths: RuntimePaths, tenant: str) -> tuple[Path, 
 
 
 def _read_delivery_root(paths: RuntimePaths) -> str | None:
-    """Read the existing app_settings authority without creating DB/table state."""
-    database = paths.settings_db_path
-    if not database.exists():
-        return None
-    sidecars = tuple(Path(str(database) + suffix) for suffix in ("-wal", "-shm", "-journal"))
-    if any(path.exists() for path in sidecars):
-        raise _failure(
-            OPERATOR_TENANT_PROVISION_SUBSYSTEM_FAILED,
-            8,
-            "Delivery configuration cannot be read safely",
+    """Translate the canonical persisted Delivery reader into operator semantics."""
+    try:
+        return read_current_delivery_root(paths) or None
+    except DeliverySettingsReadError as exc:
+        message = (
+            "Delivery configuration is invalid"
+            if str(exc) == "DELIVERY_SETTINGS_INVALID"
+            else "Delivery configuration cannot be read safely"
         )
-    try:
-        uri = database.resolve(strict=True).as_uri() + "?mode=ro&immutable=1"
-        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
-            table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings';"
-            ).fetchone()
-            if table is None:
-                return None
-            row = connection.execute(
-                "SELECT key_value FROM app_settings WHERE key_name='delivery_root';"
-            ).fetchone()
-    except (OSError, sqlite3.Error):
         raise _failure(
             OPERATOR_TENANT_PROVISION_SUBSYSTEM_FAILED,
             8,
-            "Delivery configuration cannot be read safely",
-        ) from None
-    if row is None or not str(row[0]).strip():
-        return None
-    from .delivery_output import normalize_delivery_root
-
-    try:
-        return normalize_delivery_root(str(row[0]))
-    except Exception:
-        raise _failure(
-            OPERATOR_TENANT_PROVISION_SUBSYSTEM_FAILED,
-            8,
-            "Delivery configuration is invalid",
+            message,
         ) from None
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -81,6 +82,65 @@ def _stub_initializer(paths: RuntimePaths, *, add_business_row: bool = False):
 def _stub_verifier(database: Path) -> None:
     if not database.is_file():
         raise AssertionError("missing initialized database")
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _run_real_operator_provision(
+    paths: RuntimePaths,
+) -> tuple[subprocess.CompletedProcess, dict]:
+    code = textwrap.dedent(
+        f"""
+        from src.api.runtime_paths import RuntimeMode, initialize_runtime_paths
+        from src.api.operator_cli import run_operator_cli
+        initialize_runtime_paths(mode=RuntimeMode.TEST, runtime_root={str(paths.runtime_root)!r})
+        raise SystemExit(run_operator_cli((
+            '--json', 'tenant', 'provision', '--tenant', 'ph-elv-0001',
+            '--approval-ref', 'RC2-3B-R1-TEST'
+        )))
+        """
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(REPOSITORY_ROOT)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+    payload = json.loads(result.stdout) if result.stdout else {}
+    return result, payload
+
+
+def _open_wal_settings(
+    paths: RuntimePaths,
+    *,
+    delivery_root: Path | None,
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(paths.settings_db_path)
+    assert connection.execute("PRAGMA journal_mode=WAL;").fetchone()[0] == "wal"
+    connection.execute("PRAGMA wal_autocheckpoint=0;")
+    connection.execute(
+        "CREATE TABLE app_settings (key_name TEXT PRIMARY KEY, key_value TEXT);"
+    )
+    if delivery_root is not None:
+        connection.execute(
+            "INSERT INTO app_settings VALUES ('delivery_root', ?);",
+            (str(delivery_root),),
+        )
+    connection.commit()
+    return connection
+
+
+def _file_observation(path: Path) -> tuple[int, int, str]:
+    metadata = path.stat()
+    return metadata.st_size, metadata.st_mtime_ns, _sha256(path)
 
 
 class TenantIdentityAndApprovalTests(unittest.TestCase):
@@ -322,6 +382,169 @@ class ProvisioningBarrierAndCollisionTests(unittest.TestCase):
 
 
 class NamespaceAuthorityTests(unittest.TestCase):
+    def test_complete_wal_shm_delivery_unset_uses_current_canonical_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _paths(Path(directory) / "runtime")
+            writer = _open_wal_settings(paths, delivery_root=None)
+            wal = Path(str(paths.settings_db_path) + "-wal")
+            shm = Path(str(paths.settings_db_path) + "-shm")
+            journal = Path(str(paths.settings_db_path) + "-journal")
+            try:
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                self.assertFalse(journal.exists())
+                main_before = _file_observation(paths.settings_db_path)
+                wal_before = _file_observation(wal)
+
+                result, payload = _run_real_operator_provision(paths)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(payload["status"], "PROVISIONED")
+                self.assertEqual(payload["data"]["delivery_namespace"], "NOT_CONFIGURED")
+                self.assertTrue(paths.tenant_database_path("ph-elv-0001").is_file())
+                self.assertEqual(_file_observation(paths.settings_db_path), main_before)
+                self.assertEqual(_file_observation(wal), wal_before)
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                self.assertFalse(journal.exists())
+            finally:
+                writer.close()
+
+    def test_complete_wal_shm_reads_current_configured_delivery_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            paths = _paths(base / "runtime")
+            delivery = base / "delivery-current-in-wal"
+            writer = _open_wal_settings(paths, delivery_root=delivery)
+            wal = Path(str(paths.settings_db_path) + "-wal")
+            shm = Path(str(paths.settings_db_path) + "-shm")
+            journal = Path(str(paths.settings_db_path) + "-journal")
+            try:
+                immutable_uri = (
+                    paths.settings_db_path.resolve(strict=True).as_uri()
+                    + "?mode=ro&immutable=1"
+                )
+                with closing(sqlite3.connect(immutable_uri, uri=True)) as stale:
+                    table = stale.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='app_settings';"
+                    ).fetchone()
+                    stale_value = (
+                        stale.execute(
+                            "SELECT key_value FROM app_settings "
+                            "WHERE key_name='delivery_root';"
+                        ).fetchone()[0]
+                        if table is not None
+                        else None
+                    )
+                self.assertNotEqual(stale_value, str(delivery))
+                main_before = _file_observation(paths.settings_db_path)
+                wal_before = _file_observation(wal)
+
+                result, payload = _run_real_operator_provision(paths)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(payload["status"], "PROVISIONED")
+                self.assertEqual(payload["data"]["delivery_namespace"], "AVAILABLE")
+                self.assertTrue(paths.tenant_database_path("ph-elv-0001").is_file())
+                self.assertFalse(delivery.exists())
+                self.assertEqual(_file_observation(paths.settings_db_path), main_before)
+                self.assertEqual(_file_observation(wal), wal_before)
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                self.assertFalse(journal.exists())
+            finally:
+                writer.close()
+
+    def test_incomplete_delivery_sidecars_fail_closed_without_allocation(self):
+        for suffixes in (("-wal",), ("-shm",), ("-journal",)):
+            with self.subTest(suffixes=suffixes), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                paths = _paths(base / "runtime")
+                delivery = base / "delivery"
+                with closing(sqlite3.connect(paths.settings_db_path)) as connection:
+                    connection.execute(
+                        "CREATE TABLE app_settings "
+                        "(key_name TEXT PRIMARY KEY, key_value TEXT);"
+                    )
+                    connection.execute(
+                        "INSERT INTO app_settings VALUES ('delivery_root', ?);",
+                        (str(delivery),),
+                    )
+                    connection.commit()
+                main_before = _file_observation(paths.settings_db_path)
+                sidecars = tuple(
+                    Path(str(paths.settings_db_path) + suffix) for suffix in suffixes
+                )
+                for sidecar in sidecars:
+                    sidecar.write_bytes(b"unsafe-sidecar-fixture")
+
+                result = provision_tenant(
+                    "ph-elv-0001",
+                    "RC2-3B-R1-TEST",
+                    paths_initializer=lambda: paths,
+                    barrier_factory=lambda unused: nullcontext(),
+                    initializer=lambda unused: self.fail("initializer ran"),
+                )
+
+                self.assertEqual(result.exit_code, 8)
+                self.assertEqual(
+                    result.error_code,
+                    "OPERATOR_TENANT_PROVISION_SUBSYSTEM_FAILED",
+                )
+                self.assertEqual(
+                    result.message,
+                    "Delivery configuration cannot be read safely",
+                )
+                self.assertFalse(paths.tenant_database_path("ph-elv-0001").exists())
+                self.assertFalse(delivery.exists())
+                self.assertEqual(_file_observation(paths.settings_db_path), main_before)
+                for sidecar in sidecars:
+                    self.assertEqual(sidecar.read_bytes(), b"unsafe-sidecar-fixture")
+
+    def test_sidecar_free_delivery_reader_regression(self):
+        for configured in (False, True):
+            with self.subTest(configured=configured), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                paths = _paths(base / "runtime")
+                delivery = base / "delivery"
+                with closing(sqlite3.connect(paths.settings_db_path)) as connection:
+                    connection.execute(
+                        "CREATE TABLE app_settings "
+                        "(key_name TEXT PRIMARY KEY, key_value TEXT);"
+                    )
+                    if configured:
+                        connection.execute(
+                            "INSERT INTO app_settings VALUES ('delivery_root', ?);",
+                            (str(delivery),),
+                        )
+                    connection.commit()
+                main_before = _file_observation(paths.settings_db_path)
+
+                result = provision_tenant(
+                    "ph-elv-0001",
+                    "RC2-3B-R1-TEST",
+                    paths_initializer=lambda: paths,
+                    barrier_factory=lambda unused: nullcontext(),
+                    initializer=_stub_initializer(paths),
+                    verifier=_stub_verifier,
+                )
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(
+                    result.data["delivery_namespace"],
+                    "AVAILABLE" if configured else "NOT_CONFIGURED",
+                )
+                self.assertTrue(paths.tenant_database_path("ph-elv-0001").is_file())
+                self.assertFalse(delivery.exists())
+                self.assertEqual(_file_observation(paths.settings_db_path), main_before)
+                self.assertFalse(
+                    any(
+                        Path(str(paths.settings_db_path) + suffix).exists()
+                        for suffix in ("-wal", "-shm", "-journal")
+                    )
+                )
+
     def test_no_backup_authority_does_not_block_or_touch_historical_path(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = _paths(Path(directory))
