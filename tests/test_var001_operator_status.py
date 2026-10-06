@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -21,7 +20,6 @@ from src.api.operator_status import (
     OPERATOR_ASSIGNMENT_SECRET_VERIFICATION_FAILED,
     OPERATOR_SNAPSHOT_INTEGRITY_FAILED,
     OPERATOR_STATUS_INTEGRITY_FAILED,
-    OPERATOR_STATUS_SUBSYSTEM_FAILED,
     OPERATOR_TENANT_INVALID,
     OPERATOR_TENANT_NOT_FOUND,
     observe_operator_status,
@@ -130,6 +128,7 @@ def _open_wal_global_fixture(
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     mode = connection.execute("PRAGMA journal_mode=WAL;").fetchone()[0]
+    connection.execute("PRAGMA wal_autocheckpoint=0;")
     connection.execute(
         "CREATE TABLE app_settings (key_name TEXT PRIMARY KEY, key_value TEXT);"
     )
@@ -342,7 +341,7 @@ class StrictNonMutatingStatusTests(unittest.TestCase):
             connection.set_trace_callback(statements.append)
             return connection
 
-        with patch("src.api.operator_status.sqlite3.connect", side_effect=recording_connect):
+        with patch("src.api.sqlite_observation.sqlite3.connect", side_effect=recording_connect):
             outcome = observe_operator_status(
                 ("config", "status"), paths=self.paths, protector=self.protector
             )
@@ -470,18 +469,17 @@ class StrictNonMutatingStatusTests(unittest.TestCase):
         self.assertEqual(_sqlite_artifact_state(self.paths.settings_db_path), global_before)
         self.assertEqual(_sqlite_artifact_state(tenant_path), tenant_before)
 
-    def test_existing_active_wal_state_fails_closed_without_stale_projection_or_mutation(self):
+    def test_seed_status_observes_current_wal_state_without_repair_or_transition(self):
+        tenant = "ph-elv-0001"
+        tenant_path = self.paths.tenant_database_path(tenant)
+        _create_tenant_db(tenant_path)
+        serialized_snapshot = _valid_snapshot(tenant)
         mode, writer = _open_wal_global_fixture(
             self.paths.settings_db_path,
             self.protector,
+            serialized_snapshot=serialized_snapshot,
         )
         try:
-            writer.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            writer.execute(
-                "INSERT INTO app_settings (key_name, key_value) VALUES (?, ?);",
-                (OPERATIONAL_SNAPSHOT_SETTING_KEY, _valid_snapshot()),
-            )
-            writer.commit()
             self.assertEqual(mode.lower(), "wal")
             self.assertEqual(
                 set(_sidecars(self.paths.settings_db_path)),
@@ -493,53 +491,100 @@ class StrictNonMutatingStatusTests(unittest.TestCase):
                 + "?mode=ro&immutable=1"
             )
             with closing(sqlite3.connect(immutable_uri, uri=True)) as stale_reader:
-                stale_row = stale_reader.execute(
-                    "SELECT key_value FROM app_settings WHERE key_name = ?;",
-                    (OPERATIONAL_SNAPSHOT_SETTING_KEY,),
+                table = stale_reader.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='app_settings';"
                 ).fetchone()
+                stale_row = (
+                    stale_reader.execute(
+                        "SELECT key_value FROM app_settings WHERE key_name = ?;",
+                        (OPERATIONAL_SNAPSHOT_SETTING_KEY,),
+                    ).fetchone()
+                    if table is not None
+                    else None
+                )
             self.assertIsNone(stale_row)
             before = _sqlite_artifact_state(self.paths.settings_db_path)
+            stored_before = writer.execute(
+                "SELECT key_value FROM app_settings WHERE key_name = ?;",
+                (OPERATIONAL_SNAPSHOT_SETTING_KEY,),
+            ).fetchone()[0]
 
-            outcome = observe_operator_status(
+            exit_code, stdout, stderr = _run_cli(
+                ("--json", "seed", "status", "--tenant", tenant),
+                self.paths,
+                self.protector,
+            )
+            payload = json.loads(stdout)
+            config = observe_operator_status(
                 ("config", "status"), paths=self.paths, protector=self.protector
             )
+            secret = observe_operator_status(
+                ("secret", "assignment", "status"),
+                paths=self.paths,
+                protector=self.protector,
+            )
+            after = _sqlite_artifact_state(self.paths.settings_db_path)
+            before_by_label = {item[0]: item[1:] for item in before}
+            after_by_label = {item[0]: item[1:] for item in after}
 
-            self.assertEqual(outcome.exit_code, 8)
-            self.assertEqual(outcome.error_code, OPERATOR_STATUS_SUBSYSTEM_FAILED)
-            self.assertEqual(_sqlite_artifact_state(self.paths.settings_db_path), before)
+            self.assertEqual(exit_code, 0, stderr)
+            self.assertEqual(stderr, "")
+            self.assertEqual(payload["status"], "ACTIVE")
+            self.assertIsNone(payload["error_code"])
+            self.assertEqual(payload["data"]["tenant"], tenant)
+            self.assertEqual(
+                payload["data"]["generation"], "phseed-elv0001-bal-20260921-r1"
+            )
+            self.assertEqual((config.exit_code, config.status), (0, "ACTIVE"))
+            self.assertEqual((secret.exit_code, secret.status), (0, "PRESENT"))
+            self.assertEqual(before_by_label["main"], after_by_label["main"])
+            self.assertEqual(before_by_label["wal"], after_by_label["wal"])
+            self.assertTrue(after_by_label["wal"][0])
+            self.assertTrue(after_by_label["shm"][0])
+            self.assertFalse(after_by_label["journal"][0])
+            self.assertEqual(
+                writer.execute(
+                    "SELECT key_value FROM app_settings WHERE key_name = ?;",
+                    (OPERATIONAL_SNAPSHOT_SETTING_KEY,),
+                ).fetchone()[0],
+                stored_before,
+            )
+            self.assertEqual(stored_before, serialized_snapshot)
+            self.assertEqual(_sidecars(tenant_path), ())
         finally:
             writer.close()
 
-    def test_incomplete_wal_sidecar_state_fails_integrity_without_repair(self):
-        source = self.base / "wal-source" / "source.db"
-        mode, writer = _open_wal_global_fixture(
-            source,
-            self.protector,
-        )
-        try:
-            writer.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            writer.execute(
-                "INSERT INTO app_settings (key_name, key_value) VALUES (?, ?);",
-                (OPERATIONAL_SNAPSHOT_SETTING_KEY, _valid_snapshot()),
-            )
-            writer.commit()
-            self.assertEqual(mode.lower(), "wal")
-            destination = self.paths.settings_db_path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            shutil.copy2(Path(str(source) + "-wal"), Path(str(destination) + "-wal"))
-            self.assertFalse(Path(str(destination) + "-shm").exists())
-            before = _sqlite_artifact_state(destination)
+    def test_seed_status_incomplete_sidecars_and_journal_fail_closed_without_repair(
+        self,
+    ):
+        for suffixes in (("-wal",), ("-shm",), ("-journal",)):
+            with self.subTest(suffixes=suffixes):
+                root = self.base / ("unsafe-" + suffixes[0].lstrip("-"))
+                paths = resolve_runtime_paths(mode=RuntimeMode.TEST, runtime_root=root)
+                tenant = "ph-elv-0001"
+                _create_tenant_db(paths.tenant_database_path(tenant))
+                _create_global_db(paths.settings_db_path)
+                _create_app_settings(paths.settings_db_path)
+                for suffix in suffixes:
+                    Path(str(paths.settings_db_path) + suffix).write_bytes(
+                        b"synthetic-unsafe-sidecar"
+                    )
+                before = _sqlite_artifact_state(paths.settings_db_path)
+                inventory_before = _inventory(root)
 
-            outcome = observe_operator_status(
-                ("config", "status"), paths=self.paths, protector=self.protector
-            )
+                outcome = observe_operator_status(
+                    ("seed", "status"),
+                    tenant_id=tenant,
+                    paths=paths,
+                    protector=self.protector,
+                )
 
-            self.assertEqual(outcome.exit_code, 6)
-            self.assertEqual(outcome.error_code, OPERATOR_STATUS_INTEGRITY_FAILED)
-            self.assertEqual(_sqlite_artifact_state(destination), before)
-        finally:
-            writer.close()
+                self.assertEqual(outcome.exit_code, 6)
+                self.assertEqual(outcome.error_code, OPERATOR_STATUS_INTEGRITY_FAILED)
+                self.assertEqual(_sqlite_artifact_state(paths.settings_db_path), before)
+                self.assertEqual(_inventory(root), inventory_before)
+                self.assertEqual(_sidecars(paths.tenant_database_path(tenant)), ())
 
     def test_malformed_and_policy_invalid_snapshots_fail_integrity_without_repair(self):
         valid_payload = json.loads(_valid_snapshot())

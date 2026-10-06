@@ -6,14 +6,19 @@ import logging
 import os
 import shutil
 import sqlite3
-import stat
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .runtime_paths import RuntimePaths, get_runtime_paths
+from .sqlite_observation import (
+    SQLITE_OBSERVATION_ABSENT,
+    SQLITE_OBSERVATION_CHANGED_DURING_READ,
+    SQLITE_OBSERVATION_SIDECAR_UNSAFE,
+    ReadonlySQLiteObservationError,
+    open_readonly_sqlite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +39,6 @@ class DeliveryPathError(ValueError):
 
 class DeliverySettingsReadError(RuntimeError):
     """The current persisted Delivery setting cannot be observed safely."""
-
-
-@dataclass(frozen=True)
-class _SQLiteFileObservation:
-    size: int
-    modified_ns: int
-    device: int
-    inode: int
 
 
 @dataclass(frozen=True)
@@ -102,40 +99,9 @@ def read_current_delivery_root(paths: RuntimePaths) -> str:
     visible.  Incomplete sidecar or rollback-journal states fail closed.
     """
     database = paths.settings_db_path
-    try:
-        metadata = database.stat()
-    except FileNotFoundError:
-        return ""
-    except OSError as exc:
-        raise DeliverySettingsReadError("DELIVERY_SETTINGS_UNAVAILABLE") from exc
-    if not stat.S_ISREG(metadata.st_mode):
-        raise DeliverySettingsReadError("DELIVERY_SETTINGS_UNAVAILABLE")
-    before = _SQLiteFileObservation(
-        size=metadata.st_size,
-        modified_ns=metadata.st_mtime_ns,
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-    )
-
-    wal = Path(str(database) + "-wal")
-    shm = Path(str(database) + "-shm")
-    journal = Path(str(database) + "-journal")
-    try:
-        wal_exists = os.path.lexists(wal)
-        shm_exists = os.path.lexists(shm)
-        journal_exists = os.path.lexists(journal)
-    except OSError as exc:
-        raise DeliverySettingsReadError("DELIVERY_SETTINGS_UNAVAILABLE") from exc
-    if journal_exists or wal_exists != shm_exists:
-        raise DeliverySettingsReadError("DELIVERY_SETTINGS_SIDECAR_UNSAFE")
-
-    query = "?mode=ro" if wal_exists else "?mode=ro&immutable=1"
     row = None
     try:
-        uri = database.resolve(strict=True).as_uri() + query
-        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only=ON;")
+        with open_readonly_sqlite(database, timeout=5.0) as connection:
             table = connection.execute(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE type='table' AND name='app_settings';"
@@ -145,33 +111,18 @@ def read_current_delivery_root(paths: RuntimePaths) -> str:
                     "SELECT key_value FROM app_settings WHERE key_name = ?;",
                     (DELIVERY_ROOT_SETTING_KEY,),
                 ).fetchone()
-    except (OSError, sqlite3.Error) as exc:
+    except ReadonlySQLiteObservationError as exc:
+        if exc.reason == SQLITE_OBSERVATION_ABSENT:
+            return ""
+        if exc.reason == SQLITE_OBSERVATION_SIDECAR_UNSAFE:
+            reason = "DELIVERY_SETTINGS_SIDECAR_UNSAFE"
+        elif exc.reason == SQLITE_OBSERVATION_CHANGED_DURING_READ:
+            reason = "DELIVERY_SETTINGS_CHANGED_DURING_READ"
+        else:
+            reason = "DELIVERY_SETTINGS_UNAVAILABLE"
+        raise DeliverySettingsReadError(reason) from exc
+    except sqlite3.Error as exc:
         raise DeliverySettingsReadError("DELIVERY_SETTINGS_UNAVAILABLE") from exc
-
-    if not wal_exists:
-        try:
-            current_metadata = database.stat()
-            current = _SQLiteFileObservation(
-                size=current_metadata.st_size,
-                modified_ns=current_metadata.st_mtime_ns,
-                device=current_metadata.st_dev,
-                inode=current_metadata.st_ino,
-            )
-            sidecar_appeared = any(
-                os.path.lexists(path) for path in (wal, shm, journal)
-            )
-        except (FileNotFoundError, OSError):
-            raise DeliverySettingsReadError(
-                "DELIVERY_SETTINGS_CHANGED_DURING_READ"
-            ) from None
-        if (
-            not stat.S_ISREG(current_metadata.st_mode)
-            or current != before
-            or sidecar_appeared
-        ):
-            raise DeliverySettingsReadError(
-                "DELIVERY_SETTINGS_CHANGED_DURING_READ"
-            )
     try:
         return normalize_delivery_root(row["key_value"] if row is not None else "")
     except DeliveryPathError as exc:

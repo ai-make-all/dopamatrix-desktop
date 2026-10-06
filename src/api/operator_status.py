@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import stat
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -26,6 +26,12 @@ from .secret_store import (
     SecretStoreError,
     SecretValueCorrupt,
     create_platform_secret_protector,
+)
+from .sqlite_observation import (
+    SQLITE_OBSERVATION_CHANGED_DURING_READ,
+    SQLITE_OBSERVATION_SIDECAR_UNSAFE,
+    ReadonlySQLiteObservationError,
+    open_readonly_sqlite,
 )
 
 
@@ -71,14 +77,6 @@ class _StatusFailure(Exception):
         self.error_code = error_code
         self.exit_code = exit_code
         self.message = message
-
-
-@dataclass(frozen=True)
-class _SQLiteFileObservation:
-    size: int
-    modified_ns: int
-    device: int
-    inode: int
 
 
 def _success(status: str, data: Mapping[str, Any]) -> OperatorStatusOutcome:
@@ -137,105 +135,31 @@ def _directory_state(path: Path) -> str:
     return "PRESENT"
 
 
-def _observe_sqlite_file(path: Path, *, required: bool) -> _SQLiteFileObservation | None:
-    try:
-        metadata = path.stat()
-    except FileNotFoundError:
-        if required:
-            raise _failure(
-                error_code=OPERATOR_STATUS_SUBSYSTEM_FAILED,
-                exit_code=8,
-                message="status database is unavailable",
-            ) from None
-        return None
-    except OSError:
-        raise _failure(
-            error_code=OPERATOR_STATUS_SUBSYSTEM_FAILED,
-            exit_code=8,
-            message="status database is unavailable",
-        ) from None
-    if not stat.S_ISREG(metadata.st_mode):
-        raise _failure(
-            error_code=OPERATOR_STATUS_SUBSYSTEM_FAILED,
-            exit_code=8,
-            message="status database is unavailable",
-        )
-    return _SQLiteFileObservation(
-        size=metadata.st_size,
-        modified_ns=metadata.st_mtime_ns,
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-    )
-
-
-def _sqlite_sidecar_paths(path: Path) -> tuple[Path, Path, Path]:
-    return (
-        Path(str(path) + "-wal"),
-        Path(str(path) + "-shm"),
-        Path(str(path) + "-journal"),
-    )
-
-
-def _require_sidecar_free_sqlite(path: Path) -> _SQLiteFileObservation:
-    main = _observe_sqlite_file(path, required=True)
-    assert main is not None
-    wal_path, shm_path, journal_path = _sqlite_sidecar_paths(path)
-    wal = _observe_sqlite_file(wal_path, required=False)
-    shm = _observe_sqlite_file(shm_path, required=False)
-    journal = _observe_sqlite_file(journal_path, required=False)
-    if journal is not None or (wal is None) != (shm is None):
-        raise _failure(
-            error_code=OPERATOR_STATUS_INTEGRITY_FAILED,
-            exit_code=6,
-            message="status database sidecar state is incomplete",
-        )
-    if wal is not None and shm is not None:
-        raise _failure(
-            error_code=OPERATOR_STATUS_SUBSYSTEM_FAILED,
-            exit_code=8,
-            message="active WAL state cannot be observed without mutation",
-        )
-    return main
-
-
-def _verify_sidecar_free_sqlite(
-    path: Path,
-    expected_main: _SQLiteFileObservation,
-) -> None:
-    current_main = _observe_sqlite_file(path, required=True)
-    assert current_main is not None
-    wal_path, shm_path, journal_path = _sqlite_sidecar_paths(path)
-    if (
-        current_main != expected_main
-        or _observe_sqlite_file(wal_path, required=False) is not None
-        or _observe_sqlite_file(shm_path, required=False) is not None
-        or _observe_sqlite_file(journal_path, required=False) is not None
-    ):
-        raise _failure(
-            error_code=OPERATOR_STATUS_SUBSYSTEM_FAILED,
-            exit_code=8,
-            message="status database changed during observation",
-        )
-
-
 @contextmanager
 def _readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
-    """Observe a stable, sidecar-free SQLite file without filesystem mutation."""
-    before = _require_sidecar_free_sqlite(path)
+    """Observe current SQLite state under the shared read-only contract."""
     try:
-        uri = path.resolve(strict=True).as_uri() + "?mode=ro&immutable=1"
-        connection = sqlite3.connect(uri, uri=True, timeout=1.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON;")
-    except (OSError, sqlite3.Error) as exc:
-        _raise_sqlite_failure(exc)
-    try:
-        with closing(connection):
+        with open_readonly_sqlite(path, timeout=1.0) as connection:
             yield connection
+    except ReadonlySQLiteObservationError as exc:
+        if exc.reason == SQLITE_OBSERVATION_SIDECAR_UNSAFE:
+            raise _failure(
+                error_code=OPERATOR_STATUS_INTEGRITY_FAILED,
+                exit_code=6,
+                message="status database sidecar state is incomplete",
+            ) from None
+        message = (
+            "status database changed during observation"
+            if exc.reason == SQLITE_OBSERVATION_CHANGED_DURING_READ
+            else "status database is unavailable"
+        )
+        raise _failure(
+            error_code=OPERATOR_STATUS_SUBSYSTEM_FAILED,
+            exit_code=8,
+            message=message,
+        ) from None
     except sqlite3.Error as exc:
         _raise_sqlite_failure(exc)
-    finally:
-        _verify_sidecar_free_sqlite(path, before)
 
 
 def _raise_sqlite_failure(exc: BaseException) -> None:
