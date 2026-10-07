@@ -2,7 +2,6 @@
 import { ref } from 'vue'
 import { useAppStore } from '../stores/appStore'
 
-const emit = defineEmits(['login-success'])
 const store = useAppStore()
 
 const username = ref('')
@@ -21,8 +20,7 @@ async function handleEnter() {
   isEntering.value = true
   errorMessage.value = ''
   try {
-    const tenant = await store.handleLogin(name)
-    emit('login-success', tenant)
+    await store.handleLogin(name)
   } catch (error) {
     errorMessage.value = (
       error?.response?.status === 400 || error?.response?.status === 403

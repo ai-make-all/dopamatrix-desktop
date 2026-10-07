@@ -6,22 +6,21 @@ import { open as openPath } from '@tauri-apps/plugin-shell'
 import axios from 'axios'
 import { useAppStore } from './stores/appStore'
 import Login from './components/Login.vue'
+import { installLoginCompletionRedirect } from './utils/loginCompletion.js'
 
 const router = useRouter()
 const store  = useAppStore()
 const isBellOpen = ref(false)
+const stopLoginCompletionRedirect = installLoginCompletionRedirect({ store, router })
 
 const closeBell = () => { isBellOpen.value = false }
 
 onMounted(() => window.addEventListener('click', closeBell))
 onUnmounted(() => {
   window.removeEventListener('click', closeBell)
+  stopLoginCompletionRedirect()
   store.clearPollTimer()
 })
-
-function handleLogin() {
-  router.push('/dashboard')
-}
 
 function handleLogout() {
   store.handleLogout()
@@ -123,7 +122,7 @@ async function fallbackWebDownload(url) {
 <template>
   <!-- ── AUTH GATE ── -->
   <Transition name="auth-fade">
-    <Login v-if="!store.isLoggedIn" @login-success="handleLogin" />
+    <Login v-if="!store.isLoggedIn" />
   </Transition>
 
   <!-- ── APP SHELL ── -->
