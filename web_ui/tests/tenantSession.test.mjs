@@ -89,3 +89,49 @@ test('stale unauthorized localStorage tenant is removed during restoration', asy
   assert.equal(storage.getItem(TENANT_SESSION_STORAGE_KEY), null)
   assert.equal(headers['X-Local-User'], undefined)
 })
+
+
+test('malformed tenant HTTP 400 clears persisted restoration authority', async () => {
+  const storage = memoryStorage({ [TENANT_SESSION_STORAGE_KEY]: 'malformed' })
+  const headers = { 'X-Local-User': 'malformed' }
+  const httpClient = {
+    post: async () => {
+      const error = new Error('bad request')
+      error.response = { status: 400 }
+      throw error
+    },
+  }
+
+  await assert.rejects(restoreTenantSession({
+    httpClient,
+    apiBase: 'http://127.0.0.1:8000',
+    storage,
+    headers,
+    tenantId: 'malformed',
+  }))
+  assert.equal(storage.getItem(TENANT_SESSION_STORAGE_KEY), null)
+  assert.equal(headers['X-Local-User'], undefined)
+})
+
+
+test('non-authoritative HTTP 500 retains only the persisted restoration hint', async () => {
+  const storage = memoryStorage({ [TENANT_SESSION_STORAGE_KEY]: 'ph-elv-0001' })
+  const headers = { 'X-Local-User': 'ph-elv-0001' }
+  const httpClient = {
+    post: async () => {
+      const error = new Error('server error')
+      error.response = { status: 500 }
+      throw error
+    },
+  }
+
+  await assert.rejects(restoreTenantSession({
+    httpClient,
+    apiBase: 'http://127.0.0.1:8000',
+    storage,
+    headers,
+    tenantId: 'ph-elv-0001',
+  }))
+  assert.equal(storage.getItem(TENANT_SESSION_STORAGE_KEY), 'ph-elv-0001')
+  assert.equal(headers['X-Local-User'], undefined)
+})

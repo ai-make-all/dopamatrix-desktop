@@ -5,7 +5,7 @@ import {
   TENANT_SESSION_STORAGE_KEY,
   clearTenantSession,
   establishTenantSession,
-  restoreTenantSession,
+  restoreTenantSessionWithRetry,
 } from '../utils/tenantSession.js'
 
 export const API_BASE = 'http://127.0.0.1:8000'
@@ -16,17 +16,17 @@ export const useAppStore = defineStore('app', () => {
   const isLoggedIn   = ref(false)
   const loggedInUser = ref('')
 
-  async function initAuth() {
+  async function initAuth(retryRuntime) {
     const stored = localStorage.getItem(TENANT_SESSION_STORAGE_KEY)
     if (stored) {
       try {
-        const tenant = await restoreTenantSession({
+        const tenant = await restoreTenantSessionWithRetry({
           httpClient: axios,
           apiBase: API_BASE,
           storage: localStorage,
           headers: axios.defaults.headers.common,
           tenantId: stored,
-        })
+        }, retryRuntime)
         loggedInUser.value = tenant
         isLoggedIn.value = true
       } catch (error) {
