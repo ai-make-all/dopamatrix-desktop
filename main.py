@@ -82,6 +82,7 @@ if _bootstrap_decision.runtime_paths.mode is RuntimeMode.SOURCE_DEVELOPMENT:
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.core.logger import setup_logger, logger
 from src.version import APPLICATION_VERSION
@@ -109,6 +110,50 @@ from src.api.ws_manager import manager as ws_manager
 from src.services.llm_provider import invalidate_api_key_cache
 
 setup_logger()
+
+
+_SAFE_UNHANDLED_ERROR_CODES = frozenset(
+    {
+        "OPENAI_PROVIDER_REQUEST_FAILED",
+        "OPENAI_PROVIDER_RESPONSE_INVALID",
+        "LLM_SECRET_NOT_CONFIGURED",
+        "LLM_SECRET_UNAVAILABLE",
+    }
+)
+
+
+def _classify_unhandled_error(exc: Exception) -> str:
+    try:
+        candidate = str(exc)
+    except Exception:
+        return "UNCLASSIFIED"
+    return candidate if candidate in _SAFE_UNHANDLED_ERROR_CODES else "UNCLASSIFIED"
+
+
+class UnhandledErrorFence(BaseHTTPMiddleware):
+    """Return a non-sensitive HTTP response for otherwise unhandled errors."""
+
+    async def dispatch(self, request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            safe_code = _classify_unhandled_error(exc)
+            try:
+                logger.error(
+                    "[UnhandledErrorFence] "
+                    "event=UNHANDLED_REQUEST_EXCEPTION "
+                    "method={} path={} exception_type={} error_code={}",
+                    request.method,
+                    request.url.path,
+                    type(exc).__name__,
+                    safe_code,
+                )
+            except Exception:
+                pass
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "INTERNAL_SERVER_ERROR"},
+            )
 
 
 # ================================================================== #
@@ -233,6 +278,8 @@ app.add_middleware(
     TenantHeaderAuthorityMiddleware,
     paths=_bootstrap_decision.runtime_paths,
 )
+# Registered after Tenant authority so Starlette places the fence outside it.
+app.add_middleware(UnhandledErrorFence)
 # CORS is installed last so it wraps tenant-policy error responses.
 app.add_middleware(
     CORSMiddleware,
