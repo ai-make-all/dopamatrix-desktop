@@ -26,8 +26,10 @@ from src.api.tenant_policy import (
     TenantNotApproved,
     TenantNotProvisioned,
     TenantPolicyError,
+    TenantSchemaReadinessError,
     parse_approved_tenant_identity,
     require_provisioned_tenant,
+    verify_tenant_schema_readiness,
 )
 
 
@@ -128,6 +130,15 @@ def _database_snapshot(database_path: Path) -> dict[str, object]:
         "mtime_ns": stat_result.st_mtime_ns,
         "sidecars": sidecars,
     }
+
+
+def _file_observation(path: Path) -> tuple[int, int, str]:
+    metadata = path.stat()
+    return (
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
 
 
 class FrozenTenantPolicyTests(unittest.TestCase):
@@ -281,6 +292,94 @@ class FrozenTenantPolicyTests(unittest.TestCase):
                     self.assertIsNotNone(engine)
             finally:
                 _dispose_tenant_engines()
+
+    def test_complete_wal_shm_readiness_uses_current_wal_without_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _paths(Path(directory))
+            paths.tenant_data_dir.mkdir()
+            outcome = _operator_provision(paths)
+            self.assertEqual(outcome.status, "PROVISIONED")
+            database_path = paths.tenant_database_path("ph-elv-0001")
+            wal = Path(str(database_path) + "-wal")
+            shm = Path(str(database_path) + "-shm")
+            journal = Path(str(database_path) + "-journal")
+            writer = sqlite3.connect(database_path)
+            try:
+                mode = writer.execute("PRAGMA journal_mode=WAL;").fetchone()[0]
+                writer.execute("PRAGMA wal_autocheckpoint=0;")
+                writer.execute("DROP INDEX ix_video_tasks_rollout_readiness;")
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                writer.execute(
+                    "CREATE INDEX ix_video_tasks_rollout_readiness "
+                    "ON video_tasks "
+                    "(reservation_conflict_mode, planning_policy, created_at);"
+                )
+                writer.commit()
+
+                self.assertEqual(mode.lower(), "wal")
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                self.assertFalse(journal.exists())
+
+                immutable_uri = (
+                    database_path.resolve(strict=True).as_uri()
+                    + "?mode=ro&immutable=1"
+                )
+                with closing(sqlite3.connect(immutable_uri, uri=True)) as stale:
+                    with self.assertRaises(TenantSchemaReadinessError):
+                        verify_tenant_schema_readiness(stale)
+
+                main_before = _file_observation(database_path)
+                wal_before = _file_observation(wal)
+
+                identity = require_provisioned_tenant("ph-elv-0001", paths)
+
+                self.assertEqual(identity.canonical_id, "ph-elv-0001")
+                self.assertEqual(_file_observation(database_path), main_before)
+                self.assertEqual(_file_observation(wal), wal_before)
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                self.assertFalse(journal.exists())
+            finally:
+                writer.close()
+
+    def test_incomplete_sidecars_and_journal_fail_closed_without_repair(self):
+        for suffixes in (("-wal",), ("-shm",), ("-journal",)):
+            with (
+                self.subTest(suffixes=suffixes),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                paths = _paths(Path(directory))
+                paths.tenant_data_dir.mkdir()
+                outcome = _operator_provision(paths)
+                self.assertEqual(outcome.status, "PROVISIONED")
+                database_path = paths.tenant_database_path("ph-elv-0001")
+                main_before = _file_observation(database_path)
+                sidecars = tuple(
+                    Path(str(database_path) + suffix) for suffix in suffixes
+                )
+                for sidecar in sidecars:
+                    sidecar.write_bytes(b"synthetic-unsafe-sidecar")
+
+                with self.assertRaises(TenantNotProvisioned):
+                    require_provisioned_tenant("ph-elv-0001", paths)
+
+                self.assertEqual(_file_observation(database_path), main_before)
+                for sidecar in sidecars:
+                    self.assertEqual(
+                        sidecar.read_bytes(), b"synthetic-unsafe-sidecar"
+                    )
+                self.assertEqual(
+                    tuple(
+                        Path(str(database_path) + suffix).exists()
+                        for suffix in ("-wal", "-shm", "-journal")
+                    ),
+                    tuple(
+                        suffix in suffixes
+                        for suffix in ("-wal", "-shm", "-journal")
+                    ),
+                )
 
     def test_operator_provisioned_approved_tenants_become_usable_and_isolated(self):
         with tempfile.TemporaryDirectory() as directory:

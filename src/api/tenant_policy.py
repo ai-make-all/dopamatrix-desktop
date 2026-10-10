@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from contextlib import closing
 from dataclasses import dataclass
 from types import MappingProxyType
 
 from .runtime_paths import RuntimePaths
+from .sqlite_observation import (
+    ReadonlySQLiteObservationError,
+    open_readonly_sqlite,
+)
 
 
 TENANT_IDENTITY_MALFORMED = "TENANT_IDENTITY_MALFORMED"
@@ -203,11 +206,16 @@ def require_provisioned_tenant(
     if not database.is_file():
         raise TenantNotProvisioned()
     try:
-        uri = database.resolve(strict=True).as_uri() + "?mode=ro&immutable=1"
-        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
+        with open_readonly_sqlite(database, timeout=1.0) as connection:
             verify_tenant_schema_readiness(connection)
     except TenantPolicyError:
         raise
-    except (OSError, sqlite3.Error, TypeError, ValueError):
+    except (
+        OSError,
+        ReadonlySQLiteObservationError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
         raise TenantNotProvisioned() from None
     return identity
