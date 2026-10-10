@@ -196,6 +196,7 @@ def get_pyinstaller_command() -> list[str]:
         "--onefile",
         "--console",
         "--name", "backend",
+        "--add-data", "src/prompts:src/prompts",
         "main.py",
     ]
 
