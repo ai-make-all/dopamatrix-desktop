@@ -7,18 +7,51 @@ import {
   establishTenantSession,
   restoreTenantSessionWithRetry,
 } from '../utils/tenantSession.js'
+import {
+  createStartupTrace,
+  waitForBackendReadiness,
+} from '../utils/startupReadiness.js'
 
 export const API_BASE = 'http://127.0.0.1:8000'
 const POLL_INTERVAL_MS = 3000
+const startupReadinessClient = axios.create({ withCredentials: false })
+delete startupReadinessClient.defaults.headers.common['X-Local-User']
+delete startupReadinessClient.defaults.headers.common['x-local-user']
+delete startupReadinessClient.defaults.headers.common.Authorization
+delete startupReadinessClient.defaults.headers.common.authorization
 
 export const useAppStore = defineStore('app', () => {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const isLoggedIn   = ref(false)
   const loggedInUser = ref('')
+  const startupRestoreIssue = ref('')
 
-  async function initAuth(retryRuntime) {
+  async function initAuth({
+    readinessClient = startupReadinessClient,
+    readinessRuntime,
+    sessionRuntime,
+    traceRuntime,
+  } = {}) {
+    startupRestoreIssue.value = ''
     const stored = localStorage.getItem(TENANT_SESSION_STORAGE_KEY)
     if (stored) {
+      const recordStartupEvent = createStartupTrace(localStorage, traceRuntime)
+      try {
+        await waitForBackendReadiness({
+          httpClient: readinessClient,
+          apiBase: API_BASE,
+        }, {
+          ...readinessRuntime,
+          onEvent: recordStartupEvent,
+        })
+      } catch {
+        loggedInUser.value = ''
+        isLoggedIn.value = false
+        startupRestoreIssue.value = 'BACKEND_UNAVAILABLE'
+        delete axios.defaults.headers.common['X-Local-User']
+        return false
+      }
+
       try {
         const tenant = await restoreTenantSessionWithRetry({
           httpClient: axios,
@@ -26,7 +59,10 @@ export const useAppStore = defineStore('app', () => {
           storage: localStorage,
           headers: axios.defaults.headers.common,
           tenantId: stored,
-        }, retryRuntime)
+        }, {
+          ...sessionRuntime,
+          onEvent: recordStartupEvent,
+        })
         loggedInUser.value = tenant
         isLoggedIn.value = true
       } catch (error) {
@@ -296,7 +332,7 @@ export const useAppStore = defineStore('app', () => {
 
   return {
     // Auth
-    isLoggedIn, loggedInUser,
+    isLoggedIn, loggedInUser, startupRestoreIssue,
     initAuth, handleLogin, handleLogout,
     // Toast
     toastVisible, toastMsg, toastType, showToast,

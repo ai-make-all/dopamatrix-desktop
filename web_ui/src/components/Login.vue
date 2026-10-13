@@ -89,6 +89,15 @@ function onKeydown(e) {
       </div>
 
       <!-- Input area -->
+      <p
+        v-if="store.startupRestoreIssue === 'BACKEND_UNAVAILABLE'"
+        class="startup-warning"
+        role="status"
+      >
+        Local engine did not become ready. Your saved workspace session was retained.
+        Close and reopen DopaMatrix.
+      </p>
+
       <div class="input-section">
         <label class="input-label">
           <span class="input-label-icon">◈</span>
@@ -161,6 +170,17 @@ function onKeydown(e) {
 }
 
 /* Animated grid */
+.startup-warning {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: 8px;
+  color: #fbbf24;
+  background: rgba(120, 53, 15, 0.18);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .grid-bg {
   position: absolute;
   inset: 0;

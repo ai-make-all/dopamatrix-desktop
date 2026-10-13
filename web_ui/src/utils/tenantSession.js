@@ -1,3 +1,5 @@
+import { STARTUP_EVENT } from './startupReadiness.js'
+
 export const TENANT_SESSION_STORAGE_KEY = 'dopamatrix_user'
 
 export const STARTUP_RESTORE_MAX_ATTEMPTS = 12
@@ -18,6 +20,14 @@ const RETRYABLE_AXIOS_ERROR_CODES = new Set([
 
 function sleepFor(delayMs) {
   return new Promise(resolve => setTimeout(resolve, delayMs))
+}
+
+function safeEmit(onEvent, event) {
+  try {
+    onEvent(event)
+  } catch {
+    // Observability is non-authoritative and must not change session behavior.
+  }
 }
 
 export function isRetryableStartupRestoreError(error) {
@@ -85,30 +95,38 @@ export async function restoreTenantSession(options) {
 export async function restoreTenantSessionWithRetry(options, {
   sleep = sleepFor,
   now = Date.now,
+  onEvent = () => {},
 } = {}) {
   const startedAt = now()
+  safeEmit(onEvent, STARTUP_EVENT.SESSION_BEGIN)
 
   for (let attempt = 1; attempt <= STARTUP_RESTORE_MAX_ATTEMPTS; attempt += 1) {
     const elapsedBeforeAttempt = Math.max(0, now() - startedAt)
     if (attempt > 1 && elapsedBeforeAttempt >= STARTUP_RESTORE_MAX_ELAPSED_MS) {
+      safeEmit(onEvent, STARTUP_EVENT.SESSION_EXHAUSTED)
       throw new Error('STARTUP_RESTORE_DEADLINE_EXCEEDED')
     }
 
     const remainingMs = Math.max(1, STARTUP_RESTORE_MAX_ELAPSED_MS - elapsedBeforeAttempt)
 
     try {
-      return await restoreTenantSession({
+      const tenant = await restoreTenantSession({
         ...options,
         requestConfig: {
           ...options.requestConfig,
           timeout: remainingMs,
         },
       })
+      safeEmit(onEvent, STARTUP_EVENT.SESSION_SUCCESS)
+      return tenant
     } catch (error) {
-      if (
-        !isRetryableStartupRestoreError(error)
-        || attempt >= STARTUP_RESTORE_MAX_ATTEMPTS
-      ) {
+      const retryable = isRetryableStartupRestoreError(error)
+      if (!retryable) {
+        safeEmit(onEvent, STARTUP_EVENT.SESSION_FAILED)
+        throw error
+      }
+      if (attempt >= STARTUP_RESTORE_MAX_ATTEMPTS) {
+        safeEmit(onEvent, STARTUP_EVENT.SESSION_EXHAUSTED)
         throw error
       }
 
@@ -120,16 +138,19 @@ export async function restoreTenantSessionWithRetry(options, {
       )
 
       if (remainingAfterAttempt <= 0 || retryDelay >= remainingAfterAttempt) {
+        safeEmit(onEvent, STARTUP_EVENT.SESSION_EXHAUSTED)
         throw error
       }
 
       await sleep(retryDelay)
 
       if (now() - startedAt >= STARTUP_RESTORE_MAX_ELAPSED_MS) {
+        safeEmit(onEvent, STARTUP_EVENT.SESSION_EXHAUSTED)
         throw error
       }
     }
   }
 
+  safeEmit(onEvent, STARTUP_EVENT.SESSION_EXHAUSTED)
   throw new Error('STARTUP_RESTORE_ATTEMPTS_EXHAUSTED')
 }
