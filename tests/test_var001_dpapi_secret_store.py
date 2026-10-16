@@ -24,6 +24,7 @@ from src.api.runtime_paths import RuntimeMode, temporary_test_runtime_paths
 from src.api.secret_store import (
     CF_API_TOKEN,
     DPAPI_CURRENT_USER_V1,
+    ELEVENLABS_API_KEY,
     KNOWN_SECRET_KEYS,
     OPENAI_API_KEY,
     PEXELS_API_KEY,
@@ -113,6 +114,7 @@ class SecretStoreFoundationTests(unittest.TestCase):
             KNOWN_SECRET_KEYS,
             {
                 OPENAI_API_KEY,
+                ELEVENLABS_API_KEY,
                 RESERVATION_ROLLOUT_ASSIGNMENT_SECRET,
                 PEXELS_API_KEY,
                 TELEGRAM_BOT_TOKEN,
@@ -346,6 +348,50 @@ class OpenAISettingsAndProviderTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["detail"], "LLM_SECRET_SAVE_FAILED")
         self.assertNotIn(synthetic, response.text)
+
+    def test_tts_credential_lifecycle_is_named_secure_and_redacted(self) -> None:
+        synthetic = "synthetic-elevenlabs-secret-never-echo"
+        with patch.object(settings_router, "get_default_secret_store", return_value=self.store):
+            before = self.client.get("/settings/tts")
+            saved = self.client.post("/settings/tts", json={"api_key": synthetic})
+            after = self.client.get("/settings/tts")
+
+        self.assertEqual(
+            before.json(),
+            {
+                "provider": "elevenlabs",
+                "is_configured": False,
+                "secret_status": "ABSENT",
+            },
+        )
+        self.assertEqual(saved.json(), {"status": "ok"})
+        self.assertEqual(
+            after.json(),
+            {
+                "provider": "elevenlabs",
+                "is_configured": True,
+                "secret_status": "PRESENT",
+            },
+        )
+        self.assertEqual(self.store.get_secret(ELEVENLABS_API_KEY), synthetic)
+        for response in (before, saved, after):
+            self.assertNotIn(synthetic, response.text)
+            self.assertNotIn("ciphertext", response.text)
+            self.assertNotIn("prefix", response.text)
+            self.assertNotIn("suffix", response.text)
+            self.assertNotIn("hash", response.text)
+
+    def test_tts_credential_save_performs_no_provider_request(self) -> None:
+        with (
+            patch.object(settings_router, "get_default_secret_store", return_value=self.store),
+            patch("src.services.tts_provider.ElevenLabsProvider.synthesize") as synthesize,
+        ):
+            response = self.client.post(
+                "/settings/tts",
+                json={"api_key": "synthetic-no-network"},
+            )
+        self.assertEqual(response.status_code, 200)
+        synthesize.assert_not_called()
 
     def test_provider_loads_secure_key_and_preserves_cache_invalidation(self) -> None:
         self.store.set_secret(OPENAI_API_KEY, "synthetic-provider-key")

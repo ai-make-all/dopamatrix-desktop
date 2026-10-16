@@ -19,7 +19,9 @@ from .runtime_config import (
     save_llm_operational_settings,
 )
 from .secret_store import (
+    ELEVENLABS_API_KEY,
     SecretStoreError,
+    SecretStatus,
     get_default_secret_store,
     inspect_openai_secret_state,
     replace_openai_secret,
@@ -29,6 +31,7 @@ from src.services.llm_provider import invalidate_api_key_cache
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
 _KEY_OPENAI = "openai_api_key"
+_TTS_PROVIDER = "elevenlabs"
 
 
 class LLMKeyPayload(BaseModel):
@@ -62,6 +65,24 @@ class LLMOperationalSettingsResponse(BaseModel):
     openai_base_url: str | None
     llm_model: str
     restart_required: bool = True
+
+
+class TTSKeyPayload(BaseModel):
+    api_key: str
+
+    @field_validator("api_key")
+    @classmethod
+    def _not_empty(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("api_key must not be empty")
+        return value
+
+
+class TTSKeyResponse(BaseModel):
+    provider: str
+    is_configured: bool
+    secret_status: str
 
 
 class DeliveryRootPayload(BaseModel):
@@ -150,6 +171,39 @@ def save_llm_config(
         openai_base_url=operational.openai_base_url,
         llm_model=operational.llm_model,
     )
+
+
+@router.get(
+    "/tts",
+    response_model=TTSKeyResponse,
+    summary="Get TTS provider and redacted credential status",
+)
+def get_tts_key() -> TTSKeyResponse:
+    """Return only fixed provider identity and non-secret status."""
+    secret_status = get_default_secret_store().get_status(ELEVENLABS_API_KEY)
+    return TTSKeyResponse(
+        provider=_TTS_PROVIDER,
+        is_configured=secret_status is SecretStatus.PRESENT,
+        secret_status=secret_status.value,
+    )
+
+
+@router.post(
+    "/tts",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+    summary="Save ElevenLabs TTS credential securely",
+)
+def save_tts_key(payload: TTSKeyPayload) -> dict:
+    """Store the write-only credential without provider validation."""
+    try:
+        get_default_secret_store().set_secret(ELEVENLABS_API_KEY, payload.api_key)
+    except (SecretStoreError, sqlite3.Error, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="TTS_SECRET_SAVE_FAILED",
+        ) from exc
+    return {"status": "ok"}
 
 
 @router.get(

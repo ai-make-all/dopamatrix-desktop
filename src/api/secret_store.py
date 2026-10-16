@@ -22,6 +22,7 @@ from .runtime_paths import RuntimeMode, get_runtime_paths
 
 
 OPENAI_API_KEY = "openai_api_key"
+ELEVENLABS_API_KEY = "elevenlabs_api_key"
 RESERVATION_ROLLOUT_ASSIGNMENT_SECRET = "reservation_rollout_assignment_secret"
 PEXELS_API_KEY = "pexels_api_key"
 TELEGRAM_BOT_TOKEN = "telegram_bot_token"
@@ -30,6 +31,7 @@ CF_API_TOKEN = "cf_api_token"
 KNOWN_SECRET_KEYS = frozenset(
     {
         OPENAI_API_KEY,
+        ELEVENLABS_API_KEY,
         RESERVATION_ROLLOUT_ASSIGNMENT_SECRET,
         PEXELS_API_KEY,
         TELEGRAM_BOT_TOKEN,

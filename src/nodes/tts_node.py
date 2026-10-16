@@ -1,266 +1,340 @@
-"""
-TTSNode — 多语言文字转语音节点（单轨线性架构，Phase 9.11.2）
+"""Provider-neutral TTS node with authoritative artifact publication.
 
-设计原则：
-  使用 edge_tts Python 原生异步 API 驱动 TTS，通过 asyncio.run() 在同步
-  WorkflowEngine 中执行，彻底消除对 edge-tts CLI 可执行文件的依赖，
-  从根本上解决生产环境 PATH 缺失导致的 [WinError 2] 崩溃。
-
-数据流（Phase 9.11.2 单轨线性架构）：
-  读取  → context.assets["tts_script"]    {lang: "聚合全文"}
-  写入  → context.variants[lang]["voice_audio"]  (各语言 MP3 路径)
-          context.variants[lang]["vtt_path"]     (各语言 WebVTT 字幕路径)
-
-语音配置：
-  en → en-US-AriaNeural   （美式英语，自然女声，适合品牌/广告内容）
-  ar → ar-SA-HamedNeural  （沙特阿拉伯语，男声，覆盖中东市场）
+External workflow contract remains:
+``tts_script -> voice_audio + vtt_path``.  Provider-specific HTTP and
+alignment parsing live below this node in ``src.services.tts_provider``.
 """
 
-import asyncio
-import sys
+from __future__ import annotations
+
+import math
+import os
+import re
 import time
+import uuid
 from pathlib import Path
-from typing import Dict
-
-import edge_tts
+from typing import Callable
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
-from src.core.logger import logger
+from src.services.tts_provider import (
+    MAX_ATTEMPTS,
+    PER_ATTEMPT_TIMEOUT_SECONDS,
+    RETRY_DELAYS_SECONDS,
+    TOTAL_TTS_BUDGET_SECONDS,
+    TTSErrorCode,
+    TTSProvider,
+    TTSProviderError,
+    TTSProviderRequest,
+    TTSProviderResult,
+    create_tts_provider,
+)
 
 
-# ---------------------------------------------------------------------------
-# 语音配置表：lang_code → edge-tts voice name
-# 需要新增语种时，只需在这里加一行，节点代码无需改动
-# ---------------------------------------------------------------------------
-VOICE_MAP: Dict[str, str] = {
-    "en": "en-US-AriaNeural",
-    "ar": "ar-SA-HamedNeural",
-}
+_VTT_TIMING = re.compile(
+    r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3}) --> "
+    r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})$"
+)
 
 
 def _resolve_execution_namespace(context: WorkflowContext) -> str:
-    """Return the authoritative child namespace, with a legacy direct-call fallback."""
+    """Return the authoritative child namespace, with legacy direct fallback."""
     execution_id = context.config.get("execution_id")
     if execution_id:
         return str(execution_id)
-
-    # A context carrying any new child marker belongs to the execution
-    # contract and must never fall back to the shared task_id namespace.
     if "child_index" in context.config or "file_sid" in context.config:
         raise RuntimeError("[TTSNode] child context is missing execution_id")
+    return str(getattr(context, "task_id", None) or "default")
 
-    # LEGACY DIRECT-CALL FALLBACK: a direct context without child markers uses
-    # its task namespace.
-    legacy_id = getattr(context, "task_id", None) or "default"
-    logger.warning(
-        f"[TTSNode] execution_id missing; using legacy direct-call namespace={legacy_id}"
+
+def _timestamp_milliseconds(match: re.Match[str], offset: int) -> int:
+    hours, minutes, seconds, milliseconds = (
+        int(match.group(offset + index)) for index in range(4)
     )
-    return str(legacy_id)
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError("invalid timestamp")
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
 
 
 class TTSNode(BaseNode):
-    """
-    多语言文字转语音节点（单轨线性架构，Phase 9.11.2）。
-
-    期望 Context 中存在：
-        context.assets["tts_script"]: dict
-            单轨架构的聚合台词字典，格式：
-            { "en": "beat1 text\nbeat2 text\n...", "ar": "..." }
-
-    执行后写入 Context：
-        context.variants["en"]["voice_audio"] → "output/voice_en.mp3"
-        context.variants["ar"]["voice_audio"] → "output/voice_ar.mp3"
-        （每种 tts_script 中出现的语言均会生成对应 MP3 + VTT）
-
-    参数：
-        output_dir: MP3/VTT 文件输出目录，默认 "output"
-        voice_map:  语言代码 → edge-tts 音色名称的映射表，默认使用 VOICE_MAP
-        rate:       语速调整，格式为 "+0%"（默认不调整）
-    """
+    """Generate one authoritative MP3/VTT pair for the target language."""
 
     def __init__(
         self,
         name: str = "TTSNode",
         output_dir: str = "output",
-        voice_map: Dict[str, str] | None = None,
+        *,
+        provider: TTSProvider | None = None,
+        provider_factory: Callable[[], TTSProvider] = create_tts_provider,
         rate: str = "+0%",
-    ):
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+        attempt_token_factory: Callable[[], str] | None = None,
+    ) -> None:
         super().__init__(name)
         self._output_dir = Path(output_dir)
-        self._voice_map: Dict[str, str] = voice_map or VOICE_MAP
+        self._provider = provider
+        self._provider_factory = provider_factory
         self._rate = rate
-
-    # ------------------------------------------------------------------
-    # 工具方法
-    # ------------------------------------------------------------------
-
-    async def _run_tts_async(
-        self, voice: str, text: str, output_path: Path, vtt_path: Path
-    ) -> None:
-        """
-        使用 edge_tts Python 原生 API 流式生成音频并同步收集字幕事件。
-
-        通过 communicate.stream() 逐块写入 MP3 文件，同时将 WordBoundary
-        事件喂给 SubMaker。流结束后，将 SRT 内容转换为 WebVTT 格式写入文件。
-        整个过程无需 subprocess，不依赖任何外部可执行文件。
-        """
-        # edge-tts v7.x 新增 boundary 参数，默认值为 "SentenceBoundary"。
-        # 必须显式声明 "WordBoundary" 才能让服务端开启逐词时间戳事件，
-        # 否则 SubMaker.feed() 永远收不到 WordBoundary chunk，VTT 文件输出为空，
-        # 导致 SubtitleNode 降级为单行 Dialogue（全文字幕静态堆叠 Bug）。
-        communicate = edge_tts.Communicate(text, voice, rate=self._rate, boundary="WordBoundary")
-        submaker = edge_tts.SubMaker()
-
-        with open(str(output_path), "wb") as audio_file:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_file.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    submaker.feed(chunk)
-
-        # SRT → WebVTT：添加 WEBVTT 头，逗号毫秒分隔符 → 点号（SubtitleNode 解析器已兼容两种，但标准 VTT 用点号）
-        # newline='\n'：Windows 默认文本模式会把 \n 转成 \r\n，破坏 SubtitleNode 的时间行正则匹配。
-        srt_content = submaker.get_srt()
-        vtt_content = "WEBVTT\n\n" + srt_content.replace(",", ".")
-        with open(str(vtt_path), "w", encoding="utf-8", newline="\n") as vtt_file:
-            vtt_file.write(vtt_content)
-
-    def _run_tts(self, voice: str, text: str, output_path: Path, vtt_path: Path) -> None:
-        """
-        同步包装器：在当前线程中启动独立事件循环执行异步 TTS 任务。
-
-        asyncio.run() 每次都创建一个全新的事件循环并在结束后关闭，
-        可在 WorkflowEngine 的 ThreadPoolExecutor 环境中安全调用，
-        不会与主线程或其他工作线程的事件循环产生冲突。
-        """
-        self.log(
-            f"Running: edge_tts.Communicate(voice={voice!r}, rate={self._rate!r})"
-            f" → {output_path.name} + {vtt_path.name}"
+        self._clock = clock
+        self._sleeper = sleeper
+        self._attempt_token_factory = attempt_token_factory or (
+            lambda: uuid.uuid4().hex
         )
-        try:
-            asyncio.run(
-                self._run_tts_async(
-                    voice=voice,
-                    text=text,
-                    output_path=output_path,
-                    vtt_path=vtt_path,
-                )
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"[TTSNode] edge_tts API failed for voice '{voice}': {e}"
-            ) from e
 
-    # ------------------------------------------------------------------
-    # 节点执行入口
-    # ------------------------------------------------------------------
+    def _active_provider(self) -> TTSProvider:
+        if self._provider is None:
+            self._provider = self._provider_factory()
+        return self._provider
+
+    @staticmethod
+    def _safe_unlink(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best effort here; the terminal error remains sanitized.
+            pass
+
+    @staticmethod
+    def _validate_audio(path: Path) -> None:
+        if not path.is_file():
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+        size = path.stat().st_size
+        if size < 1024:
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+        with path.open("rb") as handle:
+            signature = handle.read(3)
+        is_id3 = signature == b"ID3"
+        is_mpeg_frame = (
+            len(signature) >= 2
+            and signature[0] == 0xFF
+            and signature[1] & 0xE0 == 0xE0
+        )
+        if not is_id3 and not is_mpeg_frame:
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+
+    @staticmethod
+    def _validate_vtt(path: Path) -> None:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False) from None
+        if not lines or lines[0] != "WEBVTT":
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+        cue_count = 0
+        previous_start = -1
+        for line in lines[1:]:
+            match = _VTT_TIMING.fullmatch(line)
+            if match is None:
+                continue
+            try:
+                start = _timestamp_milliseconds(match, 1)
+                end = _timestamp_milliseconds(match, 5)
+            except ValueError:
+                raise TTSProviderError(
+                    TTSErrorCode.ARTIFACT_INVALID,
+                    retryable=False,
+                ) from None
+            if start < previous_start or end <= start:
+                raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+            previous_start = start
+            cue_count += 1
+        if cue_count == 0:
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+
+    @staticmethod
+    def _validate_result(
+        result: TTSProviderResult,
+        expected_audio: Path,
+        expected_timing: Path,
+    ) -> None:
+        if (
+            result.provider_id != "elevenlabs"
+            or result.audio_format != "mp3"
+            or result.audio_path != expected_audio
+            or result.timing_path != expected_timing
+        ):
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+        TTSNode._validate_audio(expected_audio)
+        TTSNode._validate_vtt(expected_timing)
+
+    @staticmethod
+    def _publish_pair(
+        temporary_audio: Path,
+        temporary_timing: Path,
+        final_audio: Path,
+        final_timing: Path,
+    ) -> None:
+        existed_before = {
+            final_audio: final_audio.exists(),
+            final_timing: final_timing.exists(),
+        }
+        if any(existed_before.values()):
+            raise TTSProviderError(TTSErrorCode.ARTIFACT_INVALID, retryable=False)
+        published: list[Path] = []
+        try:
+            os.replace(temporary_audio, final_audio)
+            published.append(final_audio)
+            os.replace(temporary_timing, final_timing)
+            published.append(final_timing)
+        except OSError:
+            for path in reversed(published):
+                if not existed_before[path]:
+                    TTSNode._safe_unlink(path)
+            raise TTSProviderError(TTSErrorCode.INTERNAL_ERROR, retryable=False) from None
+
+    def _attempt_paths(
+        self,
+        execution_id: str,
+        language: str,
+        attempt: int,
+    ) -> tuple[Path, Path]:
+        token = self._attempt_token_factory()
+        prefix = f".voice_{execution_id}_{language}.attempt-{attempt}-{token}"
+        return (
+            self._output_dir / f"{prefix}.mp3.part",
+            self._output_dir / f"{prefix}.vtt.part",
+        )
+
+    def _retry_delay(self, attempt: int, error: TTSProviderError) -> float:
+        if error.retry_after_seconds is not None:
+            return error.retry_after_seconds
+        return RETRY_DELAYS_SECONDS[attempt - 1]
 
     def execute(self, context: WorkflowContext) -> WorkflowContext:
-        """
-        执行 TTS — 测试语言优先（Test-First）模式：
-
-        读取 context.assets["tts_script"]（单轨线性架构，Phase 9.11.2），
-        仅为 context.test_language 生成 1 个 MP3 + VTT。
-        砍掉多语言循环，消除无意义算力浪费；
-        正式上线时只需切换 test_language，无需改代码。
-        """
         tts_script: dict = context.get_asset("tts_script") or {}
-
         if not tts_script:
             self.log("Warning: context.assets['tts_script'] is empty, skipping.")
             return context
 
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-
-        # ── 确定目标语言 ────────────────────────────────────────────
-        target_lang = getattr(context, "test_language", "en") or "en"
-        self.log(f"[Test-First] 目标语言 = '{target_lang}'（单语种模式，跳过其他语种）")
-
-        if target_lang not in tts_script:
-            # 尝试 fallback：取 tts_script 中第一个有 voice 映射的语言
-            fallback = next(
-                (lang for lang in tts_script if lang in self._voice_map), None
+        target_language = getattr(context, "test_language", "en") or "en"
+        if target_language not in {"en", "ar"}:
+            raise RuntimeError(
+                "[TTSNode] TTS audio generation failed after 0 attempt(s); "
+                "code=TTS_UNSUPPORTED_LANGUAGE; provider=elevenlabs"
             )
-            if fallback:
-                self.log(
-                    f"[Test-First] '{target_lang}' 在 tts_script 中无文本，"
-                    f"回退到 '{fallback}'。"
-                )
-                target_lang = fallback
-            else:
-                self.log(
-                    f"Warning: '{target_lang}' 无文本且无可用 fallback，跳过 TTS。"
-                )
-                return context
-
-        text = str(tts_script[target_lang]).strip()
+        if target_language not in tts_script:
+            target_language = next(
+                (language for language in tts_script if language in {"en", "ar"}),
+                target_language,
+            )
+        if target_language not in tts_script:
+            raise RuntimeError(
+                "[TTSNode] TTS audio generation failed after 0 attempt(s); "
+                "code=TTS_UNSUPPORTED_LANGUAGE; provider=elevenlabs"
+            )
+        text = str(tts_script[target_language]).strip()
         if not text:
-            self.log(f"Warning: tts_script['{target_lang}'] 为空字符串，跳过 TTS。")
-            return context
-        voice = self._voice_map.get(target_lang)
-        if not voice:
-            self.log(
-                f"Warning: voice_map 中无 '{target_lang}' 的音色配置，跳过。"
-            )
+            self.log(f"Warning: tts_script['{target_language}'] is empty, skipping.")
             return context
 
         execution_id = _resolve_execution_namespace(context)
-        output_path = self._output_dir / f"voice_{execution_id}_{target_lang}.mp3"
-        vtt_path    = self._output_dir / f"voice_{execution_id}_{target_lang}.vtt"
+        final_audio = self._output_dir / f"voice_{execution_id}_{target_language}.mp3"
+        final_timing = self._output_dir / f"voice_{execution_id}_{target_language}.vtt"
+        self._output_dir.mkdir(parents=True, exist_ok=True)
 
+        provider: TTSProvider | None = None
+        attempts_started = 0
+        last_error = TTSProviderError(TTSErrorCode.INTERNAL_ERROR, retryable=False)
+        started_at = self._clock()
+
+        try:
+            provider = self._active_provider()
+            voice_id = provider.resolve_voice_id(target_language)
+        except TTSProviderError as error:
+            last_error = error
+            provider_id = getattr(provider, "provider_id", "elevenlabs")
+            raise RuntimeError(
+                "[TTSNode] TTS audio generation failed after 0 attempt(s); "
+                f"code={error.code.value}; provider={provider_id}"
+            ) from None
+        except Exception:
+            raise RuntimeError(
+                "[TTSNode] TTS audio generation failed after 0 attempt(s); "
+                "code=TTS_INTERNAL_ERROR; provider=elevenlabs"
+            ) from None
+
+        provider_id = provider.provider_id
         self.log(
-            f"[{target_lang}] task_id={context.task_id} execution_id={execution_id} "
-            f"child_index={context.config.get('child_index')} "
-            f"file_sid={context.config.get('file_sid')} voice={voice} | "
-            f"text_length={len(text)} chars → MP3={output_path} VTT={vtt_path}"
+            f"[TTSNode] provider={provider_id} language={target_language} "
+            f"execution_id={execution_id} text_length={len(text)}"
         )
 
-        max_retries = 3
-        success = False
-        last_error = None
-
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            elapsed = self._clock() - started_at
+            remaining = TOTAL_TTS_BUDGET_SECONDS - elapsed
+            if not math.isfinite(remaining) or remaining <= 0:
+                last_error = TTSProviderError(TTSErrorCode.TIMEOUT, retryable=False)
+                break
+            temporary_audio, temporary_timing = self._attempt_paths(
+                execution_id,
+                target_language,
+                attempt,
+            )
+            request = TTSProviderRequest(
+                text=text,
+                language=target_language,
+                voice_id=voice_id,
+                rate=self._rate,
+                output_audio_path=temporary_audio,
+                output_timing_path=temporary_timing,
+                correlation_id=execution_id,
+            )
+            attempts_started += 1
             try:
-                self._run_tts(voice=voice, text=text, output_path=output_path, vtt_path=vtt_path)
-
-                if not output_path.exists():
-                    raise RuntimeError(f"Output file missing after TTS: {output_path}")
-
-                file_size = output_path.stat().st_size
-                if file_size < 1024:
-                    raise RuntimeError(
-                        f"Output file too small ({file_size} bytes), likely corrupted: {output_path}"
-                    )
-
-                success = True
+                result = provider.synthesize(
+                    request,
+                    attempt_timeout_seconds=min(PER_ATTEMPT_TIMEOUT_SECONDS, remaining),
+                )
+                self._validate_result(result, temporary_audio, temporary_timing)
+                published_audio_bytes = temporary_audio.stat().st_size
+                self._publish_pair(
+                    temporary_audio,
+                    temporary_timing,
+                    final_audio,
+                    final_timing,
+                )
+            except TTSProviderError as error:
+                last_error = error
+                self._safe_unlink(temporary_audio)
+                self._safe_unlink(temporary_timing)
+                self.log(
+                    f"[TTSNode] provider={provider_id} language={target_language} "
+                    f"attempt={attempt} code={error.code.value}"
+                )
+                if not error.retryable or attempt >= MAX_ATTEMPTS:
+                    break
+                delay = self._retry_delay(attempt, error)
+                remaining_after_attempt = (
+                    TOTAL_TTS_BUDGET_SECONDS - (self._clock() - started_at)
+                )
+                if delay >= remaining_after_attempt:
+                    last_error = TTSProviderError(TTSErrorCode.TIMEOUT, retryable=False)
+                    break
+                self._sleeper(delay)
+                continue
+            except Exception:
+                last_error = TTSProviderError(TTSErrorCode.INTERNAL_ERROR, retryable=False)
+                self._safe_unlink(temporary_audio)
+                self._safe_unlink(temporary_timing)
                 break
 
-            except Exception as e:
-                last_error = e
-                self.log(
-                    f"[Warning] [{target_lang}] TTS attempt {attempt}/{max_retries} failed: {e}"
-                )
-                if attempt < max_retries:
-                    time.sleep(1)
-
-        if not success:
-            raise RuntimeError(
-                f"[TTSNode] TTS audio generation failed after {max_retries} attempts. "
-                f"Last error: {last_error}"
+            context.variants.setdefault(target_language, {}).update(
+                {
+                    "voice_audio": str(final_audio),
+                    "vtt_path": str(final_timing),
+                }
             )
-
-        file_size_kb = output_path.stat().st_size / 1024
-        self.log(f"[OK] [{target_lang}] MP3 → {output_path} ({file_size_kb:.1f} KB)")
-        context.set_variant_asset(target_lang, "voice_audio", str(output_path))
-
-        if vtt_path.exists() and vtt_path.stat().st_size > 0:
-            context.set_variant_asset(target_lang, "vtt_path", str(vtt_path))
-            self.log(f"[OK] [{target_lang}] VTT → {vtt_path}")
-        else:
             self.log(
-                f"[Warning] [{target_lang}] VTT not generated. SubtitleNode will use fallback."
+                f"[TTSNode] provider={provider_id} language={target_language} "
+                f"attempt={attempt} audio_bytes={published_audio_bytes} published=YES"
             )
+            return context
 
-        self.log(f"TTS complete. Registered voice_audio for: [{target_lang}]")
-        return context
+        raise RuntimeError(
+            "[TTSNode] TTS audio generation failed after "
+            f"{attempts_started} attempt(s); code={last_error.code.value}; "
+            f"provider={provider_id}"
+        ) from None

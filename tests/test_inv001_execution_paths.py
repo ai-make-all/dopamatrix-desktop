@@ -12,6 +12,7 @@ from src.nodes.compositor import FFmpegCompositorNode
 from src.nodes.cover_node import CoverNode
 from src.nodes.subtitle import SubtitleNode
 from src.nodes.tts_node import TTSNode
+from src.services.tts_provider import TTSProviderResult
 
 
 @contextmanager
@@ -37,15 +38,72 @@ def _child_context(task_id: str, execution_id: str, child_index: int) -> Workflo
     return context
 
 
-def _fake_tts_run(voice, text, output_path, vtt_path):
-    output_path.write_bytes(b"a" * 2048)
-    vtt_path.write_text(
-        "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
-        encoding="utf-8",
-    )
+class _DeterministicTTSProvider:
+    provider_id = "elevenlabs"
+
+    def __init__(self):
+        self.resolve_calls = []
+        self.synthesize_calls = 0
+
+    def resolve_voice_id(self, language):
+        self.resolve_calls.append(language)
+        return f"fake_{language}"
+
+    def synthesize(self, request, *, attempt_timeout_seconds):
+        self.synthesize_calls += 1
+        request.output_audio_path.write_bytes(b"ID3" + b"a" * 2045)
+        request.output_timing_path.write_text(
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nHello\n",
+            encoding="utf-8",
+        )
+        return TTSProviderResult(
+            audio_path=request.output_audio_path,
+            audio_format="mp3",
+            timing_path=request.output_timing_path,
+            provider_id=self.provider_id,
+            safe_metadata={},
+        )
 
 
 class WritableNamespaceTests(unittest.TestCase):
+    def test_unsupported_logical_language_fails_closed_before_provider(self):
+        for available_language in ("en", "ar"):
+            with self.subTest(available_language=available_language):
+                context = WorkflowContext(task_id="unsupported", test_language="zh")
+                context.set_asset("tts_script", {available_language: "Existing script"})
+                provider = _DeterministicTTSProvider()
+
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "code=TTS_UNSUPPORTED_LANGUAGE",
+                    ):
+                        TTSNode(output_dir=directory, provider=provider).execute(context)
+
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
+                self.assertEqual(provider.resolve_calls, [])
+                self.assertEqual(provider.synthesize_calls, 0)
+                self.assertEqual(context.variants, {})
+
+    def test_supported_logical_language_paths_remain_unchanged(self):
+        for language in ("en", "ar"):
+            with self.subTest(language=language):
+                context = WorkflowContext(task_id=f"supported-{language}", test_language=language)
+                context.set_asset("tts_script", {language: "Supported script"})
+                provider = _DeterministicTTSProvider()
+
+                with tempfile.TemporaryDirectory() as directory:
+                    TTSNode(output_dir=directory, provider=provider).execute(context)
+
+                    audio_path = Path(context.variants[language]["voice_audio"])
+                    timing_path = Path(context.variants[language]["vtt_path"])
+                    self.assertTrue(audio_path.is_file())
+                    self.assertTrue(timing_path.is_file())
+
+                self.assertEqual(provider.resolve_calls, [language])
+                self.assertEqual(provider.synthesize_calls, 1)
+
     def test_two_children_get_distinct_full_uuid_tts_paths(self):
         task_id = "shared-task"
         execution_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
@@ -55,8 +113,7 @@ class WritableNamespaceTests(unittest.TestCase):
             for child_index, execution_id in enumerate(execution_ids):
                 context = _child_context(task_id, execution_id, child_index)
                 context.set_asset("tts_script", {"en": "Hello child"})
-                node = TTSNode(output_dir=directory)
-                node._run_tts = _fake_tts_run
+                node = TTSNode(output_dir=directory, provider=_DeterministicTTSProvider())
 
                 node.execute(context)
                 paths.append(
@@ -83,8 +140,7 @@ class WritableNamespaceTests(unittest.TestCase):
         context.set_asset("tts_script", {"en": "Legacy text"})
 
         with tempfile.TemporaryDirectory() as directory:
-            node = TTSNode(output_dir=directory)
-            node._run_tts = _fake_tts_run
+            node = TTSNode(output_dir=directory, provider=_DeterministicTTSProvider())
             node.execute(context)
 
             self.assertEqual(

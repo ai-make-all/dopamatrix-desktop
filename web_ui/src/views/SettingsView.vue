@@ -17,6 +17,43 @@ const llmBaseUrl      = ref('')
 const llmModel        = ref('gpt-4o-mini')
 const showLlmKeyText  = ref(false)
 
+// ── TTS Settings (write-only ElevenLabs credential) ───────────────────────
+const ttsApiKeyInput  = ref('')
+const ttsIsConfigured = ref(false)
+const ttsSecretStatus = ref('ABSENT')
+const ttsSaving       = ref(false)
+
+async function loadTtsSettings() {
+  try {
+    const resp = await axios.get(`${store.API_BASE}/api/v1/settings/tts`)
+    ttsIsConfigured.value = resp.data.is_configured ?? false
+    ttsSecretStatus.value = resp.data.secret_status || 'ERROR'
+  } catch (err) {
+    ttsIsConfigured.value = false
+    ttsSecretStatus.value = 'ERROR'
+    console.error('[TTS Settings] 获取凭据状态失败。')
+  }
+}
+
+async function saveTtsSettings() {
+  const key = ttsApiKeyInput.value.trim()
+  if (!key) {
+    store.showToast('⚠️ 请先输入有效的 ElevenLabs API Key')
+    return
+  }
+  ttsSaving.value = true
+  try {
+    await axios.post(`${store.API_BASE}/api/v1/settings/tts`, { api_key: key })
+    ttsApiKeyInput.value = ''
+    await loadTtsSettings()
+    store.showToast('✅ ElevenLabs TTS 凭据已安全保存。')
+  } catch (err) {
+    store.showToast(`❌ TTS 凭据保存失败：${err.response?.data?.detail || err.message}`)
+  } finally {
+    ttsSaving.value = false
+  }
+}
+
 async function loadLlmSettings() {
   try {
     const resp = await axios.get(`${store.API_BASE}/api/v1/settings/llm`)
@@ -115,6 +152,7 @@ async function openDiagnosticLogs() {
 
 onMounted(() => {
   loadLlmSettings()
+  loadTtsSettings()
   store.hydrateDeliveryRoot()
 })
 </script>
@@ -260,6 +298,63 @@ onMounted(() => {
             保存中...
           </span>
           <span v-else>🔑 保存 API Key</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- TTS 凭据卡：固定 ElevenLabs provider，无 provider/voice/proxy 选择 -->
+    <div class="settings-card settings-card--tts">
+      <div class="settings-card-title">
+        <span class="settings-card-icon">🔊</span>
+        <div>
+          <div style="font-size:1.05rem; font-weight:800; color:#e2e8f0;">文字转语音 <span style="color:#64748b; font-size:0.78rem; font-weight:400;">TTS Credential</span></div>
+          <div style="font-size:0.75rem; color:#475569; margin-top:0.15rem; line-height:1.5;">
+            Provider 固定为 ElevenLabs。凭据使用 Windows 当前用户加密，仅提供写入与状态查询。
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-bottom:1.25rem;">
+        <span v-if="ttsIsConfigured" class="llm-status-badge llm-status-badge--ok">
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0"><circle cx="5" cy="5" r="5" fill="#4ade80"/></svg>
+          Credential {{ ttsSecretStatus }}
+        </span>
+        <span v-else class="llm-status-badge llm-status-badge--warn">
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0"><circle cx="5" cy="5" r="5" fill="#f87171"/></svg>
+          Credential {{ ttsSecretStatus }}
+        </span>
+      </div>
+
+      <div class="settings-field">
+        <label class="settings-label">服务提供商</label>
+        <div class="llm-status-badge" style="width:fit-content;">
+          🔊 ElevenLabs
+        </div>
+      </div>
+
+      <div class="settings-field">
+        <label class="settings-label">API Key（仅写入）</label>
+        <div class="llm-key-input-wrap">
+          <input
+            v-model="ttsApiKeyInput"
+            type="password"
+            :placeholder="ttsIsConfigured ? '输入新 Key 可替换当前凭据' : '输入 ElevenLabs API Key'"
+            class="llm-key-input"
+            autocomplete="new-password"
+            spellcheck="false"
+            @keydown.enter="saveTtsSettings"
+          />
+        </div>
+        <p class="settings-hint">已保存的 Key 永不回显；保存操作不会发起 provider 网络请求。</p>
+      </div>
+
+      <div>
+        <button
+          @click="saveTtsSettings"
+          :disabled="ttsSaving || !ttsApiKeyInput.trim()"
+          class="cta-glow-btn llm-save-btn"
+        >
+          {{ ttsSaving ? '保存中...' : '🔑 保存 ElevenLabs API Key' }}
         </button>
       </div>
     </div>
