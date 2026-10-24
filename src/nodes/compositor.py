@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # 隐藏 Windows 下 FFmpeg 子进程的黑色控制台窗口
 _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -28,6 +28,7 @@ class FFmpegCompositorNode(BaseNode):
 
     def __init__(self, name: str = "FFmpeg_Slot_Compositor"):
         super().__init__(name)
+        self.target_duration: float = 15.0
         # 运行时动态分辨率（由 execute() 从 context.aspect_ratio 解析和赋值）
         self.target_w: int = 720    # 默认 9:16 宽（720P 级别，MVP 提速）
         self.target_h: int = 1280   # 默认 9:16 高
@@ -181,6 +182,16 @@ class FFmpegCompositorNode(BaseNode):
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _main_video_clip_count(timeline: Optional[Timeline]) -> int:
+        """Return the clip count on the first non-empty (main) video track."""
+        if timeline is None:
+            return 0
+        for track in timeline.tracks:
+            if getattr(track, "track_type", "video") == "video" and track.clips:
+                return len(track.clips)
+        return 0
+
     def _compute_beat_timeline(
         self, main_video_clips: "List[Clip]"
     ) -> "Tuple[List[float], float]":
@@ -217,7 +228,16 @@ class FFmpegCompositorNode(BaseNode):
                     f"[GlobalTimeline] ffprobe 失败 '{clip.file_path}'，"
                     f"使用名义时长 {actual_dur:.3f}s 作为兜底。"
                 )
-            current_time += actual_dur
+            planned_dur = self._planned_clip_duration(
+                clip,
+                clip_count=len(main_video_clips),
+                probed_duration=actual_dur,
+            )
+            self.log(
+                f"[GlobalTimeline] clip={clip.file_path!r} "
+                f"physical={actual_dur:.3f}s contract={planned_dur:.3f}s"
+            )
+            current_time += planned_dur
 
         self.log(
             f"[GlobalTimeline] {len(main_video_clips)} 个主视频 Clip → "
@@ -225,6 +245,33 @@ class FFmpegCompositorNode(BaseNode):
             f"total={current_time:.3f}s"
         )
         return beat_actual_starts, current_time
+
+    def _planned_clip_duration(
+        self,
+        clip: "Clip",
+        *,
+        clip_count: int,
+        probed_duration: float | None = None,
+    ) -> float:
+        """Return the bounded output duration for one main-video clip."""
+        if clip_count == 1 and self.target_duration > 0:
+            return self.target_duration
+
+        if probed_duration is not None and float(probed_duration) > 0:
+            return float(probed_duration)
+
+        nominal = float(clip.duration or 0.0)
+        if nominal > 0:
+            return nominal
+
+        actual = (
+            float(probed_duration)
+            if probed_duration is not None
+            else self._probe_duration(clip.file_path)
+        )
+        if actual > 0:
+            return actual
+        return 5.0
 
     @staticmethod
     def _resolve_clip_timing(
@@ -374,9 +421,11 @@ class FFmpegCompositorNode(BaseNode):
         # ── Step 0: 全局真实时间轴计算（Late-Binding，Phase 9.7.1）──────────
         # 在 ffprobe 确定主视频 Clip 真实时长之后、拼接 filter_complex 之前执行。
         # 结果供后续 overlay / text_overlay 注入 enable='between(t,start,end)'。
+        _main_video_track: Optional[Track] = None
         _main_video_clips: List[Clip] = []
         for _track in timeline.tracks:
             if getattr(_track, "track_type", "video") == "video" and _track.clips:
+                _main_video_track = _track
                 _main_video_clips = list(_track.clips)
                 break  # 主视频轨唯一，找到即止
 
@@ -451,6 +500,9 @@ class FFmpegCompositorNode(BaseNode):
 
             # ── video 轨道：原有 X 轴 concat 管线 ─────────────────────────
             per_clip_labels: List[str] = []
+            is_single_main_video_track = (
+                track is _main_video_track and len(_main_video_clips) == 1
+            )
 
             for clip in track.clips:
                 # 静态图片嗅探与时空膨胀：单帧图片需要 -loop 1 撑开为视频流，
@@ -459,7 +511,10 @@ class FFmpegCompositorNode(BaseNode):
                 _is_static_image = _ext in {"png", "jpg", "jpeg", "webp", "bmp"}
 
                 if _is_static_image:
-                    actual_dur = (clip.duration or 0.0) if (clip.duration or 0.0) > 0 else 5.0
+                    actual_dur = self._planned_clip_duration(
+                        clip,
+                        clip_count=len(track.clips),
+                    )
                     input_args.extend([
                         "-loop", "1",
                         "-framerate", str(self.TARGET_FPS),
@@ -472,40 +527,36 @@ class FFmpegCompositorNode(BaseNode):
 
                 raw = f"[{clip_index}:v]"
 
-                if len(track.clips) > 1:
-                    # 多 Clip：完整归一化管道（解决花屏）：
-                    # setpts  — PTS 归零
-                    # scale   — 等比缩小到目标尺寸（保持宽高比）
-                    # pad     — 补黑边对齐到精确目标尺寸
-                    # setsar  — 强制 SAR=1（消除非方形像素 DAR 异常）
-                    # fps     — 统一帧率（消除帧率不一致导致的花屏）
-                    # format  — 强制 yuv420p（FFmpeg concat 要求像素格式一致）
-                    # effects — per-clip 防查重滤镜链（来自 AntiDupNode）
-                    tw, th = self.target_w, self.target_h
-                    norm_label = f"[norm{clip_index}]"
-                    norm_chain = (
-                        f"{raw}setpts=PTS-STARTPTS,"
-                        f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
-                        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,"
-                        f"setsar=1,"
-                        f"fps={self.TARGET_FPS},"
-                        f"format=yuv420p"
+                # Every main-video clip follows the same normalization and
+                # target geometry contract. Duration conformance is deliberately
+                # limited to the single-clip recovery path so the established
+                # multi-clip concat timing remains unchanged.
+                tw, th = self.target_w, self.target_h
+                norm_label = f"[norm{clip_index}]"
+                norm_chain = (
+                    f"{raw}setpts=PTS-STARTPTS,"
+                    f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                    f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,"
+                    f"setsar=1,"
+                    f"fps={self.TARGET_FPS},"
+                    f"format=yuv420p"
+                )
+                if clip.effects:
+                    effects_chain = ",".join(clip.effects)
+                    norm_chain += f",{effects_chain}"
+                if is_single_main_video_track:
+                    output_dur = self._planned_clip_duration(
+                        clip,
+                        clip_count=1,
                     )
-                    if clip.effects:
-                        effects_chain = ",".join(clip.effects)
-                        norm_chain += f",{effects_chain}"
-                    norm_chain += norm_label
-                    video_parts.append(norm_chain)
-                    per_clip_labels.append(norm_label)
-                else:
-                    if clip.start_time > 0:
-                        shifted_label = f"[shifted{clip_index}]"
-                        video_parts.append(
-                            f"{raw}setpts=PTS+{clip.start_time}/TB{shifted_label}"
-                        )
-                        per_clip_labels.append(shifted_label)
-                    else:
-                        per_clip_labels.append(raw)
+                    norm_chain += (
+                        f",tpad=stop_mode=clone:stop_duration={output_dur:.6f},"
+                        f"trim=duration={output_dur:.6f},"
+                        f"setpts=PTS-STARTPTS"
+                    )
+                norm_chain += norm_label
+                video_parts.append(norm_chain)
+                per_clip_labels.append(norm_label)
 
                 clip_index += 1
 
@@ -679,6 +730,7 @@ class FFmpegCompositorNode(BaseNode):
         # 1b. 解析画幅比例，动态设置目标分辨率
         aspect_ratio: str = getattr(context, "aspect_ratio", "9:16") or "9:16"
         self.target_w, self.target_h = self._resolve_dimensions(aspect_ratio)
+        self.target_duration = float(getattr(context, "target_duration", 15) or 15)
         self.log(
             f"📐 画幅比例={aspect_ratio} → 目标分辨率={self.target_w}×{self.target_h}"
         )
@@ -877,6 +929,10 @@ class FFmpegCompositorNode(BaseNode):
         # 从 context.config 读取管线开关（render_worker 已注入，默认保守兜底为 True）
         _enable_tts       = context.config.get("enable_tts", True)
         _enable_subtitles = context.config.get("enable_subtitles", True)
+        target_duration = float(getattr(context, "target_duration", 15) or 15)
+        if target_duration <= 0:
+            raise RuntimeError("TARGET_DURATION_INVALID")
+        single_main_clip = self._main_video_clip_count(timeline) == 1
 
         for lang, assets in context.variants.items():
             ass_path: str = assets.get("subtitle_ass", "")
@@ -919,7 +975,17 @@ class FFmpegCompositorNode(BaseNode):
 
             # 第一顺位：TTS 配音
             voice_label: str = ""           # e.g. "[1:a]"，不存在则为空
+            voice_target_duration = target_duration
             if has_voice:
+                if not single_main_clip:
+                    voice_target_duration = self._probe_duration(master_path)
+                    if voice_target_duration <= 0:
+                        raise RuntimeError("MASTER_VIDEO_DURATION_UNVERIFIED")
+                voice_duration = self._probe_duration(voice_path)
+                if voice_duration <= 0:
+                    raise RuntimeError("TTS_AUDIO_DURATION_UNVERIFIED")
+                if voice_duration > voice_target_duration + 0.05:
+                    raise RuntimeError("TTS_AUDIO_EXCEEDS_TARGET_DURATION")
                 inputs += ["-i", voice_path]
                 voice_label = f"[{next_idx}:a]"
                 next_idx += 1
@@ -931,7 +997,13 @@ class FFmpegCompositorNode(BaseNode):
             audio_mix_labels:   List[str] = []
 
             if voice_label:
-                audio_mix_labels.append(voice_label)
+                padded_voice = "[voice_target]"
+                audio_filter_parts.append(
+                    f"{voice_label}apad,"
+                    f"atrim=duration={voice_target_duration:.6f}"
+                    f"{padded_voice}"
+                )
+                audio_mix_labels.append(padded_voice)
 
             for audio_track in audio_tracks:
                 for clip in audio_track.clips:
@@ -949,14 +1021,31 @@ class FFmpegCompositorNode(BaseNode):
                     if audio_track.audio_type == "bgm":
                         # BGM 闪避：降至 20% 音量，保护 TTS 人声
                         bgm_out = f"[bgm{slot}]"
-                        audio_filter_parts.append(f"{raw_label}volume=0.2{bgm_out}")
+                        if single_main_clip:
+                            audio_filter_parts.append(
+                                f"{raw_label}volume=0.2,apad,"
+                                f"atrim=duration={target_duration:.6f}{bgm_out}"
+                            )
+                        else:
+                            audio_filter_parts.append(
+                                f"{raw_label}volume=0.2{bgm_out}"
+                            )
                         audio_mix_labels.append(bgm_out)
                         self.log(
                             f"[{lang}] BGM '{audio_track.name}' [{slot}:a] → volume=0.2 {bgm_out}"
                         )
                     else:
-                        # SFX / TTS / general：原音量直通
-                        audio_mix_labels.append(raw_label)
+                        # Preserve the established multi-clip SFX/general path.
+                        # Only the single-main-clip recovery path conforms tails.
+                        if single_main_clip:
+                            audio_out = f"[audio{slot}]"
+                            audio_filter_parts.append(
+                                f"{raw_label}apad,"
+                                f"atrim=duration={target_duration:.6f}{audio_out}"
+                            )
+                            audio_mix_labels.append(audio_out)
+                        else:
+                            audio_mix_labels.append(raw_label)
                         self.log(
                             f"[{lang}] Audio '{audio_track.name}' "
                             f"(type={audio_track.audio_type}) [{slot}:a] → {raw_label}"
@@ -983,10 +1072,13 @@ class FFmpegCompositorNode(BaseNode):
                 audio_codec = []
                 shortest    = []
             elif n == 1 and not audio_filter_parts:
-                # 单一 TTS/SFX 且无中间滤镜：直接映射，不走 filter_complex 音频部分
-                # audio_mix_labels[0] 形如 "[1:a]"，去括号得 "1:a"
                 audio_fg    = ""
                 audio_map   = ["-map", audio_mix_labels[0].strip("[]")]
+                audio_codec = ["-c:a", "aac", "-b:a", "192k"]
+                shortest    = ["-shortest"]
+            elif n == 1:
+                audio_fg    = ";".join(audio_filter_parts)
+                audio_map   = ["-map", audio_mix_labels[0]]
                 audio_codec = ["-c:a", "aac", "-b:a", "192k"]
                 shortest    = ["-shortest"]
             else:
@@ -994,8 +1086,11 @@ class FFmpegCompositorNode(BaseNode):
                 mix_in  = "".join(audio_mix_labels)
                 amix_fg = (
                     f"{mix_in}"
-                    f"amix=inputs={n}:duration=longest:dropout_transition=2[outa]"
+                    f"amix=inputs={n}:duration=longest:dropout_transition=2"
                 )
+                if single_main_clip:
+                    amix_fg += f",atrim=duration={target_duration:.6f}"
+                amix_fg += "[outa]"
                 audio_fg    = ";".join(audio_filter_parts + [amix_fg])
                 audio_map   = ["-map", "[outa]"]
                 audio_codec = ["-c:a", "aac", "-b:a", "192k"]

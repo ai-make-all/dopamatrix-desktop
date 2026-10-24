@@ -6,6 +6,10 @@ import { useAppStore } from '../stores/appStore'
 import { useQueueStore } from '../stores/useQueueStore'
 import { getTagPillParts, parseFacetedTags } from '../utils/tagParser.js'
 import { ASSET_FILTER_OPTIONS, FACET_NAMESPACES } from '../utils/assetConfig.js'
+import {
+  cloneConfirmedTracks,
+  hasUncommittedBeatScript,
+} from '../utils/directRenderContract.js'
 
 // ── Props & Emits ────────────────────────────────────────────────────────────
 const props = defineProps({
@@ -423,8 +427,16 @@ async function submitRenderTask() {
   if (isRenderSubmitting.value) return
 
   if (props.directRender) {
+    if (hasUncommittedBeatScript({
+      activeBeatIndex: activeConfigBeatIndex.value,
+      tracks: localTracks.value,
+      draftScript: configForm.value.script_text,
+    })) {
+      props.showToast('Please confirm the open Beat script before Direct Render.')
+      return
+    }
     emit('confirm', {
-      tracks:       JSON.parse(JSON.stringify(localTracks.value)),
+      tracks:       cloneConfirmedTracks(localTracks.value),
       template:     localTemplate.value,
       master_track: buildMasterTrackPlan(),
       directRender: props.directRender,

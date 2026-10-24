@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 from src.core.base_node import BaseNode
 from src.core.context import WorkflowContext
 from src.services.tts_provider import (
     MAX_ATTEMPTS,
     PER_ATTEMPT_TIMEOUT_SECONDS,
+    RETRY_AFTER_CAP_SECONDS,
     RETRY_DELAYS_SECONDS,
     TOTAL_TTS_BUDGET_SECONDS,
     TTSErrorCode,
@@ -29,6 +32,18 @@ from src.services.tts_provider import (
     TTSProviderResult,
     create_tts_provider,
 )
+
+
+TTS_PROVIDER_MAX_IN_FLIGHT = 1
+RATE_LIMIT_JITTER_RATIO = 0.25
+_ELEVENLABS_PROVIDER_GATE = threading.BoundedSemaphore(TTS_PROVIDER_MAX_IN_FLIGHT)
+_SAFE_LOG_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+class _ProviderAdmissionGate(Protocol):
+    def acquire(self, *, timeout: float) -> bool: ...
+
+    def release(self) -> None: ...
 
 
 _VTT_TIMING = re.compile(
@@ -70,6 +85,8 @@ class TTSNode(BaseNode):
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         attempt_token_factory: Callable[[], str] | None = None,
+        provider_gate: _ProviderAdmissionGate | None = None,
+        jitter_source: Callable[[], float] = random.random,
     ) -> None:
         super().__init__(name)
         self._output_dir = Path(output_dir)
@@ -81,6 +98,10 @@ class TTSNode(BaseNode):
         self._attempt_token_factory = attempt_token_factory or (
             lambda: uuid.uuid4().hex
         )
+        self._provider_gate = (
+            provider_gate if provider_gate is not None else _ELEVENLABS_PROVIDER_GATE
+        )
+        self._jitter_source = jitter_source
 
     def _active_provider(self) -> TTSProvider:
         if self._provider is None:
@@ -199,9 +220,75 @@ class TTSNode(BaseNode):
         )
 
     def _retry_delay(self, attempt: int, error: TTSProviderError) -> float:
-        if error.retry_after_seconds is not None:
-            return error.retry_after_seconds
-        return RETRY_DELAYS_SECONDS[attempt - 1]
+        base_delay = (
+            error.retry_after_seconds
+            if error.retry_after_seconds is not None
+            else RETRY_DELAYS_SECONDS[attempt - 1]
+        )
+        base_delay = max(0.0, min(float(base_delay), RETRY_AFTER_CAP_SECONDS))
+        if error.code not in {
+            TTSErrorCode.RATE_LIMITED,
+            TTSErrorCode.CONCURRENCY_LIMITED,
+        }:
+            return base_delay
+        try:
+            jitter_fraction = float(self._jitter_source())
+        except (TypeError, ValueError, OverflowError):
+            jitter_fraction = 0.0
+        if not math.isfinite(jitter_fraction):
+            jitter_fraction = 0.0
+        jitter_fraction = min(max(jitter_fraction, 0.0), 1.0)
+        jitter = min(
+            base_delay * RATE_LIMIT_JITTER_RATIO * jitter_fraction,
+            RETRY_AFTER_CAP_SECONDS - base_delay,
+        )
+        return base_delay + jitter
+
+    @staticmethod
+    def _safe_error_diagnostics(error: TTSProviderError) -> str:
+        diagnostics: list[str] = []
+        if (
+            isinstance(error.safe_status, int)
+            and not isinstance(error.safe_status, bool)
+            and 100 <= error.safe_status <= 599
+        ):
+            diagnostics.append(f"http_status={error.safe_status}")
+        for label, value in (
+            ("provider_type", error.provider_error_type),
+            ("provider_code", error.provider_error_code),
+            ("provider_legacy_status", error.provider_legacy_status),
+            ("provider_request_id", error.provider_request_id),
+        ):
+            if isinstance(value, str) and _SAFE_LOG_TOKEN.fullmatch(value):
+                diagnostics.append(f"{label}={value}")
+        return "" if not diagnostics else " " + " ".join(diagnostics)
+
+    def _synthesize_with_admission(
+        self,
+        provider: TTSProvider,
+        request: TTSProviderRequest,
+        *,
+        started_at: float,
+    ) -> TTSProviderResult:
+        remaining = TOTAL_TTS_BUDGET_SECONDS - (self._clock() - started_at)
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise TTSProviderError(TTSErrorCode.TIMEOUT, retryable=False)
+
+        acquired = False
+        try:
+            acquired = self._provider_gate.acquire(timeout=remaining)
+            if not acquired:
+                raise TTSProviderError(TTSErrorCode.TIMEOUT, retryable=False)
+            remaining = TOTAL_TTS_BUDGET_SECONDS - (self._clock() - started_at)
+            if not math.isfinite(remaining) or remaining <= 0:
+                raise TTSProviderError(TTSErrorCode.TIMEOUT, retryable=False)
+            return provider.synthesize(
+                request,
+                attempt_timeout_seconds=min(PER_ATTEMPT_TIMEOUT_SECONDS, remaining),
+            )
+        finally:
+            if acquired:
+                self._provider_gate.release()
 
     def execute(self, context: WorkflowContext) -> WorkflowContext:
         tts_script: dict = context.get_asset("tts_script") or {}
@@ -284,9 +371,10 @@ class TTSNode(BaseNode):
             )
             attempts_started += 1
             try:
-                result = provider.synthesize(
+                result = self._synthesize_with_admission(
+                    provider,
                     request,
-                    attempt_timeout_seconds=min(PER_ATTEMPT_TIMEOUT_SECONDS, remaining),
+                    started_at=started_at,
                 )
                 self._validate_result(result, temporary_audio, temporary_timing)
                 published_audio_bytes = temporary_audio.stat().st_size
@@ -303,6 +391,7 @@ class TTSNode(BaseNode):
                 self.log(
                     f"[TTSNode] provider={provider_id} language={target_language} "
                     f"attempt={attempt} code={error.code.value}"
+                    f"{self._safe_error_diagnostics(error)}"
                 )
                 if not error.retryable or attempt >= MAX_ATTEMPTS:
                     break

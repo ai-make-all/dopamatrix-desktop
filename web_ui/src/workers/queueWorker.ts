@@ -11,6 +11,7 @@
  *  { type: 'STOP'                                  }  — 清理定时器并退出
  *
  * ────── 推送的消息类型 ──────
+ *  { type: 'READY' }
  *  { type: 'TICK', payload: { tasks: QueueTask[], stats: QueueStats } }
  */
 
@@ -94,6 +95,7 @@ export interface WsUpdatePayload {
 // ── 内部状态 ─────────────────────────────────────────────────────────────────
 
 let _tasks: QueueTask[] = []
+let _revision = 0
 
 let _stats: QueueStats = {
   totalPending:          0,
@@ -165,6 +167,7 @@ function _broadcastTick(): void {
     payload: {
       tasks: _tasks.slice(),
       stats: { ..._stats },
+      revision: _revision,
     },
   })
 }
@@ -184,18 +187,25 @@ const _tickInterval = setInterval(() => {
 // ── 消息处理器 ───────────────────────────────────────────────────────────────
 
 ;(self as DedicatedWorkerGlobalScope).onmessage = (event: MessageEvent) => {
-  const msg = event.data as { type: string; payload?: unknown }
+  const msg = event.data as { type: string; payload?: unknown; revision?: number }
   if (!msg?.type) return
 
   switch (msg.type) {
 
     case 'WS_UPDATE':
+      if (!Number.isSafeInteger(msg.revision) || (msg.revision as number) < _revision) break
+      _revision = msg.revision as number
       _handleWsUpdate(msg.payload as WsUpdatePayload)
       break
 
     case 'INIT_TASKS': {
       const incoming = msg.payload
-      if (Array.isArray(incoming)) {
+      if (
+        Array.isArray(incoming) &&
+        Number.isSafeInteger(msg.revision) &&
+        (msg.revision as number) >= _revision
+      ) {
+        _revision = msg.revision as number
         _tasks = (incoming as QueueTask[]).filter(t => t && typeof t.id === 'string')
         _recomputeStats()
         _broadcastTick()
@@ -211,6 +221,10 @@ const _tickInterval = setInterval(() => {
       break
   }
 }
+
+// The main thread does not treat a constructed Worker as usable until this
+// handshake proves that the compiled module reached its message loop.
+;(self as DedicatedWorkerGlobalScope).postMessage({ type: 'READY' })
 
 // ── WS_UPDATE 处理逻辑 ───────────────────────────────────────────────────────
 

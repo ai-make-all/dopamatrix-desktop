@@ -2,17 +2,24 @@
  * useQueueStore.ts — Pinia 桥梁层
  *
  * 职责：
- *  1. 持有 tasks / stats 两个 reactive 引用（唯一数据源）
- *  2. 创建 Web Worker，监听其 TICK 消息并覆写 state
- *  3. 维护 WebSocket 连接，将收到的消息原封不动转发给 Worker
+ *  1. 持有 tasks / stats 两个 reactive 引用及可降级的主线程镜像
+ *  2. 创建 Web Worker，握手成功后监听其 TICK 消息并覆写 state
+ *  3. 维护 WebSocket 连接，将任务更新写入镜像并转发给可用 Worker
  *  4. 暴露 pushTaskUpdate / initTasks 以兼容现有 REST 轮询模式
  *
- * 设计原则：Store 本身不含任何业务计算逻辑，全部下沉到 Worker。
+ * 设计原则：Worker 负责高频状态机；Worker 不可用时由等价的最小主线程逻辑接管。
  */
 
 import { defineStore } from 'pinia'
 import { ref }         from 'vue'
 import { normalizeCoverageDiagnostics } from '../utils/coverageDiagnostics'
+import {
+  applyQueueUpdate,
+  computeQueueStats,
+  normalizeQueueSnapshot,
+} from '../utils/queueStateFallback.js'
+import { createQueueWorkerBridge } from '../utils/queueWorkerBridge.js'
+import QueueWorker from '../workers/queueWorker.ts?worker'
 
 // ── 从 Worker 侧复用类型（避免重复定义） ──────────────────────────────────────
 export type { QueueTask, QueueTaskAsset, QueueStats, TaskStatus, WsUpdatePayload } from '../workers/queueWorker'
@@ -27,15 +34,22 @@ const EMPTY_STATS: QueueStats = {
   estimatedETA_seconds: 0,
 }
 
+const WORKER_READY_TIMEOUT_MS = 2_000
+
+type QueueWorkerInboundMessage =
+  | { type: 'WS_UPDATE'; payload: WsUpdatePayload; revision: number }
+  | { type: 'INIT_TASKS'; payload: QueueTask[]; revision: number }
+  | { type: 'STOP' }
+
 // ── Store 定义 ────────────────────────────────────────────────────────────────
 export const useQueueStore = defineStore('queue', () => {
 
-  // ── 核心状态（只由 Worker TICK 驱动写入，视图层只读） ──────────────────────
+  // ── 核心状态（Worker TICK 或故障降级镜像驱动；视图层只读） ────────────────
   const tasks = ref<QueueTask[]>([])
   const stats = ref<QueueStats>({ ...EMPTY_STATS })
 
   // ── 内部句柄（不暴露） ─────────────────────────────────────────────────────
-  let _worker:            Worker | null = null
+  let _stateRevision       = 0
   let _ws:                WebSocket | null = null
   let _wsReconnectTimer:  ReturnType<typeof setTimeout> | null = null
   let _wsReconnectDelay   = 1_000         // 指数退避起始值（ms）
@@ -49,45 +63,40 @@ export const useQueueStore = defineStore('queue', () => {
 
   const MAX_WS_RECONNECT_DELAY_MS = 30_000
 
+  const _workerBridge = createQueueWorkerBridge({
+    createWorker: () => new QueueWorker(),
+    readyTimeoutMs: WORKER_READY_TIMEOUT_MS,
+    getInitialState: () => ({
+      tasks: normalizeQueueSnapshot(tasks.value),
+      revision: _stateRevision,
+    }),
+    onTick: (payload: unknown) => {
+      const tick = payload as { tasks: QueueTask[]; stats: QueueStats; revision: number }
+      if (!tick || !Array.isArray(tick.tasks) || !tick.stats) return
+      if (!Number.isSafeInteger(tick.revision) || tick.revision < _stateRevision) return
+      tasks.value = tick.tasks
+      stats.value = tick.stats
+    },
+    onUnavailable: (reason: string) => {
+      console.warn(`[QueueStore] Worker unavailable (${reason}); main-thread queue state remains active.`)
+    },
+  })
+
+  function _postToReadyWorker(message: QueueWorkerInboundMessage): boolean {
+    return _workerBridge.post(message)
+  }
+
   // ── Worker 初始化 ──────────────────────────────────────────────────────────
   /**
    * 必须在组件 setup / onMounted 中显式调用，否则 Worker 不会启动。
    * 多次调用安全，内部有幂等保护。
    */
   function initWorker(): void {
-    if (_worker) return
-
     if (typeof Worker === 'undefined') {
       console.warn('[QueueStore] 当前环境不支持 Web Worker，降级为直接状态更新。')
       return
     }
-
-    _worker = new Worker(
-      // Vite 特有语法：编译时会将 Worker 文件打包成独立 chunk
-      new URL('../workers/queueWorker.ts', import.meta.url),
-      { type: 'module' }
-    )
-
-    _worker.onmessage = (event: MessageEvent) => {
-      const { type, payload } = (event.data ?? {}) as {
-        type: string
-        payload?: { tasks: QueueTask[]; stats: QueueStats }
-      }
-
-      if (type === 'TICK' && payload) {
-        // 直接覆盖 —— Worker 是真相的唯一来源，无需深度 merge
-        tasks.value = payload.tasks
-        stats.value = payload.stats
-      }
-    }
-
-    _worker.onerror = (err: ErrorEvent) => {
-      console.error('[QueueStore] Worker 运行时错误:', err.message, err)
-    }
-
-    _worker.onmessageerror = (err: MessageEvent) => {
-      console.error('[QueueStore] Worker 消息序列化错误:', err)
-    }
+    _workerBridge.start()
   }
 
   // ── WebSocket 桥接 ─────────────────────────────────────────────────────────
@@ -139,13 +148,18 @@ export const useQueueStore = defineStore('queue', () => {
         return
       }
 
-      if (_worker) {
-        // Worker 可用时仍由 Worker 独占分发，避免主线程重复写 task state。
-        _worker.postMessage(envelope)
-      } else if (envelope.type === 'WS_UPDATE') {
-        // Worker 不可用时仅接管现有任务更新；其他事件类型保持原有忽略行为。
+      if (envelope.type === 'WS_UPDATE') {
+        // Always retain a deduplicated main-thread mirror so a later Worker load,
+        // runtime, or message failure cannot discard an accepted task update.
         const payload = envelope.payload as WsUpdatePayload
-        if (payload?.taskId) _fallbackUpdate(payload)
+        if (payload?.taskId) {
+          _fallbackUpdate(payload)
+          _postToReadyWorker({
+            type: 'WS_UPDATE',
+            payload,
+            revision: _stateRevision,
+          })
+        }
       }
     }
 
@@ -237,12 +251,8 @@ export const useQueueStore = defineStore('queue', () => {
   function pushTaskUpdate(payload: WsUpdatePayload): void {
     if (!payload?.taskId) return
 
-    if (_worker) {
-      _worker.postMessage({ type: 'WS_UPDATE', payload })
-    } else {
-      // Worker 不可用时的降级：直接在主线程做最小化状态更新
-      _fallbackUpdate(payload)
-    }
+    _fallbackUpdate(payload)
+    _postToReadyWorker({ type: 'WS_UPDATE', payload, revision: _stateRevision })
   }
 
   /**
@@ -251,64 +261,25 @@ export const useQueueStore = defineStore('queue', () => {
   function initTasks(initialTasks: QueueTask[]): void {
     if (!Array.isArray(initialTasks)) return
 
-    if (_worker) {
-      _worker.postMessage({ type: 'INIT_TASKS', payload: initialTasks })
-    } else {
-      tasks.value = initialTasks
-    }
+    tasks.value = normalizeQueueSnapshot(initialTasks)
+    stats.value = computeQueueStats(tasks.value)
+    _stateRevision += 1
+    _postToReadyWorker({
+      type: 'INIT_TASKS',
+      payload: tasks.value,
+      revision: _stateRevision,
+    })
   }
 
   // ── 降级逻辑（Worker 不可用时） ────────────────────────────────────────────
   function _fallbackUpdate(payload: WsUpdatePayload): void {
-    const existing = tasks.value.find(t => t.id === payload.taskId)
-    const coverageDiagnostics = normalizeCoverageDiagnostics(payload.coverageDiagnostics)
-    if (existing) {
-      existing.type = payload.status
-      if (payload.assets?.length) existing.assets = payload.assets
-      if (payload.partial !== undefined) existing.partial = payload.partial
-      if (payload.requestedCount !== undefined) existing.requestedCount = payload.requestedCount
-      if (payload.plannedCount !== undefined) existing.plannedCount = payload.plannedCount
-      if (payload.succeededCount !== undefined) existing.succeededCount = payload.succeededCount
-      if (payload.failedCount !== undefined) existing.failedCount = payload.failedCount
-      if (payload.historyPersisted !== undefined) existing.historyPersisted = payload.historyPersisted
-      if (Array.isArray(payload.warningCodes)) existing.warningCodes = [...payload.warningCodes]
-      if (coverageDiagnostics) existing.coverageDiagnostics = coverageDiagnostics
-    } else {
-      const now = new Date()
-      const ts  = now.toLocaleTimeString('zh', {
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-      })
-      tasks.value.unshift({
-        id:        payload.taskId,
-        type:      payload.status ?? 'pending',
-        prompt:    payload.prompt ?? '',
-        ts,
-        startTime: payload.startTime ?? Date.now(),
-        startTs:   ts,
-        assets:    payload.assets ?? [],
-        partial: payload.partial,
-        requestedCount: payload.requestedCount,
-        plannedCount: payload.plannedCount,
-        succeededCount: payload.succeededCount,
-        failedCount: payload.failedCount,
-        historyPersisted: payload.historyPersisted,
-        warningCodes: Array.isArray(payload.warningCodes) ? [...payload.warningCodes] : undefined,
-        coverageDiagnostics,
-      })
-    }
-
-    // 同步更新统计（简化版，不含 ETA）
-    const counts = tasks.value.reduce(
-      (acc, t) => { acc[t.type] = (acc[t.type] ?? 0) + 1; return acc },
-      {} as Record<string, number>
-    )
-    stats.value = {
-      totalPending:         counts['pending']   ?? 0,
-      totalRunning:         counts['running']   ?? 0,
-      totalCompleted:       counts['completed'] ?? 0,
-      totalFailed:          counts['failed']    ?? 0,
-      estimatedETA_seconds: 0,
-    }
+    tasks.value = applyQueueUpdate(
+      tasks.value,
+      payload,
+      normalizeCoverageDiagnostics(payload.coverageDiagnostics),
+    ) as QueueTask[]
+    stats.value = computeQueueStats(tasks.value)
+    _stateRevision += 1
   }
 
   // ── 清理（路由离开或应用卸载时调用） ───────────────────────────────────────
@@ -326,14 +297,7 @@ export const useQueueStore = defineStore('queue', () => {
 
     // 2. 先摘掉 Worker 的所有消息回调，再发 STOP 并 terminate。
     //    这样在 terminate 返回前不会有任何 TICK 写入 tasks/stats。
-    if (_worker) {
-      _worker.onmessage      = null
-      _worker.onerror        = null
-      _worker.onmessageerror = null
-      _worker.postMessage({ type: 'STOP' })
-      _worker.terminate()
-      _worker = null
-    }
+    _workerBridge.stop()
 
     // 3. 先摘掉 WebSocket 的所有事件钩子，再关闭连接。
     //    摘掉 onclose 可阻断 _scheduleWsReconnect 的触发链。
@@ -349,6 +313,7 @@ export const useQueueStore = defineStore('queue', () => {
     // 4. 回调全部屏蔽后，安全地清空响应式状态
     tasks.value = []
     stats.value = { ...EMPTY_STATS }
+    _stateRevision = 0
   }
 
   return {

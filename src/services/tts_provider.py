@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -34,6 +35,9 @@ TOTAL_TTS_BUDGET_SECONDS = 180.0
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (1.0, 2.0)
 RETRY_AFTER_CAP_SECONDS = 30.0
+MAX_SAFE_ERROR_BODY_BYTES = 8192
+MAX_SAFE_PROVIDER_TOKEN_LENGTH = 64
+MAX_SAFE_REQUEST_ID_LENGTH = 128
 
 # Owner-frozen RC2 provider policy.  These provider-specific IDs are neither
 # persisted nor exposed as WorkflowContext/application settings.
@@ -46,16 +50,72 @@ ELEVENLABS_VOICE_MAP: Mapping[str, str] = MappingProxyType(
 
 _SIGNED_PERCENT = re.compile(r"^[+-]\d+%$")
 _VOICE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_PROVIDER_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_SAFE_PROVIDER_ERROR_TYPES = frozenset(
+    {
+        "authentication_error",
+        "authorization_error",
+        "conflict",
+        "internal_error",
+        "invalid_request",
+        "not_found",
+        "payment_required",
+        "rate_limit_error",
+        "service_unavailable",
+        "validation_error",
+    }
+)
+_SAFE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "concurrent_limit_exceeded",
+        "feature_not_available",
+        "forbidden",
+        "insufficient_credits",
+        "insufficient_permissions",
+        "internal_error",
+        "invalid_api_key",
+        "invalid_authorization_header",
+        "maintenance",
+        "missing_api_key",
+        "model_access_denied",
+        "rate_limit_exceeded",
+        "service_unavailable",
+        "sign_in_required",
+        "subscription_required",
+        "system_busy",
+        "unauthorized",
+        "voice_access_denied",
+        "workspace_access_denied",
+    }
+)
+_SAFE_PROVIDER_LEGACY_STATUSES = frozenset(
+    {
+        "concurrent_limit_exceeded",
+        "insufficient_credits",
+        "invalid_api_key",
+        "max_character_limit_exceeded",
+        "missing_api_key",
+        "quota_exceeded",
+        "rate_limit_exceeded",
+        "system_busy",
+        "too_many_concurrent_requests",
+        "voice_not_found",
+    }
+)
 
 
 class TTSErrorCode(str, Enum):
     AUTH_ERROR = "TTS_AUTH_ERROR"
+    PAYMENT_REQUIRED = "TTS_PAYMENT_REQUIRED"
+    AUTHORIZATION_ERROR = "TTS_AUTHORIZATION_ERROR"
     CREDENTIAL_MISSING = "TTS_CREDENTIAL_MISSING"
     CONFIG_ERROR = "TTS_CONFIG_ERROR"
     INVALID_INPUT = "TTS_INVALID_INPUT"
     UNSUPPORTED_LANGUAGE = "TTS_UNSUPPORTED_LANGUAGE"
     UNSUPPORTED_VOICE = "TTS_UNSUPPORTED_VOICE"
     RATE_LIMITED = "TTS_RATE_LIMITED"
+    CONCURRENCY_LIMITED = "TTS_CONCURRENCY_LIMITED"
     TIMEOUT = "TTS_TIMEOUT"
     NETWORK_ERROR = "TTS_NETWORK_ERROR"
     PROVIDER_5XX = "TTS_PROVIDER_5XX"
@@ -74,12 +134,20 @@ class TTSProviderError(RuntimeError):
         retryable: bool,
         retry_after_seconds: float | None = None,
         safe_status: int | None = None,
+        provider_error_type: str | None = None,
+        provider_error_code: str | None = None,
+        provider_legacy_status: str | None = None,
+        provider_request_id: str | None = None,
     ) -> None:
         super().__init__(code.value)
         self.code = code
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
         self.safe_status = safe_status
+        self.provider_error_type = provider_error_type
+        self.provider_error_code = provider_error_code
+        self.provider_legacy_status = provider_legacy_status
+        self.provider_request_id = provider_request_id
 
 
 @dataclass(frozen=True)
@@ -216,6 +284,75 @@ def alignment_to_vtt(text: str, alignment: object) -> tuple[str, int]:
     return "\n".join(lines), len(cues)
 
 
+def _allowlisted_provider_token(value: object, allowed: frozenset[str]) -> str | None:
+    if not isinstance(value, str) or len(value) > MAX_SAFE_PROVIDER_TOKEN_LENGTH:
+        return None
+    if not _SAFE_PROVIDER_TOKEN.fullmatch(value) or value not in allowed:
+        return None
+    return value
+
+
+def _safe_provider_error_details(content: bytes) -> dict[str, str]:
+    """Extract only bounded, allowlisted provider diagnostics from an error."""
+    if not content or len(content) > MAX_SAFE_ERROR_BODY_BYTES:
+        return {}
+    try:
+        payload = json.loads(content.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    detail = payload.get("detail")
+    if not isinstance(detail, dict):
+        return {}
+
+    safe: dict[str, str] = {}
+    error_type = _allowlisted_provider_token(
+        detail.get("type"),
+        _SAFE_PROVIDER_ERROR_TYPES,
+    )
+    if error_type is not None:
+        safe["provider_error_type"] = error_type
+    error_code = _allowlisted_provider_token(
+        detail.get("code"),
+        _SAFE_PROVIDER_ERROR_CODES,
+    )
+    if error_code is not None:
+        safe["provider_error_code"] = error_code
+    legacy_status = _allowlisted_provider_token(
+        detail.get("status"),
+        _SAFE_PROVIDER_LEGACY_STATUSES,
+    )
+    if legacy_status is not None:
+        safe["provider_legacy_status"] = legacy_status
+
+    request_id = detail.get("request_id")
+    if (
+        isinstance(request_id, str)
+        and len(request_id) <= MAX_SAFE_REQUEST_ID_LENGTH
+        and _SAFE_REQUEST_ID.fullmatch(request_id)
+    ):
+        safe["provider_request_id"] = request_id
+    return safe
+
+
+async def _read_bounded_error_body(response: httpx.Response) -> bytes:
+    raw_content_length = response.headers.get("Content-Length")
+    if raw_content_length is not None:
+        if not raw_content_length.isdigit():
+            return b""
+        declared_length = int(raw_content_length)
+        if declared_length > MAX_SAFE_ERROR_BODY_BYTES:
+            return b""
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > MAX_SAFE_ERROR_BODY_BYTES:
+            return b""
+        body.extend(chunk)
+    return bytes(body)
+
+
 def _bounded_retry_after(response: httpx.Response) -> float | None:
     raw = response.headers.get("Retry-After")
     if raw is None:
@@ -253,28 +390,64 @@ class ElevenLabsProvider:
             raise TTSProviderError(TTSErrorCode.UNSUPPORTED_VOICE, retryable=False)
         return voice_id
 
-    def _map_http_error(self, response: httpx.Response) -> TTSProviderError:
+    def _map_http_error(
+        self,
+        response: httpx.Response,
+        error_body: bytes,
+    ) -> TTSProviderError:
         status = response.status_code
+        safe_details = _safe_provider_error_details(error_body)
         if status == 401:
-            return TTSProviderError(TTSErrorCode.AUTH_ERROR, retryable=False, safe_status=status)
+            return TTSProviderError(
+                TTSErrorCode.AUTH_ERROR,
+                retryable=False,
+                safe_status=status,
+                **safe_details,
+            )
+        if status == 402:
+            return TTSProviderError(
+                TTSErrorCode.PAYMENT_REQUIRED,
+                retryable=False,
+                safe_status=status,
+                **safe_details,
+            )
+        if status == 403:
+            return TTSProviderError(
+                TTSErrorCode.AUTHORIZATION_ERROR,
+                retryable=False,
+                safe_status=status,
+                **safe_details,
+            )
         if status == 404:
             return TTSProviderError(
                 TTSErrorCode.UNSUPPORTED_VOICE,
                 retryable=False,
                 safe_status=status,
+                **safe_details,
             )
         if status in {400, 422}:
             return TTSProviderError(
                 TTSErrorCode.INVALID_INPUT,
                 retryable=False,
                 safe_status=status,
+                **safe_details,
             )
         if status == 429:
+            concurrency_limited = (
+                safe_details.get("provider_error_code") == "concurrent_limit_exceeded"
+                or safe_details.get("provider_legacy_status")
+                in {"concurrent_limit_exceeded", "too_many_concurrent_requests"}
+            )
             return TTSProviderError(
-                TTSErrorCode.RATE_LIMITED,
+                (
+                    TTSErrorCode.CONCURRENCY_LIMITED
+                    if concurrency_limited
+                    else TTSErrorCode.RATE_LIMITED
+                ),
                 retryable=True,
                 retry_after_seconds=_bounded_retry_after(response),
                 safe_status=status,
+                **safe_details,
             )
         if status in {500, 502, 503, 504}:
             retry_after = _bounded_retry_after(response) if status == 503 else None
@@ -283,14 +456,21 @@ class ElevenLabsProvider:
                 retryable=True,
                 retry_after_seconds=retry_after,
                 safe_status=status,
+                **safe_details,
             )
         if 400 <= status < 600:
             return TTSProviderError(
                 TTSErrorCode.PROVIDER_REJECTED,
                 retryable=False,
                 safe_status=status,
+                **safe_details,
             )
-        return TTSProviderError(TTSErrorCode.INTERNAL_ERROR, retryable=False)
+        return TTSProviderError(
+            TTSErrorCode.INTERNAL_ERROR,
+            retryable=False,
+            safe_status=status,
+            **safe_details,
+        )
 
     async def _request_and_write(self, request: TTSProviderRequest) -> TTSProviderResult:
         if not request.text or not request.text.strip():
@@ -314,7 +494,8 @@ class ElevenLabsProvider:
                 trust_env=False,
                 transport=self._transport,
             ) as client:
-                response = await client.post(
+                async with client.stream(
+                    "POST",
                     url,
                     params={"output_format": ELEVENLABS_OUTPUT_FORMAT},
                     headers={
@@ -327,14 +508,16 @@ class ElevenLabsProvider:
                         "model_id": ELEVENLABS_MODEL_ID,
                         "voice_settings": {"speed": speed},
                     },
-                )
+                ) as response:
+                    if response.status_code != 200:
+                        error_body = await _read_bounded_error_body(response)
+                        raise self._map_http_error(response, error_body)
+                    await response.aread()
         except httpx.TimeoutException:
             raise TTSProviderError(TTSErrorCode.TIMEOUT, retryable=True) from None
         except httpx.RequestError:
             raise TTSProviderError(TTSErrorCode.NETWORK_ERROR, retryable=True) from None
 
-        if response.status_code != 200:
-            raise self._map_http_error(response)
         try:
             payload = response.json()
         except (ValueError, TypeError):
