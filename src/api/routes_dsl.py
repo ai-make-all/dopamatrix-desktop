@@ -3023,7 +3023,14 @@ def render_worker(
         if render_ok and collected_assets:
             return _result("succeeded")
         if not render_ok:
-            return _result("failed", "RENDER_FAILED", "compositor did not complete")
+            render_failure_code = str(
+                context.config.get("render_failure_code") or "RENDER_FAILED"
+            )
+            return _result(
+                "failed",
+                render_failure_code,
+                "compositor did not complete",
+            )
         return _result("failed", "NO_FINAL_OUTPUT", "render produced no final output")
 
     except Exception as exc:
@@ -4277,7 +4284,11 @@ def _run_compositor(
     try:
         compositor.execute(context)
         return True
-    except Exception:
+    except Exception as exc:
+        failure_code = getattr(exc, "code", None)
+        context.config["render_failure_code"] = (
+            str(failure_code) if failure_code else "RENDER_FAILED"
+        )
         logger.exception(
             "[_run_compositor] FFmpeg 渲染失败 task_id=%s execution_id=%s "
             "child_index=%s file_sid=%s",

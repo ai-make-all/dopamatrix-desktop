@@ -91,6 +91,11 @@ class TTSPipelineIntegrationTests(unittest.TestCase):
                     patch("src.nodes.compositor.get_ffmpeg_path", return_value="ffmpeg"),
                     patch("src.nodes.compositor.subprocess.Popen", FakePopen),
                     patch.object(compositor, "_probe_duration", return_value=1.0),
+                    patch.object(
+                        compositor,
+                        "_validate_final_output",
+                        return_value=None,
+                    ),
                 ):
                     compositor.execute(context)
 

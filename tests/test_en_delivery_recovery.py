@@ -50,6 +50,15 @@ class _SuccessfulPopen:
 
 
 class ENDeliveryRecoveryUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        postcondition = patch.object(
+            FFmpegCompositorNode,
+            "_validate_final_output",
+            return_value=None,
+        )
+        postcondition.start()
+        self.addCleanup(postcondition.stop)
+
     def test_single_clip_is_normalized_and_frozen_to_target(self) -> None:
         node = FFmpegCompositorNode()
         node.target_w, node.target_h = (720, 1280)
@@ -127,8 +136,13 @@ class ENDeliveryRecoveryUnitTests(unittest.TestCase):
             node = FFmpegCompositorNode()
             node._ws_broadcast = lambda *_args, **_kwargs: None
 
-            with patch("src.nodes.compositor.subprocess.Popen", _SuccessfulPopen):
+            with (
+                patch.object(node, "_probe_duration") as probe,
+                patch("src.nodes.compositor.subprocess.Popen", _SuccessfulPopen),
+            ):
                 node._render_variant(context, str(master), "ffmpeg")
+
+            probe.assert_not_called()
 
         command = _SuccessfulPopen.commands[0]
         filter_complex = command[command.index("-filter_complex") + 1]
@@ -162,10 +176,14 @@ class ENDeliveryRecoveryUnitTests(unittest.TestCase):
             node._ws_broadcast = lambda *_args, **_kwargs: None
 
             with (
-                patch.object(node, "_probe_duration", return_value=4.0),
+                patch.object(node, "_probe_duration", return_value=4.0) as probe,
                 patch("src.nodes.compositor.subprocess.Popen", _SuccessfulPopen),
             ):
                 node._render_variant(context, str(master), "ffmpeg")
+
+            self.assertEqual(probe.call_count, 1)
+            self.assertEqual(probe.call_args.args[0], str(voice))
+            self.assertEqual(probe.call_args.kwargs["role"], "VOICE")
 
         command = _SuccessfulPopen.commands[0]
         joined = " ".join(command)
@@ -193,7 +211,7 @@ class ENDeliveryRecoveryUnitTests(unittest.TestCase):
             node = FFmpegCompositorNode()
             node._ws_broadcast = lambda *_args, **_kwargs: None
 
-            def duration_for(path: str) -> float:
+            def duration_for(path: str, **_kwargs) -> float:
                 return 15.0 if path == str(master) else 2.0
 
             with (
@@ -379,6 +397,32 @@ class ENDeliveryRecoveryUnitTests(unittest.TestCase):
 
             probe.assert_not_called()
             self.assertNotIn(str(voice), _SuccessfulPopen.commands[0])
+
+    def test_multi_clip_without_voice_does_not_probe_master(self) -> None:
+        _SuccessfulPopen.commands = []
+        with tempfile.TemporaryDirectory() as directory:
+            master = Path(directory) / "master.mp4"
+            master.write_bytes(b"master")
+            context = WorkflowContext(task_id="multi-no-voice", target_duration=15)
+            context.set_asset(
+                "timeline",
+                _video_timeline(
+                    Clip("first.mp4", 0.0, 7.0),
+                    Clip("second.mp4", 7.0, 8.0),
+                ),
+            )
+            context.variants = {"en": {}}
+            node = FFmpegCompositorNode()
+            node._compiled_media_duration = 15.0
+            node._ws_broadcast = lambda *_args, **_kwargs: None
+
+            with (
+                patch.object(node, "_probe_duration") as probe,
+                patch("src.nodes.compositor.subprocess.Popen", _SuccessfulPopen),
+            ):
+                node._render_variant(context, str(master), "ffmpeg")
+
+            probe.assert_not_called()
 
 
 class ENDeliveryRecoveryRealFFmpegTests(unittest.TestCase):

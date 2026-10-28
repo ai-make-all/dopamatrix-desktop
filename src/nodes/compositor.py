@@ -1,12 +1,17 @@
 import hashlib
+import json
 import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Deque, List, Optional, Tuple
 
 # 隐藏 Windows 下 FFmpeg 子进程的黑色控制台窗口
 _WIN_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -17,6 +22,73 @@ from src.core.context import WorkflowContext
 from src.core.logger import logger
 from src.core.timeline import Clip, Timeline, Track
 from src.utils.env_utils import get_ffmpeg_path
+
+
+_MEDIA_STDOUT_LIMIT = 64 * 1024
+_MEDIA_STDERR_LIMIT = 8 * 1024
+_MEDIA_POLL_INTERVAL_SECONDS = 0.05
+_MEDIA_TERMINATE_GRACE_SECONDS = 3.0
+_FFPROBE_TIMEOUT_SECONDS = 15.0
+_RENDER_TIMEOUT_MIN_SECONDS = 120.0
+_RENDER_TIMEOUT_OVERHEAD_SECONDS = 60.0
+_RENDER_TIMEOUT_PER_MEDIA_SECOND = 12.0
+_RENDER_TIMEOUT_MAX_SECONDS = 900.0
+
+
+class _BoundedTextBuffer:
+    """Thread-safe trailing text buffer with a strict character ceiling."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(int(limit), 0)
+        self._parts: Deque[str] = deque()
+        self._length = 0
+        self._lock = threading.Lock()
+
+    def append(self, value: str) -> None:
+        if self._limit == 0 or not value:
+            return
+        with self._lock:
+            self._parts.append(value)
+            self._length += len(value)
+            while self._length > self._limit and self._parts:
+                overflow = self._length - self._limit
+                head = self._parts[0]
+                if len(head) <= overflow:
+                    self._parts.popleft()
+                    self._length -= len(head)
+                else:
+                    self._parts[0] = head[overflow:]
+                    self._length -= overflow
+
+    def getvalue(self) -> str:
+        with self._lock:
+            return "".join(self._parts)
+
+
+@dataclass(frozen=True)
+class _MediaProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    elapsed_seconds: float
+
+
+class _MediaProcessFailure(RuntimeError):
+    """Safe, typed failure propagated from one bounded media subprocess."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        stage: str,
+        returncode: Optional[int] = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.stage = stage
+        self.returncode = returncode
+        self.stderr = stderr[-_MEDIA_STDERR_LIMIT:]
 
 
 class FFmpegCompositorNode(BaseNode):
@@ -152,16 +224,367 @@ class FFmpegCompositorNode(BaseNode):
         """True for routes_dsl children whose task terminal is finalized upstream."""
         return context.config.get("ws_terminal_managed_by_coordinator") is True
 
+    @staticmethod
+    def _render_timeout_seconds(media_duration: float) -> float:
+        """Return a bounded encoding budget derived from the real media duration."""
+        duration = max(float(media_duration or 0.0), 1.0)
+        calculated = (
+            _RENDER_TIMEOUT_OVERHEAD_SECONDS
+            + duration * _RENDER_TIMEOUT_PER_MEDIA_SECOND
+        )
+        return min(
+            max(calculated, _RENDER_TIMEOUT_MIN_SECONDS),
+            _RENDER_TIMEOUT_MAX_SECONDS,
+        )
+
+    @staticmethod
+    def _identity_fields(context: WorkflowContext) -> str:
+        return (
+            f"task_id={context.task_id} "
+            f"execution_id={context.config.get('execution_id')} "
+            f"child_index={context.config.get('child_index')} "
+            f"file_sid={context.config.get('file_sid')}"
+        )
+
+    @staticmethod
+    def _safe_stderr_excerpt(stderr: str, limit: int = 800) -> str:
+        """Keep diagnostics finite and single-line without exposing process state."""
+        safe = "".join(
+            char if char.isprintable() and char not in "\r\n" else " "
+            for char in (stderr or "")
+        )
+        safe = " ".join(safe.split())
+        safe = re.sub(
+            r"(?i)\b(authorization|xi-api-key|api[_-]?key|access[_-]?token|token)"
+            r"\s*[:=]\s*[^\s,;]+",
+            r"\1=[REDACTED]",
+            safe,
+        )
+        safe = re.sub(
+            r"(?i)\bbearer\s+[^\s,;]+",
+            "Bearer [REDACTED]",
+            safe,
+        )
+        return safe[-max(int(limit), 0):]
+
+    def _log_media_stage(
+        self,
+        context: WorkflowContext,
+        stage: str,
+        *,
+        elapsed_seconds: Optional[float] = None,
+        failure_code: Optional[str] = None,
+        returncode: Optional[int] = None,
+        role: Optional[str] = None,
+        extra: str = "",
+    ) -> None:
+        fields = [
+            "[FINAL_RENDER]",
+            f"stage={stage}",
+            self._identity_fields(context),
+        ]
+        if role:
+            fields.append(f"role={role}")
+        if elapsed_seconds is not None:
+            fields.append(f"elapsed_ms={int(max(elapsed_seconds, 0.0) * 1000)}")
+        if failure_code:
+            fields.append(f"failure_code={failure_code}")
+        if returncode is not None:
+            fields.append(f"returncode={returncode}")
+        if extra:
+            fields.append(extra)
+        logger.info(" ".join(fields))
+
+    @staticmethod
+    def _stop_and_reap_process(proc: subprocess.Popen, grace_seconds: float) -> None:
+        """Terminate, escalate to kill, and reap one already-created process."""
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise _MediaProcessFailure(
+                "MEDIA_PROCESS_REAP_TIMEOUT",
+                stage="PROCESS_CLEANUP",
+            ) from exc
+
+    def _run_bounded_media_process(
+        self,
+        command: List[str],
+        *,
+        context: WorkflowContext,
+        process_kind: str,
+        timeout_seconds: float,
+        started_stage: Optional[str] = None,
+        exited_stage: Optional[str] = None,
+        on_stdout_line: Optional[Callable[[str], None]] = None,
+    ) -> _MediaProcessResult:
+        """
+        Run one created media process without blocking on a pipe iterator.
+
+        Windows process creation itself is synchronous and cannot be made an
+        absolute deadline without risking a late-created orphan. The caller logs
+        before entry; STARTED is logged only after Popen returns successfully.
+        """
+        started_at = time.monotonic()
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=_WIN_NO_WINDOW,
+            )
+        except Exception as exc:
+            raise _MediaProcessFailure(
+                f"{process_kind}_CREATE_FAILED",
+                stage="PROCESS_CREATE",
+            ) from exc
+
+        if started_stage:
+            self._log_media_stage(
+                context,
+                started_stage,
+                elapsed_seconds=time.monotonic() - started_at,
+                extra=f"pid={getattr(proc, 'pid', 'NOT_AVAILABLE')}",
+            )
+
+        stdout_tail = _BoundedTextBuffer(_MEDIA_STDOUT_LIMIT)
+        stderr_tail = _BoundedTextBuffer(_MEDIA_STDERR_LIMIT)
+        stdout_events: "queue.Queue[str]" = queue.Queue()
+
+        def _drain_stdout(pipe) -> None:
+            if pipe is None:
+                return
+            for line in pipe:
+                stdout_tail.append(line)
+                if on_stdout_line is not None:
+                    stdout_events.put(line)
+
+        def _drain_stderr(pipe) -> None:
+            if pipe is None:
+                return
+            for line in pipe:
+                stderr_tail.append(line)
+
+        stdout_thread = threading.Thread(
+            target=_drain_stdout, args=(proc.stdout,), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(proc.stderr,), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        deadline = started_at + max(float(timeout_seconds), 0.001)
+        cancel_event = context.config.get("render_cancel_event")
+        failure_code: Optional[str] = None
+
+        def _deliver_stdout_events() -> Optional[str]:
+            while True:
+                try:
+                    stdout_line = stdout_events.get_nowait()
+                except queue.Empty:
+                    return None
+                if on_stdout_line is None:
+                    continue
+                try:
+                    on_stdout_line(stdout_line)
+                except Exception:
+                    return f"{process_kind}_PROGRESS_CALLBACK_FAILED"
+
+        while True:
+            callback_failure = _deliver_stdout_events()
+            if callback_failure is not None:
+                failure_code = callback_failure
+                break
+
+            poll = getattr(proc, "poll", None)
+            if callable(poll):
+                returncode = poll()
+            else:  # Compatibility for deterministic legacy test doubles only.
+                returncode = getattr(proc, "returncode", None)
+            if returncode is not None:
+                break
+            if (
+                cancel_event is not None
+                and callable(getattr(cancel_event, "is_set", None))
+                and cancel_event.is_set()
+            ):
+                failure_code = f"{process_kind}_CANCELLED"
+                break
+            if time.monotonic() >= deadline:
+                failure_code = f"{process_kind}_TIMEOUT"
+                break
+            time.sleep(_MEDIA_POLL_INTERVAL_SECONDS)
+
+        cleanup_failure: Optional[_MediaProcessFailure] = None
+        if failure_code is not None:
+            try:
+                self._stop_and_reap_process(proc, _MEDIA_TERMINATE_GRACE_SECONDS)
+            except _MediaProcessFailure as exc:
+                # Continue through pipe closure even when the operating system
+                # does not confirm that the killed process was reaped.  The
+                # explicit cleanup failure remains the authoritative result.
+                cleanup_failure = exc
+                failure_code = exc.code
+
+        # Reap an exited process and let both pipe readers observe EOF.
+        if failure_code is None:
+            proc.wait()
+        stdout_thread.join(timeout=_MEDIA_TERMINATE_GRACE_SECONDS)
+        stderr_thread.join(timeout=_MEDIA_TERMINATE_GRACE_SECONDS)
+        if stdout_thread.is_alive() or stderr_thread.is_alive():
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except Exception:
+                    pass
+            stdout_thread.join(timeout=_MEDIA_TERMINATE_GRACE_SECONDS)
+            stderr_thread.join(timeout=_MEDIA_TERMINATE_GRACE_SECONDS)
+            failure_code = failure_code or f"{process_kind}_PIPE_DRAIN_TIMEOUT"
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except Exception:
+                pass
+
+        callback_failure = _deliver_stdout_events()
+        if callback_failure is not None and failure_code is None:
+            failure_code = callback_failure
+
+        elapsed = time.monotonic() - started_at
+        raw_returncode = getattr(proc, "returncode", None)
+        returncode = int(raw_returncode) if raw_returncode is not None else -1
+        if exited_stage:
+            self._log_media_stage(
+                context,
+                exited_stage,
+                elapsed_seconds=elapsed,
+                failure_code=failure_code,
+                returncode=returncode,
+            )
+        if failure_code is not None:
+            raise _MediaProcessFailure(
+                failure_code,
+                stage=(
+                    cleanup_failure.stage
+                    if cleanup_failure is not None
+                    else exited_stage or process_kind
+                ),
+                returncode=returncode,
+                stderr=stderr_tail.getvalue(),
+            )
+        return _MediaProcessResult(
+            returncode=returncode,
+            stdout=stdout_tail.getvalue(),
+            stderr=stderr_tail.getvalue(),
+            elapsed_seconds=elapsed,
+        )
+
     # ------------------------------------------------------------------
     # 核心编译器：Timeline → (input_args, video_filtergraph, audio_filtergraph)
     # ------------------------------------------------------------------
 
+    def _probe_duration(
+        self,
+        file_path: str,
+        *,
+        context: WorkflowContext,
+        role: str,
+    ) -> float:
+        """
+        Probe one required Final-stage media duration or raise a typed failure.
+
+        Unlike the timeline planner's explicit nominal-duration fallback, this
+        preflight is fail-closed and always emits bounded structured evidence.
+        """
+        probe_stage = f"PROBE_{role.upper()}"
+        started_at = time.monotonic()
+        self._log_media_stage(context, f"{probe_stage}_START", role=role)
+        try:
+            try:
+                ffprobe_bin = get_ffmpeg_path("ffprobe.exe")
+            except Exception as exc:
+                raise _MediaProcessFailure(
+                    "FFPROBE_PATH_RESOLUTION_FAILED",
+                    stage=probe_stage,
+                ) from exc
+            result = self._run_bounded_media_process(
+                [
+                    ffprobe_bin,
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                context=context,
+                process_kind="FFPROBE",
+                timeout_seconds=_FFPROBE_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                raise _MediaProcessFailure(
+                    "FFPROBE_NONZERO_EXIT",
+                    stage=probe_stage,
+                    returncode=result.returncode,
+                    stderr=result.stderr,
+                )
+            val = result.stdout.strip()
+            try:
+                duration = float(val)
+            except (TypeError, ValueError) as exc:
+                raise _MediaProcessFailure(
+                    "FFPROBE_RESULT_INVALID",
+                    stage=probe_stage,
+                    returncode=result.returncode,
+                ) from exc
+            if duration <= 0:
+                raise _MediaProcessFailure(
+                    "FFPROBE_RESULT_INVALID",
+                    stage=probe_stage,
+                    returncode=result.returncode,
+                )
+            self._log_media_stage(
+                context,
+                f"{probe_stage}_END",
+                role=role,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+            return duration
+        except _MediaProcessFailure as exc:
+            self._log_media_stage(
+                context,
+                f"{probe_stage}_FAILED",
+                role=role,
+                elapsed_seconds=time.monotonic() - started_at,
+                failure_code=exc.code,
+                returncode=exc.returncode,
+                extra=(
+                    f"stderr={self._safe_stderr_excerpt(exc.stderr)}"
+                    if exc.stderr
+                    else ""
+                ),
+            )
+            raise
+
     @staticmethod
-    def _probe_duration(file_path: str) -> float:
-        """
-        使用 ffprobe 探测媒体文件的真实时长（秒）。
-        任何异常均静默返回 0.0，由上层按名义时长兜底。
-        """
+    def _probe_duration_for_timeline(file_path: str) -> float:
+        """Best-effort planning probe; callers intentionally use nominal fallback."""
         ffprobe_bin = get_ffmpeg_path("ffprobe.exe")
         try:
             result = subprocess.run(
@@ -174,13 +597,93 @@ class FFmpegCompositorNode(BaseNode):
                 ],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=_FFPROBE_TIMEOUT_SECONDS,
                 creationflags=_WIN_NO_WINDOW,
             )
-            val = result.stdout.strip()
-            return float(val) if val else 0.0
-        except Exception:
+            if result.returncode != 0:
+                return 0.0
+            value = float(result.stdout.strip())
+            return value if value > 0 else 0.0
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError):
             return 0.0
+
+    def _validate_final_output(
+        self,
+        final_path: str,
+        *,
+        context: WorkflowContext,
+        require_audio: bool,
+    ) -> None:
+        """Enforce the Final success contract without changing media content."""
+        if not os.path.isfile(final_path):
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_MISSING",
+                stage="FINAL_POSTCONDITION",
+            )
+        try:
+            output_size = os.path.getsize(final_path)
+        except OSError as exc:
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_STAT_FAILED",
+                stage="FINAL_POSTCONDITION",
+            ) from exc
+        if output_size <= 0:
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_EMPTY",
+                stage="FINAL_POSTCONDITION",
+            )
+
+        ffprobe_bin = get_ffmpeg_path("ffprobe.exe")
+        result = self._run_bounded_media_process(
+            [
+                ffprobe_bin,
+                "-v", "error",
+                "-show_entries", "stream=codec_type",
+                "-of", "json",
+                final_path,
+            ],
+            context=context,
+            process_kind="FINAL_POSTCONDITION_PROBE",
+            timeout_seconds=_FFPROBE_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_PROBE_NONZERO_EXIT",
+                stage="FINAL_POSTCONDITION",
+                returncode=result.returncode,
+                stderr=result.stderr,
+            )
+        try:
+            payload = json.loads(result.stdout)
+            stream_types = {
+                stream.get("codec_type")
+                for stream in payload.get("streams", [])
+                if isinstance(stream, dict)
+            }
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_PROBE_INVALID",
+                stage="FINAL_POSTCONDITION",
+            ) from exc
+        if "video" not in stream_types:
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_VIDEO_STREAM_MISSING",
+                stage="FINAL_POSTCONDITION",
+            )
+        if require_audio and "audio" not in stream_types:
+            raise _MediaProcessFailure(
+                "FINAL_OUTPUT_AUDIO_STREAM_MISSING",
+                stage="FINAL_POSTCONDITION",
+            )
+
+        self._log_media_stage(
+            context,
+            "FINAL_POSTCONDITION",
+            extra=(
+                f"result=PASS bytes={output_size} "
+                f"audio_required={str(require_audio).lower()}"
+            ),
+        )
 
     @staticmethod
     def _main_video_clip_count(timeline: Optional[Timeline]) -> int:
@@ -220,7 +723,7 @@ class FFmpegCompositorNode(BaseNode):
             beat_actual_starts.append(current_time)
             actual_dur = 0.0
             if os.path.isfile(clip.file_path):
-                actual_dur = self._probe_duration(clip.file_path)
+                actual_dur = self._probe_duration_for_timeline(clip.file_path)
             if actual_dur <= 0:
                 # ffprobe 失败时退回名义时长，再退回保守值 5s
                 actual_dur = (clip.duration or 0.0) if (clip.duration or 0.0) > 0 else 5.0
@@ -267,7 +770,7 @@ class FFmpegCompositorNode(BaseNode):
         actual = (
             float(probed_duration)
             if probed_duration is not None
-            else self._probe_duration(clip.file_path)
+            else self._probe_duration_for_timeline(clip.file_path)
         )
         if actual > 0:
             return actual
@@ -432,6 +935,7 @@ class FFmpegCompositorNode(BaseNode):
         beat_actual_starts: List[float]
         total_actual_dur: float
         beat_actual_starts, total_actual_dur = self._compute_beat_timeline(_main_video_clips)
+        self._compiled_media_duration = total_actual_dur
 
         input_args: List[str] = []    # [-i file1, -i file2, ...]
         video_parts: List[str] = []   # 视频 filtergraph 语句
@@ -795,81 +1299,64 @@ class FFmpegCompositorNode(BaseNode):
         logger.info("⏳ 正在渲染最终母带，请稍候...")
         self.log("Rendering master video, please wait...")
 
-        # 6. 用 Popen 替换 subprocess.run，实现实时进度流读取
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,   # 承接 -progress pipe:1 的进度输出
-                stderr=subprocess.PIPE,   # 承接 FFmpeg 的错误/警告日志
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_WIN_NO_WINDOW,
-            )
+        # 6. Drain both pipes independently and enforce a media-duration budget.
+        total_us: int = max(int(context.target_duration * 1_000_000), 1)
+        _last_ws_time: float = 0.0
+        _last_pct: int = -1
 
-            # ── stderr 独立线程消费，防止缓冲区满导致子进程死锁 ──────────────
-            _stderr_lines: List[str] = []
-
-            def _drain_stderr(pipe) -> None:
-                for line in pipe:
-                    _stderr_lines.append(line)
-
-            _stderr_thread = threading.Thread(
-                target=_drain_stderr, args=(proc.stderr,), daemon=True
-            )
-            _stderr_thread.start()
-
-            # ── 逐行解析 -progress 输出，计算并推送实时进度 ──────────────────
-            # out_time_us: FFmpeg ≥ 4.x 输出的已渲染微秒数（精度优于 out_time_ms）
-            # 总时长以 context.target_duration 为基准（秒 → 微秒），最小值 1 防零除
-            total_us: int = max(context.target_duration * 1_000_000, 1)
-            _last_ws_time: float = 0.0   # 上次广播的 monotonic 时间戳
-            _last_pct: int = -1          # 上次广播的进度百分比
-
-            for raw_line in proc.stdout:
-                line = raw_line.strip()
-                if not line.startswith("out_time_us="):
-                    continue
-                try:
-                    elapsed_us = int(line.split("=", 1)[1])
-                except ValueError:
-                    continue
-
-                pct = min(int(elapsed_us * 100 / total_us), 99)  # 99 封顶；completed 由 coordinator 推送
-                now = time.monotonic()
-                # 限速规则：两次广播间隔 ≥ 1s，或进度跳变 ≥ 5%（防止高频刷屏）
-                if now - _last_ws_time >= 1.0 or pct - _last_pct >= 5:
-                    self._ws_broadcast(task_id, user_id, {"status": "running", "progress": pct})
-                    _last_ws_time = now
-                    _last_pct = pct
-
-            proc.wait()
-            _stderr_thread.join(timeout=10)
-            stderr_output = "".join(_stderr_lines)
-
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    proc.returncode, cmd, stderr=stderr_output
+        def _master_progress(raw_line: str) -> None:
+            nonlocal _last_ws_time, _last_pct
+            line = raw_line.strip()
+            if not line.startswith("out_time_us="):
+                return
+            try:
+                elapsed_us = int(line.split("=", 1)[1])
+            except ValueError:
+                return
+            pct = min(int(elapsed_us * 100 / total_us), 99)
+            now = time.monotonic()
+            if now - _last_ws_time >= 1.0 or pct - _last_pct >= 5:
+                self._ws_broadcast(
+                    task_id,
+                    user_id,
+                    {"status": "running", "progress": pct},
                 )
+                _last_ws_time = now
+                _last_pct = pct
 
+        master_media_duration = max(
+            float(context.target_duration or 0.0),
+            float(getattr(self, "_compiled_media_duration", 0.0) or 0.0),
+        )
+        master_timeout = self._render_timeout_seconds(master_media_duration)
+        try:
+            master_result = self._run_bounded_media_process(
+                cmd,
+                context=context,
+                process_kind="MASTER_FFMPEG",
+                timeout_seconds=master_timeout,
+                started_stage="MASTER_PROCESS_STARTED",
+                exited_stage="MASTER_PROCESS_EXITED",
+                on_stdout_line=_master_progress,
+            )
+            if master_result.returncode != 0:
+                raise _MediaProcessFailure(
+                    "MASTER_FFMPEG_NONZERO_EXIT",
+                    stage="MASTER_PROCESS_EXITED",
+                    returncode=master_result.returncode,
+                    stderr=master_result.stderr,
+                )
             self.log("[OK] FFmpeg master render completed successfully.")
-
-        except FileNotFoundError:
+        except _MediaProcessFailure as exc:
             if not self._coordinator_owns_terminal(context):
                 self._ws_broadcast(task_id, user_id, {"status": "failed"})
+            error_excerpt = self._safe_stderr_excerpt(exc.stderr)
             self.log(
-                f"[ERROR] ffmpeg binary not found at '{ffmpeg_bin}'. "
-                "In production, ensure ffmpeg.exe is in the same directory as backend.exe. "
-                "In development, ensure ffmpeg is available on your system PATH."
+                "[ERROR] Master render failed "
+                f"code={exc.code} returncode={exc.returncode} "
+                f"stderr={error_excerpt or 'NOT_AVAILABLE'}"
             )
-            return context
-        except subprocess.CalledProcessError as exc:
-            if not self._coordinator_owns_terminal(context):
-                self._ws_broadcast(task_id, user_id, {"status": "failed"})
-            self.log(
-                f"[ERROR] FFmpeg exited with code {exc.returncode}. stderr:\n{exc.stderr}"
-            )
-            raise RuntimeError(f"FFmpeg render failed: {exc.stderr}")
+            raise
 
         # 7. 将母带路径写回 Context
         context.set_asset("video_master", output_path)
@@ -879,7 +1366,19 @@ class FFmpegCompositorNode(BaseNode):
         # Legacy direct calls retain failed WS; coordinator children only re-raise.
         try:
             self._render_variant(context, output_path, ffmpeg_bin)
-        except Exception:
+        except Exception as exc:
+            failure_code = getattr(exc, "code", exc.__class__.__name__.upper())
+            self._log_media_stage(
+                context,
+                "FINAL_FAILED",
+                failure_code=str(failure_code),
+                returncode=getattr(exc, "returncode", None),
+                extra=(
+                    f"stderr={self._safe_stderr_excerpt(getattr(exc, 'stderr', ''))}"
+                    if getattr(exc, "stderr", "")
+                    else ""
+                ),
+            )
             if not self._coordinator_owns_terminal(context):
                 self._ws_broadcast(task_id, user_id, {"status": "failed"})
             raise
@@ -945,6 +1444,11 @@ class FFmpegCompositorNode(BaseNode):
                 f"child_index={context.config.get('child_index')} "
                 f"file_sid={file_sid} lang={lang} path={final_path}"
             )
+            self._log_media_stage(
+                context,
+                "FINAL_PREFLIGHT_START",
+                role=lang,
+            )
 
             has_sub   = bool(ass_path   and os.path.exists(ass_path))
             has_voice = bool(voice_path and os.path.exists(voice_path))
@@ -975,17 +1479,43 @@ class FFmpegCompositorNode(BaseNode):
 
             # 第一顺位：TTS 配音
             voice_label: str = ""           # e.g. "[1:a]"，不存在则为空
-            voice_target_duration = target_duration
+            trusted_media_duration = max(
+                target_duration,
+                float(getattr(self, "_compiled_media_duration", 0.0) or 0.0),
+            )
+            master_duration: Optional[float] = None
+            if has_voice and not single_main_clip:
+                master_duration = self._probe_duration(
+                    master_path,
+                    context=context,
+                    role="MASTER",
+                )
+                if master_duration <= 0:
+                    raise _MediaProcessFailure(
+                        "MASTER_VIDEO_DURATION_UNVERIFIED",
+                        stage="FINAL_PREFLIGHT",
+                    )
+            voice_target_duration = (
+                target_duration
+                if single_main_clip
+                else master_duration or trusted_media_duration
+            )
             if has_voice:
-                if not single_main_clip:
-                    voice_target_duration = self._probe_duration(master_path)
-                    if voice_target_duration <= 0:
-                        raise RuntimeError("MASTER_VIDEO_DURATION_UNVERIFIED")
-                voice_duration = self._probe_duration(voice_path)
+                voice_duration = self._probe_duration(
+                    voice_path,
+                    context=context,
+                    role="VOICE",
+                )
                 if voice_duration <= 0:
-                    raise RuntimeError("TTS_AUDIO_DURATION_UNVERIFIED")
+                    raise _MediaProcessFailure(
+                        "TTS_AUDIO_DURATION_UNVERIFIED",
+                        stage="FINAL_PREFLIGHT",
+                    )
                 if voice_duration > voice_target_duration + 0.05:
-                    raise RuntimeError("TTS_AUDIO_EXCEEDS_TARGET_DURATION")
+                    raise _MediaProcessFailure(
+                        "TTS_AUDIO_EXCEEDS_TARGET_DURATION",
+                        stage="FINAL_PREFLIGHT",
+                    )
                 inputs += ["-i", voice_path]
                 voice_label = f"[{next_idx}:a]"
                 next_idx += 1
@@ -1112,63 +1642,67 @@ class FFmpegCompositorNode(BaseNode):
                 + ["-y", final_path]
             )
 
+            final_timeout = self._render_timeout_seconds(
+                master_duration or trusted_media_duration
+            )
+            self._log_media_stage(
+                context,
+                "FINAL_COMMAND_BUILT",
+                role=lang,
+                extra=f"timeout_seconds={final_timeout:.3f}",
+            )
+
             self.log(f"[{lang}] Rendering variant → {final_path}")
             self.log(f"[{lang}] CMD: {' '.join(cmd)}")
 
             # ── 生命周期推送：变体渲染开始 ────────────────────────────────────
             self._ws_broadcast(task_id, user_id, {"status": "running", "progress": 0, "lang": lang})
 
+            total_us: int = max(int(voice_target_duration * 1_000_000), 1)
+            _last_ws_time: float = 0.0
+
+            def _final_progress(raw_line: str) -> None:
+                nonlocal _last_ws_time
+                line = raw_line.strip()
+                if not line.startswith("out_time_us="):
+                    return
+                try:
+                    elapsed_us = int(line.split("=", 1)[1])
+                except ValueError:
+                    return
+                now = time.monotonic()
+                if now - _last_ws_time >= 1.0:
+                    pct = min(int(elapsed_us * 100 / total_us), 99)
+                    self._ws_broadcast(
+                        task_id,
+                        user_id,
+                        {"status": "running", "progress": pct, "lang": lang},
+                    )
+                    _last_ws_time = now
+
             try:
-                proc = subprocess.Popen(
+                final_result = self._run_bounded_media_process(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=_WIN_NO_WINDOW,
+                    context=context,
+                    process_kind="FINAL_FFMPEG",
+                    timeout_seconds=final_timeout,
+                    started_stage="FINAL_PROCESS_STARTED",
+                    exited_stage="FINAL_PROCESS_EXITED",
+                    on_stdout_line=_final_progress,
                 )
-
-                # stderr 消费线程，防止缓冲区满阻塞子进程
-                _stderr_lines: List[str] = []
-
-                def _drain(pipe) -> None:
-                    for line in pipe:
-                        _stderr_lines.append(line)
-
-                _t = threading.Thread(target=_drain, args=(proc.stderr,), daemon=True)
-                _t.start()
-
-                # 实时进度推送（变体渲染通常比母带快，限速 1s/次即可）
-                total_us: int = max(context.target_duration * 1_000_000, 1)
-                _last_ws_time: float = 0.0
-
-                for raw_line in proc.stdout:
-                    line = raw_line.strip()
-                    if not line.startswith("out_time_us="):
-                        continue
-                    try:
-                        elapsed_us = int(line.split("=", 1)[1])
-                    except ValueError:
-                        continue
-                    now = time.monotonic()
-                    if now - _last_ws_time >= 1.0:
-                        pct = min(int(elapsed_us * 100 / total_us), 99)
-                        self._ws_broadcast(
-                            task_id, user_id,
-                            {"status": "running", "progress": pct, "lang": lang},
-                        )
-                        _last_ws_time = now
-
-                proc.wait()
-                _t.join(timeout=10)
-                stderr_output = "".join(_stderr_lines)
-
-                if proc.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        proc.returncode, cmd, stderr=stderr_output
+                if final_result.returncode != 0:
+                    raise _MediaProcessFailure(
+                        "FINAL_FFMPEG_NONZERO_EXIT",
+                        stage="FINAL_PROCESS_EXITED",
+                        returncode=final_result.returncode,
+                        stderr=final_result.stderr,
                     )
 
+                self._validate_final_output(
+                    final_path,
+                    context=context,
+                    require_audio=bool(audio_mix_labels),
+                )
                 self.log(f"[{lang}] [OK] Variant rendered: {final_path}")
                 context.set_variant_asset(lang, "final_video", final_path)
 
@@ -1182,14 +1716,11 @@ class FFmpegCompositorNode(BaseNode):
                     self.log(
                         f"[{lang}] [OK] Copied to custom output dir: {target_file_path}"
                     )
-
-            except FileNotFoundError:
-                self.log(f"[{lang}] [ERROR] ffmpeg binary not found.")
-                raise
-            except subprocess.CalledProcessError as exc:
-                error_msg = exc.stderr[-800:] if exc.stderr else "Unknown error"
+            except _MediaProcessFailure as exc:
+                error_msg = self._safe_stderr_excerpt(exc.stderr)
                 self.log(
                     f"[{lang}] [ERROR] Variant render failed "
-                    f"(exit {exc.returncode}):\n{error_msg}"
+                    f"code={exc.code} returncode={exc.returncode} "
+                    f"stderr={error_msg or 'NOT_AVAILABLE'}"
                 )
-                raise RuntimeError(f"FFmpeg render failed: {error_msg}")
+                raise

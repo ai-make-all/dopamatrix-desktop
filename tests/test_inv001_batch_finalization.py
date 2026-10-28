@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -197,6 +198,20 @@ class BatchFinalizationTests(unittest.TestCase):
         self.assertFalse(terminal["partial"])
         self.assertEqual(ws.call_count, 1)
 
+    def test_batch_size_one_child_failure_reaches_failed_terminal(self):
+        terminal, calls, ws = self._run_fake_batch(
+            task_id="phase2-single-failed",
+            batch_size=1,
+            failed_indices={0},
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self._history_rows(), [])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["succeededCount"], 0)
+        self.assertEqual(terminal["failedCount"], 1)
+        self.assertEqual(ws.call_count, 1)
+
     def test_batch_size_four_writes_one_stably_ordered_history_and_terminal(self):
         terminal, calls, ws = self._run_fake_batch(
             task_id="phase2-four",
@@ -241,6 +256,68 @@ class BatchFinalizationTests(unittest.TestCase):
         self.assertTrue(terminal["partial"])
         self.assertEqual(terminal["succeededCount"], 3)
         self.assertEqual(terminal["failedCount"], 1)
+        self.assertEqual(ws.call_count, 1)
+
+    def test_bounded_child_timeout_preserves_sibling_and_finalizes_partial(self):
+        calls: list[int] = []
+        calls_lock = threading.Lock()
+
+        def fake_render_worker(
+            _plan,
+            _task_id,
+            _aspect_ratio,
+            _target_duration,
+            _tenant_id,
+            _prompt,
+            _batch_size,
+            _test_language,
+            file_sid,
+            **kwargs,
+        ):
+            child_index = kwargs["child_index"]
+            with calls_lock:
+                calls.append(child_index)
+            if child_index == 1:
+                time.sleep(0.05)
+                child = _result_from_call(file_sid, kwargs, succeeded=False)
+                return routes_dsl._ChildResult(
+                    child_index=child.child_index,
+                    execution_id=child.execution_id,
+                    file_sid=child.file_sid,
+                    outcome=child.outcome,
+                    assets=child.assets,
+                    elapsed=child.elapsed,
+                    error_code="FINAL_FFMPEG_TIMEOUT",
+                    error_message="bounded media timeout",
+                    prompt_details=child.prompt_details,
+                    fatigue_asset_ids=child.fatigue_asset_ids,
+                )
+            return _result_from_call(file_sid, kwargs, succeeded=True)
+
+        started = time.monotonic()
+        with (
+            patch.object(routes_dsl, "render_worker", side_effect=fake_render_worker),
+            patch.object(routes_dsl, "get_tenant_engine", return_value=self.engine),
+            patch.object(routes_dsl.ws_manager, "broadcast_sync") as ws,
+        ):
+            terminal = routes_dsl.render_batch_worker(
+                None,
+                "phase2-bounded-timeout",
+                prompt="test prompt",
+                batch_size=2,
+            )
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(sorted(calls), [0, 1])
+        self.assertEqual(terminal["status"], "completed")
+        self.assertTrue(terminal["partial"])
+        self.assertEqual(terminal["succeededCount"], 1)
+        self.assertEqual(terminal["failedCount"], 1)
+        self.assertEqual(
+            [asset["file_path"] for asset in terminal["assets"]],
+            ["final_0.mp4"],
+        )
+        self.assertEqual(len(self._history_rows()), 1)
         self.assertEqual(ws.call_count, 1)
 
     def test_all_children_failed_writes_no_history_and_one_failed_terminal(self):
@@ -426,6 +503,7 @@ class WorkerFinalizationBoundaryTests(unittest.TestCase):
         with (
             patch("src.nodes.compositor.get_ffmpeg_path", return_value="ffmpeg"),
             patch("src.nodes.compositor.subprocess.Popen", side_effect=FileNotFoundError),
+            self.assertRaisesRegex(RuntimeError, "MASTER_FFMPEG_CREATE_FAILED"),
         ):
             node.execute(context)
 
@@ -448,6 +526,7 @@ class WorkerFinalizationBoundaryTests(unittest.TestCase):
         with (
             patch("src.nodes.compositor.get_ffmpeg_path", return_value="ffmpeg"),
             patch("src.nodes.compositor.subprocess.Popen", side_effect=FileNotFoundError),
+            self.assertRaisesRegex(RuntimeError, "MASTER_FFMPEG_CREATE_FAILED"),
         ):
             node.execute(context)
 
