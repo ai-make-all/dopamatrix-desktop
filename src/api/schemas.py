@@ -9,9 +9,13 @@ Pydantic v2 请求 / 响应模型。
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from enum import Enum
+from typing import Dict, Generic, List, Literal, Optional, TypeVar
 
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import (
+    BaseModel, Field, ConfigDict, StrictBool, StrictInt, StrictStr,
+    ValidationError, model_validator,
+)
 
 from .approval_types import VariantStatus
 from .task_identity import CLIENT_TASK_ID_NOT_ALLOWED
@@ -543,4 +547,374 @@ class DSLSubmitResponse(CompilationPlan):
     message:       str       = Field(
         default="渲染任务已在后台下发，请在输出目录查看或通过 WebSocket 监听进度。",
         description="人类可读的操作结果说明。",
+    )
+
+
+# P1-A: independent, in-memory contracts; deliberately not wired to live routes.
+# Observed/provided facts are not authenticated receipts. No IDs or authority
+# are created here. Current AUTH-ACK/G1 gates cannot be unlocked by input/context.
+class _P1AModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, revalidate_instances="always",
+        hide_input_in_errors=True,
+    )
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _safe_validation(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            # Do not embed raw input, extra-field names or nested errors in text.
+            raise ValueError("P1A_CONTRACT_INVALID") from None
+
+
+class P1AEvidenceState(str, Enum):
+    PRESENT = "PRESENT"
+    NOT_ESTABLISHED = "NOT_ESTABLISHED"
+    UNKNOWN = "UNKNOWN"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class P1AEvidenceProvenance(str, Enum):
+    CLIENT_ASSERTED = "CLIENT_ASSERTED"
+    BACKEND_OBSERVED = "BACKEND_OBSERVED"
+    TRUSTED_AUTHORITY_VERIFIED = "TRUSTED_AUTHORITY_VERIFIED"
+
+
+_P1AT = TypeVar("_P1AT")
+
+
+class P1AEvidenceReference(_P1AModel, Generic[_P1AT]):
+    value: Optional[_P1AT] = None
+    state: P1AEvidenceState = P1AEvidenceState.NOT_ESTABLISHED
+    provenance: Optional[P1AEvidenceProvenance] = None
+
+    @model_validator(mode="after")
+    def _reference_rules(self):
+        if self.provenance == P1AEvidenceProvenance.TRUSTED_AUTHORITY_VERIFIED:
+            raise ValueError("P1A_AUTHORITY_NOT_QUALIFIED")
+        if self.state == P1AEvidenceState.PRESENT:
+            if self.value is None or self.provenance is None:
+                raise ValueError("P1A_REFERENCE_MISSING")
+            if type(self.value) not in (str, int, bool):
+                raise ValueError("P1A_REFERENCE_NOT_SCALAR")
+            if isinstance(self.value, str) and (
+                not self.value or any(
+                    not (ch.isascii() and (ch.isalnum() or ch in "._-"))
+                    for ch in self.value
+                )
+            ):
+                raise ValueError("P1A_REFERENCE_NOT_OPAQUE")
+        elif self.value is not None:
+            raise ValueError("P1A_REFERENCE_STATE_CONFLICT")
+        return self
+
+
+class P1AIdentityReferences(_P1AModel):
+    asset_id: P1AEvidenceReference[StrictInt] = Field(default_factory=P1AEvidenceReference[StrictInt])
+    content_version: P1AEvidenceReference[StrictStr] = Field(default_factory=P1AEvidenceReference[StrictStr])
+    source_binding_revision: P1AEvidenceReference[StrictStr] = Field(default_factory=P1AEvidenceReference[StrictStr])
+    qualification_proof: P1AEvidenceReference[StrictStr] = Field(default_factory=P1AEvidenceReference[StrictStr])
+    generation: P1AEvidenceReference[StrictStr] = Field(default_factory=P1AEvidenceReference[StrictStr])
+    operation: P1AEvidenceReference[StrictStr] = Field(default_factory=P1AEvidenceReference[StrictStr])
+
+    @model_validator(mode="after")
+    def _asset_id_rule(self):
+        if self.asset_id.value is not None and self.asset_id.value <= 0:
+            raise ValueError("P1A_ASSET_ID_INVALID")
+        return self
+
+
+class P1AImportOutcome(str, Enum):
+    CREATED = "CREATED"
+    DUPLICATE_EXISTING = "DUPLICATE_EXISTING"
+    RESTORED = "RESTORED"
+    REVIVED = "REVIVED"
+    REJECTED = "REJECTED"
+    NOT_COMPLETED = "NOT_COMPLETED"
+    PERSISTENCE_UNKNOWN = "PERSISTENCE_UNKNOWN"
+
+
+class P1ATechnicalStatus(str, Enum):
+    NOT_EVALUATED = "NOT_EVALUATED"
+    PENDING = "PENDING"
+    PASS = "PASS"
+    REJECTED = "REJECTED"
+    UNVERIFIED = "UNVERIFIED"
+    UNSUPPORTED_PROFILE = "UNSUPPORTED_PROFILE"
+
+
+class P1AQualificationStatus(str, Enum):
+    NOT_QUALIFIED = "NOT_QUALIFIED"
+    PENDING_ACK = "PENDING_ACK"
+    PASS = "PASS"
+    INVALIDATED = "INVALIDATED"
+
+
+class P1AReasonCode(str, Enum):
+    NOT_EVALUATED = "NOT_EVALUATED"
+    FILE_MISSING_OR_UNREADABLE = "FILE_MISSING_OR_UNREADABLE"
+    EMPTY_OR_BAD_CONTAINER = "EMPTY_OR_BAD_CONTAINER"
+    NO_OR_AMBIGUOUS_VIDEO_STREAM = "NO_OR_AMBIGUOUS_VIDEO_STREAM"
+    DECODE_CORRUPT_OR_TRUNCATED = "DECODE_CORRUPT_OR_TRUNCATED"
+    UNSUPPORTED_PROFILE = "UNSUPPORTED_PROFILE"
+    VALIDATION_TIMEOUT = "VALIDATION_TIMEOUT"
+    VALIDATOR_UNAVAILABLE = "VALIDATOR_UNAVAILABLE"
+    SOURCE_CHANGED_OR_PROOF_STALE = "SOURCE_CHANGED_OR_PROOF_STALE"
+    DUPLICATE_EXISTING = "DUPLICATE_EXISTING"
+    AI_ANALYSIS_FAILED = "AI_ANALYSIS_FAILED"
+    REQUALIFICATION_REQUIRED = "REQUALIFICATION_REQUIRED"
+    QUALIFICATION_INVALIDATED = "QUALIFICATION_INVALIDATED"
+    AUTHORIZATION_NOT_VERIFIED = "AUTHORIZATION_NOT_VERIFIED"
+    SCHEMA_NOT_READY = "SCHEMA_NOT_READY"
+    STALE_RESULT_REJECTED = "STALE_RESULT_REJECTED"
+    RESOURCE_STATE_UNKNOWN = "RESOURCE_STATE_UNKNOWN"
+    REFERENCE_RETIRED = "REFERENCE_RETIRED"
+    CONTRACT_INVALID = "CONTRACT_INVALID"
+
+
+class P1AOperatorAction(str, Enum):
+    REVIEW_EXISTING = "REVIEW_EXISTING"
+    REQUALIFY_AND_RESELECT = "REQUALIFY_AND_RESELECT"
+    SUPPLY_HEALTHY_SOURCE = "SUPPLY_HEALTHY_SOURCE"
+    SUPPLY_SUPPORTED_SOURCE = "SUPPLY_SUPPORTED_SOURCE"
+    REPORT_VALIDATOR_STATUS = "REPORT_VALIDATOR_STATUS"
+    WAIT_FOR_AUTHORIZED_RESOLUTION = "WAIT_FOR_AUTHORIZED_RESOLUTION"
+    PRESERVE_HISTORY = "PRESERVE_HISTORY"
+    REVIEW_CONTRACT = "REVIEW_CONTRACT"
+
+
+class P1ATechnicalValidation(_P1AModel):
+    status: P1ATechnicalStatus = P1ATechnicalStatus.NOT_EVALUATED
+
+
+class P1AQualificationActivation(_P1AModel):
+    status: P1AQualificationStatus = P1AQualificationStatus.NOT_QUALIFIED
+
+    @model_validator(mode="after")
+    def _no_activation_authority(self):
+        if self.status == P1AQualificationStatus.PASS:
+            raise ValueError("P1A_ACTIVATION_BLOCKED")
+        return self
+
+
+class P1AResultFacts(_P1AModel):
+    """Supplied consistency facts, not persistence/validation/authentication proof."""
+    persistence_confirmed: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+    technical_completed: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+    phase1_persisted: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+    existing_binding_current: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+
+
+def _p1a_observed(reference):
+    return (
+        reference.state == P1AEvidenceState.PRESENT
+        and reference.provenance == P1AEvidenceProvenance.BACKEND_OBSERVED
+    )
+
+
+def _p1a_true(reference):
+    return _p1a_observed(reference) and reference.value is True
+
+
+class P1APerInputResult(_P1AModel):
+    input_index: StrictInt = Field(ge=0)
+    file_display_name: StrictStr
+    import_outcome: P1AImportOutcome
+    technical_validation: P1ATechnicalValidation = Field(default_factory=P1ATechnicalValidation)
+    qualification_activation: P1AQualificationActivation = Field(default_factory=P1AQualificationActivation)
+    reason_code: P1AReasonCode
+    operator_next_action: P1AOperatorAction
+    references: P1AIdentityReferences = Field(default_factory=P1AIdentityReferences)
+    facts: P1AResultFacts = Field(default_factory=P1AResultFacts, exclude=True, repr=False)
+
+    @model_validator(mode="after")
+    def _result_rules(self):
+        name = self.file_display_name
+        if not name or name in (".", "..") or any(
+            ch in "/\\:" or ord(ch) < 32 or ord(ch) == 127 for ch in name
+        ):
+            raise ValueError("P1A_DISPLAY_NAME_INVALID")
+        mutation = self.import_outcome in (
+            P1AImportOutcome.CREATED, P1AImportOutcome.RESTORED, P1AImportOutcome.REVIVED,
+        )
+        if mutation and not (
+            _p1a_true(self.facts.persistence_confirmed)
+            and _p1a_observed(self.references.asset_id)
+        ):
+            raise ValueError("P1A_PERSISTENCE_NOT_CONFIRMED")
+        if self.import_outcome in (
+            P1AImportOutcome.REJECTED, P1AImportOutcome.NOT_COMPLETED,
+            P1AImportOutcome.PERSISTENCE_UNKNOWN,
+        ) and _p1a_true(self.facts.persistence_confirmed):
+            raise ValueError("P1A_OUTCOME_PERSISTENCE_CONFLICT")
+        if self.technical_validation.status == P1ATechnicalStatus.PASS:
+            if not _p1a_true(self.facts.technical_completed):
+                raise ValueError("P1A_TECHNICAL_EVIDENCE_MISSING")
+            if self.import_outcome == P1AImportOutcome.DUPLICATE_EXISTING and not _p1a_true(self.facts.existing_binding_current):
+                raise ValueError("P1A_DUPLICATE_NOT_CURRENT")
+        activation = self.qualification_activation.status
+        if activation == P1AQualificationStatus.PENDING_ACK and not (
+            self.technical_validation.status == P1ATechnicalStatus.PASS
+            and _p1a_true(self.facts.phase1_persisted)
+            and all(_p1a_observed(getattr(self.references, key)) for key in P1AIdentityReferences.model_fields)
+            and self.import_outcome == P1AImportOutcome.CREATED
+        ):
+            raise ValueError("P1A_PHASE1_NOT_CONFIRMED")
+        if self.import_outcome in (P1AImportOutcome.RESTORED, P1AImportOutcome.REVIVED) and (
+            self.technical_validation.status != P1ATechnicalStatus.NOT_EVALUATED
+            or activation != P1AQualificationStatus.NOT_QUALIFIED
+        ):
+            raise ValueError("P1A_REVIVAL_CANNOT_INHERIT")
+        return self
+
+
+class P1AResultBatch(_P1AModel):
+    results: tuple[P1APerInputResult, ...]
+
+    @model_validator(mode="after")
+    def _input_order(self):
+        if tuple(item.input_index for item in self.results) != tuple(range(len(self.results))):
+            raise ValueError("P1A_INPUT_ORDER_INVALID")
+        return self
+
+
+def safe_p1a_validation_errors(error):
+    """Only this controlled error data is public; never export raw errors()/ctx."""
+    return [{"reason_code": "CONTRACT_INVALID", "operator_next_action": "REVIEW_CONTRACT"}]
+
+
+def serialize_p1a_results(batch):
+    """Revalidate even construct/copy instances. This does not authenticate facts."""
+    try:
+        checked = P1AResultBatch.model_validate(batch)
+        return checked.model_dump(mode="json")["results"]
+    except ValidationError:
+        raise ValueError("P1A_CONTRACT_INVALID") from None
+
+
+class P1AEvent(str, Enum):
+    FRESH_IMPORT = "FRESH_IMPORT"
+    ACTIVE_DUPLICATE = "ACTIVE_DUPLICATE"
+    SAME_PATH_BYTES_CHANGED = "SAME_PATH_BYTES_CHANGED"
+    DIFFERENT_PATH_SAME_BYTES = "DIFFERENT_PATH_SAME_BYTES"
+    DIFFERENT_PATH_BYTES_CHANGED = "DIFFERENT_PATH_BYTES_CHANGED"
+    TRASH = "TRASH"
+    TRASH_RESTORE = "TRASH_RESTORE"
+    SAME_MD5_REVIVAL = "SAME_MD5_REVIVAL"
+    VALIDATION_POLICY_CHANGED = "VALIDATION_POLICY_CHANGED"
+    AUTHORIZATION_REVOKED_OR_UNKNOWN = "AUTHORIZATION_REVOKED_OR_UNKNOWN"
+    DB_RESTORE_OR_SCHEMA_NOT_READY = "DB_RESTORE_OR_SCHEMA_NOT_READY"
+    LATE_RESULT_ACK_OR_RECOVER = "LATE_RESULT_ACK_OR_RECOVER"
+    NATIVE_RESOURCE_UNKNOWN = "NATIVE_RESOURCE_UNKNOWN"
+    PURGE = "PURGE"
+
+
+class P1AIdentityAction(str, Enum):
+    KEEP = "KEEP"
+    NEW_REQUIRED = "NEW_REQUIRED"
+    RECONFIRM_REQUIRED = "RECONFIRM_REQUIRED"
+    RETIRE = "RETIRE"
+    UNDETERMINED = "UNDETERMINED"
+
+
+class P1AInvalidationFacts(_P1AModel):
+    event: P1AEvent
+    references: P1AIdentityReferences = Field(default_factory=P1AIdentityReferences)
+    # Delayed results require two independent sets; references is not a fallback.
+    current_references: P1AIdentityReferences = Field(default_factory=P1AIdentityReferences)
+    candidate_references: P1AIdentityReferences = Field(default_factory=P1AIdentityReferences)
+    same_bytes: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+    binding_current: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+    compatibility_allows_reuse: P1AEvidenceReference[StrictBool] = Field(default_factory=P1AEvidenceReference[StrictBool])
+
+
+class P1AInvalidationDecision(_P1AModel):
+    content_version_action: P1AIdentityAction
+    source_binding_action: P1AIdentityAction
+    generation_action: P1AIdentityAction
+    operation_action: P1AIdentityAction
+    qualification_invalidation_required: StrictBool
+    requalification_required: StrictBool
+    reject_stale_result: StrictBool = False
+    reason_code: P1AReasonCode
+    normal_use_permitted: Literal[False] = False
+    automatic_rebind_permitted: Literal[False] = False
+    preserve_history: Literal[True] = True
+    preserve_proof_operation_tombstones: Literal[True] = True
+    preserve_resource_responsibility: Literal[True] = True
+
+
+def decide_p1a_invalidation(facts: P1AInvalidationFacts) -> P1AInvalidationDecision:
+    """Return required actions, never execute them or grant eligibility."""
+    try:
+        facts = P1AInvalidationFacts.model_validate(facts)
+    except ValidationError:
+        if not isinstance(facts, P1AInvalidationFacts) or facts.event != P1AEvent.LATE_RESULT_ACK_OR_RECOVER:
+            raise
+        # Invalid construct/copy facts cannot establish a match. Use missing
+        # local facts to reject; never repair or mutate the caller's identities.
+        facts = P1AInvalidationFacts(event=P1AEvent.LATE_RESULT_ACK_OR_RECOVER)
+    event, refs = facts.event, facts.references
+    action, reason = P1AIdentityAction, P1AReasonCode
+    content = action.KEEP if _p1a_observed(refs.content_version) else action.UNDETERMINED
+    binding = action.KEEP if _p1a_observed(refs.source_binding_revision) else action.UNDETERMINED
+    generation = operation = action.NEW_REQUIRED
+    invalidate = requalify = True
+    reject = False
+    code = reason.REQUALIFICATION_REQUIRED
+    if event in (P1AEvent.FRESH_IMPORT, P1AEvent.SAME_PATH_BYTES_CHANGED, P1AEvent.DIFFERENT_PATH_BYTES_CHANGED):
+        content = binding = action.NEW_REQUIRED
+        code = reason.SOURCE_CHANGED_OR_PROOF_STALE if event != P1AEvent.FRESH_IMPORT else code
+    elif event in (P1AEvent.DIFFERENT_PATH_SAME_BYTES, P1AEvent.SAME_MD5_REVIVAL):
+        content = content if _p1a_true(facts.same_bytes) else action.UNDETERMINED
+        if _p1a_observed(facts.same_bytes) and facts.same_bytes.value is False:
+            content = action.NEW_REQUIRED
+        binding = action.NEW_REQUIRED
+    elif event == P1AEvent.ACTIVE_DUPLICATE:
+        # Do not revoke the existing record merely for a duplicate request.
+        # KEEP preserves supplied references, not a proven qualification PASS.
+        # This request still requires separate qualification: no ACK/proof
+        # transfer, automatic rebind, new Operation, or normal-use permission.
+        generation = action.KEEP if _p1a_observed(refs.generation) else action.UNDETERMINED
+        operation = action.KEEP if _p1a_observed(refs.operation) else action.UNDETERMINED
+        invalidate = False
+        code = reason.DUPLICATE_EXISTING
+    elif event == P1AEvent.TRASH_RESTORE:
+        content = binding = action.RECONFIRM_REQUIRED
+    elif event == P1AEvent.TRASH:
+        generation = operation = action.RETIRE
+        requalify = False
+        code = reason.QUALIFICATION_INVALIDATED
+    elif event == P1AEvent.VALIDATION_POLICY_CHANGED:
+        # COMPAT_RUNTIME is NOT_VERIFIED. No supplied Boolean proves that
+        # historical qualification is reusable under a changed policy/tool.
+        invalidate = requalify = True
+    elif event == P1AEvent.PURGE:
+        content = binding = generation = operation = action.RETIRE
+        requalify, reject = False, True
+        code = reason.REFERENCE_RETIRED
+    elif event == P1AEvent.LATE_RESULT_ACK_OR_RECOVER:
+        reject = not (_p1a_true(facts.binding_current) and all(
+            _p1a_observed(getattr(facts.current_references, key))
+            and _p1a_observed(getattr(facts.candidate_references, key))
+            and getattr(facts.current_references, key).value == getattr(facts.candidate_references, key).value
+            for key in P1AIdentityReferences.model_fields
+        ))
+        # An exact match only avoids stale rejection; it authorizes nothing.
+        content = binding = generation = operation = action.RECONFIRM_REQUIRED
+        code = reason.STALE_RESULT_REJECTED if reject else reason.REQUALIFICATION_REQUIRED
+    else:
+        content = binding = generation = operation = action.RECONFIRM_REQUIRED
+        code = {
+            P1AEvent.AUTHORIZATION_REVOKED_OR_UNKNOWN: reason.AUTHORIZATION_NOT_VERIFIED,
+            P1AEvent.DB_RESTORE_OR_SCHEMA_NOT_READY: reason.SCHEMA_NOT_READY,
+            P1AEvent.NATIVE_RESOURCE_UNKNOWN: reason.RESOURCE_STATE_UNKNOWN,
+        }[event]
+    return P1AInvalidationDecision(
+        content_version_action=content, source_binding_action=binding,
+        generation_action=generation, operation_action=operation,
+        qualification_invalidation_required=invalidate, requalification_required=requalify,
+        reject_stale_result=reject, reason_code=code,
     )
