@@ -918,3 +918,62 @@ def decide_p1a_invalidation(facts: P1AInvalidationFacts) -> P1AInvalidationDecis
         qualification_invalidation_required=invalidate, requalification_required=requalify,
         reject_stale_result=reject, reason_code=code,
     )
+
+
+# P1-B public projections contain no internal P1-A consistency facts.
+class P1BTechnicalValidation(_P1AModel):
+    status: Literal["NOT_EVALUATED"]
+
+
+class P1BQualificationActivation(_P1AModel):
+    status: Literal["NOT_QUALIFIED"]
+
+
+class P1BPublicInputResult(_P1AModel):
+    input_index: StrictInt = Field(ge=0)
+    file_display_name: StrictStr
+    import_outcome: Literal[
+        P1AImportOutcome.CREATED, P1AImportOutcome.DUPLICATE_EXISTING,
+        P1AImportOutcome.REVIVED, P1AImportOutcome.NOT_COMPLETED,
+    ]
+    technical_validation: P1BTechnicalValidation
+    qualification_activation: P1BQualificationActivation
+    reason_code: P1AReasonCode
+    operator_next_action: P1AOperatorAction
+    references: P1AIdentityReferences
+
+    @model_validator(mode="after")
+    def _public_projection_rules(self):
+        if self.file_display_name != f"input-{self.input_index}":
+            raise ValueError("P1B_DISPLAY_NAME_INVALID")
+        for key in P1AIdentityReferences.model_fields:
+            reference = getattr(self.references, key)
+            if key == "asset_id" and self.import_outcome != P1AImportOutcome.NOT_COMPLETED:
+                if not _p1a_observed(reference):
+                    raise ValueError("P1B_ASSET_ID_NOT_ESTABLISHED")
+            elif (
+                reference.state != P1AEvidenceState.NOT_ESTABLISHED
+                or reference.value is not None or reference.provenance is not None
+            ):
+                raise ValueError("P1B_UNSUPPORTED_EVIDENCE")
+        return self
+
+
+class P1BInformationalImportResponse(_P1AModel):
+    result_format: Literal["p1b-info-v1"]
+    success_count: StrictInt = Field(ge=0)
+    skipped_count: StrictInt = Field(ge=0)
+    message: StrictStr
+    results: tuple[P1BPublicInputResult, ...]
+
+    @model_validator(mode="after")
+    def _ordered_summary(self):
+        if tuple(item.input_index for item in self.results) != tuple(range(len(self.results))):
+            raise ValueError("P1B_INPUT_ORDER_INVALID")
+        successes = 0
+        for item in self.results:
+            if item.import_outcome in (P1AImportOutcome.CREATED, P1AImportOutcome.REVIVED):
+                successes += 1
+        if self.success_count != successes or self.skipped_count != len(self.results) - successes:
+            raise ValueError("P1B_SUMMARY_INVALID")
+        return self

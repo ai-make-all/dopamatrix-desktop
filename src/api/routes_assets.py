@@ -11,13 +11,15 @@ import hashlib
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import RootModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, inspect as inspect_asset
 
 from .database import get_db
 from .models import LocalAsset
+from . import schemas as asset_schemas
 from .schemas import LocalAssetCreate, LocalAssetResponse, LocalAssetImportResponse, AssetRoleUpdate, AssetTagsUpdate, AssetAppendTags, TextAssetCreate
 
 router = APIRouter(prefix="/assets", tags=["DAM Assets"])
@@ -39,25 +41,125 @@ def compute_md5(file_path: str) -> str:
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-@router.post("/import", response_model=LocalAssetImportResponse, summary="导入本地素材")
-def import_asset(asset_in: LocalAssetCreate, db: Session = Depends(get_db)):
+class _P1BImportResponseDocumentation(RootModel[
+    LocalAssetImportResponse | asset_schemas.P1BInformationalImportResponse
+]):
+    """Documentation only: the default runtime response model stays legacy."""
+
+
+def _p1b_informational_requested(request: Request) -> bool:
+    values = request.query_params.getlist("result_format")
+    if not values:
+        return False
+    if len(values) != 1 or values[0] != "p1b-info-v1":
+        raise HTTPException(status_code=400, detail={
+            "reason_code": "CONTRACT_INVALID",
+            "operator_next_action": "REVIEW_CONTRACT",
+        })
+    return True
+
+
+def _p1b_asset_id(asset) -> int:
+    # InstanceState.identity reads mapper metadata, not expired ORM attributes.
+    identity = inspect_asset(asset).identity
+    if type(identity) is not tuple or len(identity) != 1:
+        raise ValueError("P1B_ASSET_ID_UNAVAILABLE")
+    asset_id = identity[0]
+    if type(asset_id) is not int or asset_id <= 0:
+        raise ValueError("P1B_ASSET_ID_UNAVAILABLE")
+    return asset_id
+
+
+def _p1b_import_response(observations, legacy):
+    """Called only after the existing commit returns; never grants qualification."""
+    try:
+        results = []
+        for index, outcome, asset, reason, action in observations:
+            references = {}
+            facts = {}
+            if asset is not None:
+                references["asset_id"] = {
+                    "value": _p1b_asset_id(asset), "state": "PRESENT",
+                    "provenance": "BACKEND_OBSERVED",
+                }
+            if outcome in ("CREATED", "REVIVED"):
+                facts["persistence_confirmed"] = {
+                    "value": True, "state": "PRESENT", "provenance": "BACKEND_OBSERVED",
+                }
+            results.append(asset_schemas.P1APerInputResult(
+                input_index=index, file_display_name=f"input-{index}",
+                import_outcome=outcome, reason_code=reason, operator_next_action=action,
+                references=references, facts=facts,
+            ))
+        # Validate the complete internal batch BEFORE excluded facts disappear.
+        batch = asset_schemas.P1AResultBatch(results=tuple(results))
+        public_results = asset_schemas.serialize_p1a_results(batch)
+        public = asset_schemas.P1BInformationalImportResponse.model_validate({
+            "result_format": "p1b-info-v1",
+            "success_count": legacy.success_count, "skipped_count": legacy.skipped_count,
+            "message": legacy.message, "results": public_results,
+        })
+        return JSONResponse(content=public.model_dump(mode="json"))
+    except Exception:
+        # This can fail AFTER persistence. Never claim rollback or suggest retry.
+        # The existing application error fence supplies the safe non-2xx response.
+        raise ValueError("P1B_RESPONSE_UNAVAILABLE") from None
+
+
+@router.post(
+    "/import", response_model=LocalAssetImportResponse, summary="导入本地素材",
+    responses={
+        200: {
+            "model": _P1BImportResponseDocumentation,
+            "description": "Legacy by default; informational only with one result_format=p1b-info-v1.",
+        },
+        400: {
+            "description": "Empty, invalid, or repeated result_format: CONTRACT_INVALID before Import business work.",
+            "content": {"application/json": {"schema": {
+                "type": "object", "required": ["detail"], "additionalProperties": False,
+                "properties": {"detail": {
+                    "type": "object", "required": ["reason_code", "operator_next_action"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "reason_code": {"type": "string", "const": "CONTRACT_INVALID"},
+                        "operator_next_action": {"type": "string", "const": "REVIEW_CONTRACT"},
+                    },
+                }},
+            }}},
+        },
+    },
+    openapi_extra={"parameters": [{
+        "name": "result_format", "in": "query", "required": False,
+        "schema": {"type": "string", "enum": ["p1b-info-v1"]},
+        "description": "Omit for Legacy. Exactly one valid value opts in; any repetition or invalid value is HTTP 400. Informational only, never Seed/authorization authority. Existing dependencies may initialize first.",
+    }]},
+)
+def import_asset(asset_in: LocalAssetCreate, request: Request, db: Session = Depends(get_db)):
     """
     接收本地素材的绝对路径列表，计算 MD5 后存入本地库中。
     防重复检测：如果 MD5 已存在则跳过。
     返回成功导入和跳过的数量。
     """
+    informational = _p1b_informational_requested(request)
+    observations = [] if informational else None
     success_count = 0
     skipped_count = 0
 
-    for file_path in asset_in.file_paths:
+    for input_index, file_path in enumerate(asset_in.file_paths):
         if not os.path.exists(file_path):
             skipped_count += 1
+            if observations is not None:
+                observations.append((input_index, "NOT_COMPLETED", None,
+                                     "FILE_MISSING_OR_UNREADABLE", "SUPPLY_HEALTHY_SOURCE"))
             continue
         
         try:
             file_hash = compute_md5(file_path)
         except Exception:
             skipped_count += 1
+            if observations is not None:
+                observations.append((input_index, "NOT_COMPLETED", None,
+                                     "NOT_EVALUATED", "WAIT_FOR_AUTHORIZED_RESOLUTION"))
             continue
 
         # 防重复检测：活跃素材跳过；已逻辑删除的同 hash 则复活并更新元数据
@@ -72,8 +174,14 @@ def import_asset(asset_in: LocalAssetCreate, db: Session = Depends(get_db)):
                 existing.entity_id = asset_in.entity_id
                 existing.asset_name = asset_in.asset_name
                 success_count += 1
+                if observations is not None:
+                    observations.append((input_index, "REVIVED", existing,
+                                         "REQUALIFICATION_REQUIRED", "REQUALIFY_AND_RESELECT"))
             else:
                 skipped_count += 1
+                if observations is not None:
+                    observations.append((input_index, "DUPLICATE_EXISTING", existing,
+                                         "DUPLICATE_EXISTING", "REVIEW_EXISTING"))
             continue
 
         new_asset = LocalAsset(
@@ -87,14 +195,20 @@ def import_asset(asset_in: LocalAssetCreate, db: Session = Depends(get_db)):
         )
         db.add(new_asset)
         success_count += 1
+        if observations is not None:
+            observations.append((input_index, "CREATED", new_asset,
+                                 "NOT_EVALUATED", "WAIT_FOR_AUTHORIZED_RESOLUTION"))
 
     db.commit()
     
-    return LocalAssetImportResponse(
+    legacy = LocalAssetImportResponse(
         success_count=success_count,
         skipped_count=skipped_count,
         message=f"成功导入 {success_count} 个素材，跳过 {skipped_count} 个已存在或无效的文件"
     )
+    if observations is not None:
+        return _p1b_import_response(observations, legacy)
+    return legacy
 
 
 @router.post("/text", response_model=LocalAssetResponse, summary="虚拟创建文本模板资产")
