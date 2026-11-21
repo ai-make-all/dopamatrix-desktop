@@ -1,0 +1,3 @@
+
+# Python source files use LF in both the working tree and Git repository.
+*.py text eol=lf
